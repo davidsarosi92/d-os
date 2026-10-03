@@ -12,6 +12,7 @@
 #include "lnx_signal.h"   /* §M89 */
 #include "abi.h"
 #include "nsproxy.h"
+#include "procfs.h"
 #include "dosgui.h"     /* §M65 — the toolkit build op */
 #include "printf.h"
 #include "epoll.h"        /* EPOLL_CTL_* — the guest's own numbers */
@@ -316,26 +317,33 @@ static long h_ui_build(struct abi_ctx* c) {
 /* §M90 — getpid is the PROCESS (the thread group), gettid the thread.  They
  * used to be one number per task, so every Go or JVM thread answered getpid()
  * with a different pid. */
+/* §M90 — every pid here is the CALLER's view (its pid namespace, nsproxy.c):
+ * inside a container the init is 1 and a parent outside the namespace is 0,
+ * as on Linux; in the initial namespace each answer is the global pid. */
 static long h_getpid(struct abi_ctx* c) {
     (void)c;
     struct task* t = task_current();
-    return t ? task_tgid(t) : 0;
+    if (!t) return 0;
+    struct task* lead = (t->tgid && t->tgid != t->pid) ? task_find(t->tgid) : t;
+    return ns_vnr(t, lead ? lead : t);
 }
 static long h_gettid(struct abi_ctx* c) {
     (void)c;
     struct task* t = task_current();
-    return t ? t->pid : 0;
+    return t ? ns_vnr(t, t) : 0;
 }
 static long h_getppid(struct abi_ctx* c) {
     (void)c;
     struct task* t = task_current();
     if (!t) return 0;
     /* A thread's parent is its PROCESS's parent. */
+    int pp = t->ppid;
     if (t->tgid && t->tgid != t->pid) {
         struct task* lead = task_find(t->tgid);
-        if (lead) return lead->ppid;
+        if (lead) pp = lead->ppid;
     }
-    return t->ppid;
+    struct task* par = task_find(pp);
+    return par ? ns_vnr(t, par) : 0;
 }
 
 #define ABI_EPERM 1
@@ -637,8 +645,26 @@ static long abi_readlink_path(unsigned long upath, unsigned long ubuf, unsigned 
             for (; kp[i] && i < sizeof m - 1; i++) m[i] = kp[i];
             m[i] = 0;
         }
-        /* §M90 — a namespace handle reads as "<kind>:[<inode>]". */
+        /* §M90 — /proc/<pid>/fd/N of ANY descriptor kind, of the process the
+         * path named: a path, "pipe:[n]", "socket:[n]", "anon_inode:[…]". */
         {
+            const char* pre = "/proc/self/fd/";
+            unsigned i = 0;
+            while (pre[i] && m[i] == pre[i]) i++;
+            if (!pre[i] && m[i] >= '0' && m[i] <= '9') {
+                int fd = 0; unsigned j = i;
+                while (m[j] >= '0' && m[j] <= '9') fd = fd * 10 + (m[j++] - '0');
+                if (!m[j]) {
+                    struct task* tg = procfs_target();
+                    if (sys_fd_link_of(tg ? tg : task_current(), fd, tgt, sizeof tgt) != 0)
+                        return -ABI_ENOENT;
+                    n = 0;
+                    while (tgt[n]) n++;
+                }
+            }
+        }
+        /* §M90 — a namespace handle reads as "<kind>:[<inode>]". */
+        if (n == -1) {
             const char* pre = "/proc/self/ns/";
             unsigned i = 0;
             while (pre[i] && m[i] == pre[i]) i++;
@@ -737,19 +763,21 @@ static long h_chroot(struct abi_ctx* c) {
  *   CLONE_FS      a task's root and cwd are already its own (cred copy).
  *   CLONE_FILES   a private copy of a shared descriptor table.
  *   CLONE_SYSVSEM no System V semaphores exist: nothing to separate.
- * NET, USER and PID are REFUSED with EINVAL rather than pretended: the network
- * stack is single-instance, there is no uid mapping, and pid numbers are not
- * yet per namespace. */
+ *   CLONE_NEWPID  a pid namespace for the caller's CHILDREN (the first becomes
+ *                 its init), as on Linux.
+ * NET and USER are REFUSED with EINVAL rather than pretended: the network
+ * stack is single-instance and there is no uid mapping. */
 #define CLONE_NEWNS_   0x00020000ul
 #define CLONE_FS_      0x00000200ul
 #define CLONE_FILES_   0x00000400ul
 #define CLONE_SYSVSEM_ 0x00040000ul
-#define CLONE_NSOBJ_   (NS_CLONE_NEWUTS | NS_CLONE_NEWIPC | NS_CLONE_NEWCGROUP | NS_CLONE_NEWTIME)
+#define CLONE_NSOBJ_   (NS_CLONE_NEWUTS | NS_CLONE_NEWIPC | NS_CLONE_NEWCGROUP | NS_CLONE_NEWTIME | \
+                        NS_CLONE_NEWPID)
 static long h_unshare(struct abi_ctx* c) {
     unsigned long fl = c->a[0];
     unsigned long known = CLONE_NEWNS_ | CLONE_FS_ | CLONE_FILES_ | CLONE_SYSVSEM_ | CLONE_NSOBJ_;
     if (fl & ~known) {
-        kprintf("unshare: flags %lx not supported (NET/USER/PID namespaces do not exist yet)\n",
+        kprintf("unshare: flags %lx not supported (NET/USER namespaces do not exist yet)\n",
                 fl & ~known);
         return -ABI_EINVAL;
     }
@@ -758,7 +786,8 @@ static long h_unshare(struct abi_ctx* c) {
     if ((fl & (CLONE_NEWNS_ | CLONE_NSOBJ_)) &&
         cred_uid(&t->cred) != 0 && !cred_is_admin(&t->cred)) return -ABI_EPERM;
     if (fl & CLONE_NSOBJ_) {
-        if (ns_unshare(t, fl & CLONE_NSOBJ_) != 0) return -12;     /* ENOMEM */
+        int e = ns_unshare(t, fl & CLONE_NSOBJ_);
+        if (e != 0) return e;                                     /* ENOMEM / ENOSPC */
     }
     if (fl & CLONE_NEWNS_) {
         int ns = vfs_mntns_new(t->mntns);
@@ -825,8 +854,8 @@ static long h_mount(struct abi_ctx* c) {
  * — the one it named when it was OPENED (procfs keeps a reference), so a
  * namespace whose last member has gone can still be joined, as on Linux.
  * `nstype` 0 = any kind, else it must match the handle.  NET and USER have
- * one namespace each (joining it is true as asked); PID likewise until pid
- * numbers are per namespace. */
+ * one namespace each (joining it is true as asked); a PID namespace is
+ * joined for the caller's children, as on Linux. */
 int procfs_ns_handle(struct file* f, int* kind, struct nsobj** obj, int* mnt, uint32_t* ino);
 static long h_setns(struct abi_ctx* c) {
     static const unsigned long flag_of[NSK_COUNT] = {
@@ -842,7 +871,14 @@ static long h_setns(struct abi_ctx* c) {
     if (!t) return -ABI_EINVAL;
     if (cred_uid(&t->cred) != 0 && !cred_is_admin(&t->cred)) return -ABI_EPERM;
     if (kind == NSK_MNT) { t->mntns = mnt; return 0; }
-    if (kind == NSK_NET || kind == NSK_USER || kind == NSK_PID) return 0;
+    if (kind == NSK_NET || kind == NSK_USER) return 0;
+    /* Linux: joining a PID namespace changes where CHILDREN are born; the
+     * caller keeps its own number (and must be at or above that namespace). */
+    if (kind == NSK_PID) {
+        if (o && !ns_pid_within(t, o) && o->level <= ns_pid_level(t)) return -ABI_EINVAL;
+        ns_enter_pid_children(t, o);
+        return 0;
+    }
     ns_enter(t, kind, o);
     return 0;
 }
@@ -1153,12 +1189,23 @@ static long h_umask(struct abi_ctx* c) {
 
 /* §M90 — sessions and process groups (see task.h: pgid/sid).  0 stored means
  * the boot group, reported as 1 so no caller ever sees a group id of 0. */
-static int abi_pg_of(const struct task* t)  { return t->pgid ? t->pgid : 1; }
-static int abi_sid_of(const struct task* t) { return t->sid  ? t->sid  : 1; }
+/* §M90 — a stored (global) process id, as the CALLER's pid namespace names
+ * it: the task's number there, 0 when it is outside; an id whose task has
+ * gone keeps its global value only in the initial namespace. */
+static int abi_id_vnr(int gid) {
+    struct task* me = task_current();
+    struct task* t = task_find(gid);
+    if (t) return ns_vnr(me, t);
+    return ns_pid_level(me) ? 0 : gid;
+}
+static int abi_pg_of(const struct task* t)  { return t->pgid ? abi_id_vnr(t->pgid) : 1; }
+static int abi_sid_of(const struct task* t) { return t->sid  ? abi_id_vnr(t->sid)  : 1; }
+/* A pid argument, in the caller's namespace → the task. */
 static struct task* abi_pid_target(long pid) {
     struct task* self = task_current();
-    if (pid == 0 || (self && pid == self->pid)) return self;
-    return task_find((int)pid);
+    if (pid == 0) return self;
+    int g = ns_pid_resolve(self, (int)pid);
+    return g > 0 ? task_find(g) : NULL;
 }
 static long h_setsid(struct abi_ctx* c) {
     (void)c;
@@ -1170,7 +1217,7 @@ static long h_setsid(struct abi_ctx* c) {
      * setsid(1)): it outlives its parent instead of dying with it (task.c's
      * "a parent takes its subtree down" rule), adopted by a subreaper or init. */
     t->survives_parent = 1;
-    return t->pid;
+    return ns_vnr(t, t);
 }
 static long h_getsid(struct abi_ctx* c) {
     struct task* t = abi_pid_target((long)c->a[0]);
@@ -1194,7 +1241,12 @@ static long h_setpgid(struct abi_ctx* c) {
     if (t != self && t->ppid != self->pid) return -3;
     if ((long)c->a[1] < 0) return -22;                   /* EINVAL */
     if (t->sid == t->pid) return -1;                     /* EPERM: session leader */
-    int pg = (int)c->a[1] ? (int)c->a[1] : t->pid;
+    int pg = t->pid;
+    if ((int)c->a[1]) {                               /* the group, in OUR namespace */
+        int g = ns_pid_resolve(self, (int)c->a[1]);
+        pg = g > 0 ? g : (ns_pid_level(self) ? -1 : (int)c->a[1]);
+        if (pg < 0) return -1;                        /* EPERM: no such group here */
+    }
     t->pgid = (pg == 1) ? 0 : pg;
     /* §M90 — becoming the leader of a NEW process group (setpgid(0, 0), Go's
      * SysProcAttr.Setpgid) is the other way a Linux program detaches from the
@@ -1640,9 +1692,15 @@ static long h_wait(struct abi_ctx* c) {
      * (setpgid) but not yet used to select. */
     int want = (int)c->a[0];
     if (want < -1 || want == 0) want = -1;
-    int pid = task_wait_ex(want, &code, (int)(c->a[2] & 1));
+    if (want > 0) {                                       /* §M90 — in our namespace */
+        want = ns_pid_resolve(task_current(), want);
+        if (want <= 0) return -10;                        /* ECHILD */
+    }
+    int vnr = 0;
+    int pid = task_wait_ex2(want, &code, (int)(c->a[2] & 1), &vnr);
     if (pid < 0) return -10;                              /* ECHILD */
     if (pid == 0) return 0;                               /* WNOHANG, nobody yet */
+    pid = vnr ? vnr : pid;                                /* the number WE know it by */
     if (c->a[1]) {
         /* The status slot is the GUEST's pointer — validate it here, where its
          * origin is known.  (§M46's lesson, three times over.) */
@@ -2124,10 +2182,16 @@ static long h_ppoll(struct abi_ctx* c) {
     return r < 0 ? -ABI_EFAULT : r;
 }
 
+/* §M90 — set_tid_address(tidptr): RECORD the address as this thread's
+ * clear-child-tid (zeroed and futex-woken at its exit — task_exit_code), as
+ * Linux does; it used to be dropped.  Returns the tid as the caller's pid
+ * namespace names it. */
 static long h_settid(struct abi_ctx* c) {
-    (void)c;
     struct task* t = task_current();
-    return t ? t->pid : 0;
+    if (!t) return 0;
+    if (c->a[0] && abi_w_ok(c->a[0], sizeof(int))) t->clear_tid = (int*)(uintptr_t)c->a[0];
+    else if (!c->a[0]) t->clear_tid = NULL;
+    return ns_vnr(t, t);
 }
 
 /* exit: does NOT return.  Declared in the vocabulary precisely so the shims
@@ -2439,6 +2503,15 @@ static long h_recvfrom(struct abi_ctx* c) {
         if (r >= 0 && c->a[4]) abi_nl_out(c->a[4], c->a[5], 0);   /* from the kernel */
         return r;
     }
+    /* §M90 — a unix socket honours MSG_PEEK / MSG_TRUNC / MSG_DONTWAIT (they
+     * used to be dropped, and a zero-length peek was refused outright). */
+    if (abi_fd_is_unix((int)c->a[0])) {
+        long r = sys_unix_recv_flags_u((int)c->a[0], (uintptr_t)c->a[1], (size_t)c->a[2],
+                                       (int)c->a[3]);
+        if (r >= 0 && c->a[4] && c->a[5] && abi_w_ok(c->a[5], 4))
+            *(uint32_t*)(uintptr_t)c->a[5] = 0;          /* no source address */
+        return r;
+    }
     uint32_t ip = 0; int port = 0;
     long n = sys_recvfrom_u((int)c->a[0], (uintptr_t)c->a[1], (size_t)c->a[2],
                             &ip, &port);
@@ -2494,6 +2567,10 @@ static long h_getsockopt(struct abi_ctx* c) {
             int r = sys_sock_peercred(fd, &pid, &uid, &gid);
             if (r < 0) return -92;                               /* ENOPROTOOPT */
             if (r > 0) { pid = 0; uid = -1; gid = -1; }
+            else {                              /* §M90 — the pid as WE name it */
+                struct task* pt = task_find(pid);
+                pid = pt ? ns_vnr(task_current(), pt) : (ns_pid_level(task_current()) ? 0 : pid);
+            }
             if (!ulen || !abi_user_r_ok(ulen, sizeof(uint32_t))) return -ABI_EFAULT;
             uint32_t room = *(uint32_t*)(uintptr_t)ulen;
             int32_t cr[3] = { pid, uid, gid };

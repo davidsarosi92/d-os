@@ -1295,6 +1295,94 @@ static void sy_memfdtest(const char* args) {
              wsealed == -1 && tsealed == -1;
     console_write(ok ? "memfd: ok\n" : "memfd: FAIL\n");
 }
+/* §M90 — `pidnstest`: pid namespaces (nsproxy.c).  H unshares NEWPID and stays
+ * where it was; its first child C1 is number 1 inside, sees H as 0 (outside)
+ * while H sees C1 by its global pid; C1's child C2 is 2 inside and resolves
+ * from inside; C2's detached child C3 is adopted by C1 — the namespace's init,
+ * not the machine's — when C2 dies; and C1's death takes C3 down with it. */
+static volatile int g_pn_c1, g_pn_c2, g_pn_c3, g_pn_c1_self, g_pn_c1_seesh, g_pn_c2_in,
+                    g_pn_res2, g_pn_c3_ppid, g_pn_c1_go, g_pn_c2_go;
+static void pn_c3(void) { for (int i = 0; i < 400; i++) task_msleep(5); }
+static void pn_c2(void) {
+    struct task* me = task_current();
+    g_pn_c2_in = ns_vnr(me, me);
+    struct task* c3 = task_spawn("pidns-c3", pn_c3);
+    if (c3) { c3->survives_parent = 1; g_pn_c3 = c3->pid; }
+    while (!g_pn_c2_go) task_msleep(2);              /* then exit: C3 is orphaned */
+}
+static void pn_c1(void) {
+    struct task* me = task_current();
+    g_pn_c1_self = ns_vnr(me, me);
+    struct task* h = task_find(me->ppid);
+    g_pn_c1_seesh = h ? ns_vnr(me, h) : -1;
+    struct task* c2 = task_spawn("pidns-c2", pn_c2);
+    if (c2) g_pn_c2 = c2->pid;
+    task_msleep(30);
+    g_pn_res2 = ns_pid_resolve(me, 2);
+    g_pn_c2_go = 1;
+    task_msleep(60);                                 /* C2 is gone: who has C3? */
+    struct task* c3 = g_pn_c3 ? task_find(g_pn_c3) : NULL;
+    g_pn_c3_ppid = c3 ? c3->ppid : -1;
+    while (!g_pn_c1_go) task_msleep(2);              /* then the init dies */
+}
+static volatile int g_pn_lvl_h, g_pn_hsees, g_pn_done;
+static void pn_h(void) {
+    struct task* me = task_current();
+    int e = ns_unshare(me, NS_CLONE_NEWPID);
+    g_pn_lvl_h = e ? -1 : ns_pid_level(me);
+    struct task* c1 = task_spawn("pidns-c1", pn_c1);
+    if (c1) { g_pn_c1 = c1->pid; g_pn_hsees = ns_vnr(me, c1); }
+    g_pn_done = 1;
+    for (int i = 0; i < 300; i++) task_msleep(5);
+}
+static void sy_pidnstest(const char* args) {
+    (void)args;
+    g_pn_c1 = g_pn_c2 = g_pn_c3 = 0; g_pn_c1_go = g_pn_c2_go = 0; g_pn_done = 0;
+    g_pn_c3_ppid = g_pn_res2 = g_pn_c1_self = g_pn_c1_seesh = g_pn_c2_in = -9;
+    task_spawn("pidns-h", pn_h);
+    for (int i = 0; i < 100 && !(g_pn_done && g_pn_c3_ppid != -9); i++) task_msleep(5);
+    int c3_alive_before = g_pn_c3 && task_find(g_pn_c3) && task_find(g_pn_c3)->state != TASK_DEAD;
+    g_pn_c1_go = 1;                                  /* the init exits */
+    task_msleep(150);
+    struct task* c3 = g_pn_c3 ? task_find(g_pn_c3) : NULL;
+    int c3_gone = !c3 || c3->state == TASK_DEAD || c3->kill_pending;
+    kprintf("pidns: H level %d; C1 self %d (H sees %d, global %d); C1 sees H as %d; C2 inside %d, "
+            "resolve(2)=%d (C2 %d); C3 adopted by %d (C1 %d); C3 alive %d, gone after init %d\n",
+            g_pn_lvl_h, g_pn_c1_self, g_pn_hsees, g_pn_c1, g_pn_c1_seesh, g_pn_c2_in,
+            g_pn_res2, g_pn_c2, g_pn_c3_ppid, g_pn_c1, c3_alive_before, c3_gone);
+    int ok = g_pn_lvl_h == 0 && g_pn_c1_self == 1 && g_pn_hsees == g_pn_c1 && g_pn_c1_seesh == 0 &&
+             g_pn_c2_in == 2 && g_pn_res2 == g_pn_c2 && g_pn_c3_ppid == g_pn_c1 &&
+             c3_alive_before && c3_gone;
+    console_write(ok ? "pidns: ok\n" : "pidns: FAIL\n");
+}
+/* §M90 — `fdlinktest`: what /proc/<pid>/fd/N names, per descriptor kind,
+ * worded as Linux words it (runc identifies a container's stdio pipes this
+ * way).  Both ends of one pipe must name the SAME object. */
+static int fl_starts(const char* s, const char* p) { while (*p) if (*s++ != *p++) return 0; return 1; }
+static void sy_fdlinktest(const char* args) {
+    (void)args;
+    struct task* me = task_current();
+    int p[2] = { -1, -1 }, sp[2] = { -1, -1 };
+    sys_pipe_k(p);
+    sys_socketpair_k(sp);
+    int ef = sys_eventfd_create(0, 0), mf = sys_memfd(0);
+    int ff = sys_open_k("/fdlinktest.f", VFS_RDWR | VFS_CREATE);
+    char a[64], b[64], c[64], d[64], e[64], f[64], g[64];
+    sys_fd_link_of(me, p[0], a, sizeof a); sys_fd_link_of(me, p[1], b, sizeof b);
+    sys_fd_link_of(me, sp[0], c, sizeof c); sys_fd_link_of(me, ef, d, sizeof d);
+    sys_fd_link_of(me, mf, e, sizeof e);   sys_fd_link_of(me, ff, f, sizeof f);
+    int con = me->fds[2] ? 1 : (sys_fd_link_of(me, 2, g, sizeof g) == 0 && fl_starts(g, "/dev/console"));
+    int same = 1;
+    for (int i = 0; a[i] || b[i]; i++) if (a[i] != b[i]) { same = 0; break; }
+    kprintf("fdlink: pipe '%s' '%s' socket '%s' eventfd '%s' memfd '%s' file '%s'\n", a, b, c, d, e, f);
+    int ok = fl_starts(a, "pipe:[") && same && fl_starts(c, "socket:[") &&
+             fl_starts(d, "anon_inode:[eventfd]") && fl_starts(e, "/memfd:") &&
+             fl_starts(f, "/fdlinktest.f") && con;
+    sys_close(p[0]); sys_close(p[1]); sys_close(sp[0]); sys_close(sp[1]);
+    sys_close(ef); sys_close(mf); sys_close(ff);
+    vfs_unlink("/fdlinktest.f");
+    console_write(ok ? "fdlink: ok\n" : "fdlink: FAIL\n");
+}
 /* §M90 — `renametest`: rename across directories (docker writes a layer's
  * metadata in tmp/ and renames it into the store), a directory over an EMPTY
  * directory, and the two refusals that keep the tree a tree: a directory into
@@ -1404,6 +1492,10 @@ SHELL_CMD(seqpackettest) = { "seqpackettest", "", "SOCK_SEQPACKET keeps message 
                               SHELL_G_TEST, sy_seqpackettest, SHELL_P_ANY };
 SHELL_CMD(memfdtest) = { "memfdtest", "", "a memfd as a file: read/write/seek/truncate/seals",
                           SHELL_G_TEST, sy_memfdtest, SHELL_P_ANY };
+SHELL_CMD(pidnstest) = { "pidnstest", "", "pid namespaces: numbers, visibility, init, orphans",
+                          SHELL_G_TEST, sy_pidnstest, SHELL_P_ANY };
+SHELL_CMD(fdlinktest) = { "fdlinktest", "", "/proc/<pid>/fd/N names per descriptor kind",
+                           SHELL_G_TEST, sy_fdlinktest, SHELL_P_ANY };
 SHELL_CMD(fifotest) = { "fifotest", "", "named pipes: open rules, EOF/HUP, a blocking reader",
                          SHELL_G_TEST, sy_fifotest, SHELL_P_ANY };
 SHELL_CMD(unlinkopentest) = { "unlinkopentest", "", "an unlinked file stays readable while open",

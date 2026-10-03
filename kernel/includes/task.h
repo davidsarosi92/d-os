@@ -539,6 +539,11 @@ struct task {
      * ns_time_children (Linux's time_for_children). */
     struct nsobj* ns[8];
     struct nsobj* ns_time_children;
+    /* §M90 — pid namespaces: the namespace this task's next CHILD is born in
+     * (unshare/setns of CLONE_NEWPID only move that), and this task's number
+     * at every level of its own namespace chain (upid[0] = pid). */
+    struct nsobj* ns_pid_children;
+    int           upid[4];
     /* §M90 — clone() of the fork shape (proc_clone_fork): the options the
      * parent is forking with (set around proc_fork, consumed by
      * proc_fork_apply), the child's exit signal plus one (0 = the default,
@@ -754,6 +759,9 @@ int task_wait(int pid, int* code);
 /* §M90 — the same with WNOHANG: returns 0 when a matching child is alive but
  * none has exited.  Waits are by PROCESS (task_tgid) and never count threads. */
 int task_wait_ex(int pid, int* code, int nohang);
+int task_wait_ex2(int pid, int* code, int nohang, int* vnr_out);   /* §M90 */
+struct vmm_space;
+int task_space_handoff(struct task* owner, struct vmm_space* s);   /* §M90 */
 
 /* Internal scheduler entry — pick next RUNNABLE task and context_switch
  * to it.  Both task_yield and the IRQ-driven preemption path call this.

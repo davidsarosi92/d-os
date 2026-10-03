@@ -737,7 +737,11 @@ int sys_pipe(int* fds) {
     return sys_socketpair(fds);
 }
 int sys_pipe_k(int* fds) {
-    return sys_socketpair_k(fds);
+    if (sys_socketpair_k(fds) != 0) return -1;
+    struct ofile* a = fd_lookup(fds[0]);
+    struct ofile* b = fd_lookup(fds[1]);
+    usock_set_pipe(a ? a->sock : NULL, b ? b->sock : NULL);   /* §M90 — /proc names it */
+    return 0;
 }
 
 /* M34 — dup2(oldfd, newfd): make newfd refer to oldfd's object (closing any
@@ -2242,6 +2246,21 @@ static long ns_dgram_recv(struct netsock* ns, void* buf, size_t n, uint32_t* ip_
  * marshals (ip, port) into the client's `struct sockaddr_in` itself, but the
  * payload pointer is the client's.  sys_recvfrom (the d-os-native entry) is a
  * thin wrapper that also copies the address out to ring 3. */
+/* §M90 — recvfrom on a unix socket WITH its flags (usock_recv_flags), from a
+ * ring-3 buffer.  -1 when `fd` is not a unix socket (the caller falls back). */
+long sys_unix_recv_flags_u(int fd, uintptr_t ubuf, size_t n, int flags) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_SOCK) return -1;
+    if (n > 65536) n = 65536;
+    if (n && !vmm_user_access_ok(ubuf, n, 1)) return -14;
+    void* k = n ? kmalloc(n) : NULL;
+    if (n && !k) return -12;
+    long r = usock_recv_flags(o->sock, k, n, !o->nonblock, flags);
+    size_t copy = r > 0 ? ((size_t)r < n ? (size_t)r : n) : 0;   /* TRUNC may exceed n */
+    if (copy && copy_to_user(ubuf, k, copy) != 0) r = -14;
+    if (k) kfree(k);
+    return r;
+}
 long sys_recvfrom_u(int fd, uintptr_t ubuf, size_t n, uint32_t* ip_out, int* port_out) {
     if (n > UDP_MAX_PAYLOAD) n = UDP_MAX_PAYLOAD;
     if (n && !vmm_user_access_ok(ubuf, n, 1)) return -1;   /* §1.1 */
@@ -2589,6 +2608,67 @@ int sys_fd_path(int fd, char* out, size_t cap) {
     return vfs_dentry_path(o->file->dentry, out, cap) == 0 ? 0 : -1;
 }
 
+/* §M90 — slot `fd` of ANOTHER task's table (or the caller's), with a
+ * reference the caller drops (ofile_unref); NULL when empty. */
+static struct ofile* fd_ref_in(struct task* t, int fd) {
+    if (!t || fd < 0 || fd >= TASK_MAX_FDS) return NULL;
+    uint32_t fl = fdt_lock(t);
+    struct ofile* o = t->fds[fd];
+    if (o) ofile_ref(o);
+    fdt_unlock(t, fl);
+    return o;
+}
+
+/* §M90 — what readlink(/proc/<pid>/fd/N) says, as Linux words it: a file's
+ * path, "pipe:[n]", "socket:[n]", "anon_inode:[eventfd]", … (n identifies the
+ * object: two descriptors of one pipe read the same).  0, or -1 when the slot
+ * is closed. */
+static void lk_put(char* out, size_t cap, size_t* o, const char* s) {
+    for (; *s && *o + 1 < cap; s++) out[(*o)++] = *s;
+}
+static void lk_num(char* out, size_t cap, size_t* o, uintptr_t v) {
+    char d[24]; int n = 0;
+    do { d[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+    while (n && *o + 1 < cap) out[(*o)++] = d[--n];
+}
+int sys_fd_link_of(struct task* t, int fd, char* out, size_t cap) {
+    if (!out || cap < 2) return -1;
+    size_t o = 0;
+    struct ofile* f = fd_ref_in(t, fd);
+    if (!f) {
+        if (fd >= 0 && fd <= 2) { lk_put(out, cap, &o, "/dev/console"); out[o] = 0; return 0; }
+        return -1;
+    }
+    const char* tag = NULL;
+    uintptr_t id = (uintptr_t)f >> 3;
+    switch (f->kind) {
+    case FD_VFS: case FD_FIFO:
+        if (f->file && f->file->dentry && !(f->file->inode && f->file->inode->unlink_dir) &&
+            vfs_dentry_path(f->file->dentry, out, cap) == 0) { ofile_unref(f); return 0; }
+        tag = "anon_inode:[file]"; break;
+    case FD_SOCK:
+        /* a pipe is ONE object to Linux (both ends name it); each end of a
+         * socketpair is its own socket */
+        id = usock_is_pipe(f->sock) ? 4026540000u + usock_pipe_id(f->sock)
+                                    : (uintptr_t)f->sock >> 3;
+        tag = usock_is_pipe(f->sock) ? "pipe:[" : "socket:["; break;
+    case FD_NETSOCK: case FD_NETLINK: tag = "socket:["; break;
+    case FD_SHM:     tag = "/memfd: (deleted)"; break;
+    case FD_EVENT:   tag = "anon_inode:[eventfd]"; break;
+    case FD_EPOLL:   tag = "anon_inode:[eventpoll]"; break;
+    case FD_TIMER:   tag = "anon_inode:[timerfd]"; break;
+    case FD_CONSOLE: tag = "/dev/console"; break;
+    default:         tag = "anon_inode:[?]"; break;
+    }
+    lk_put(out, cap, &o, tag);
+    size_t tl = 0;
+    while (tag[tl]) tl++;
+    if (tl && tag[tl - 1] == '[') { lk_num(out, cap, &o, id); lk_put(out, cap, &o, "]"); }
+    out[o] = 0;
+    ofile_unref(f);
+    return 0;
+}
+
 /* §M90 — the VFS open file behind `fd` (FD_VFS), or NULL. */
 struct file* sys_fd_vfs_file(int fd) {
     struct ofile* o = fd_lookup(fd);
@@ -2596,8 +2676,23 @@ struct file* sys_fd_vfs_file(int fd) {
 }
 
 /* §M90 — see vfs.c (fd_vfs_dentry): the dentry of the caller's descriptor. */
+struct task* procfs_target(void);
 struct dentry* fd_vfs_dentry(int fd) {
-    struct ofile* o = fd_lookup(fd);
+    /* §M90 — /proc/<another pid>/fd/N names THAT process's descriptor (the
+     * path lookup recorded it as the /proc target), never the caller's. */
+    struct task* tg = procfs_target();
+    struct task* me = task_current();
+    struct ofile* o;
+    if (tg && me && tg != me && task_tgid(tg) != task_tgid(me)) {
+        o = fd_ref_in(tg, fd);
+        if (!o) return NULL;
+        struct dentry* d = ((o->kind == FD_VFS || o->kind == FD_FIFO) && o->file &&
+                            o->file->dentry && !(o->file->inode && o->file->inode->unlink_dir))
+                         ? o->file->dentry : NULL;
+        ofile_unref(o);
+        return d;
+    }
+    o = fd_lookup(fd);
     if (!o || (o->kind != FD_VFS && o->kind != FD_FIFO) || !o->file || !o->file->dentry) return NULL;
     if (o->file->inode && o->file->inode->unlink_dir) return NULL;
     return o->file->dentry;

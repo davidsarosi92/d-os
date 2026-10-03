@@ -357,9 +357,10 @@ static int vfs_fd_magic(const char* path, char* out, size_t cap) {
  *   /proc/<other pid>[/task/<tid>]/X  -> /proc/self/X, target = <other pid>,
  *                                        for ns/… and the per-process files in
  *                                        proc_foreign_ok (status, cgroup,
- *                                        oom_score_adj, oom_score, exe)
- * Another process's fd table or mountinfo stay unanswered — a wrong answer
- * (the caller's own, under another pid) is worse than a missing one.
+ *                                        oom_score_adj, oom_score, exe, fd/N —
+ *                                        the TARGET's descriptor, never ours)
+ * Another process's mountinfo stays unanswered — a wrong answer (the
+ * caller's own, under another pid) is worse than a missing one.
  * 1 if `out` holds the rewrite. */
 int task_tgid_current(void) __attribute__((weak));
 int task_tgid_current(void) { return -1; }
@@ -371,12 +372,16 @@ void task_set_proc_target(int pid) __attribute__((weak));
 void task_set_proc_target(int pid) { (void)pid; }
 int  task_tgid_alive(int pid) __attribute__((weak));
 int  task_tgid_alive(int pid) { (void)pid; return 0; }
+/* §M90 — a /proc/<n> number is in the CALLER's pid namespace: the global pid
+ * it names, or -1. */
+int  task_proc_resolve(long nr) __attribute__((weak));
+int  task_proc_resolve(long nr) { return (int)nr; }
 /* The per-process files that answer for ANOTHER process.  The rest of
  * /proc/self (fd/, mountinfo, …) is the caller's own view and is not offered
  * under a foreign pid — better ENOENT than the caller's data under another
  * process's name. */
 static int proc_foreign_ok(const char* rest) {
-    static const char* const ok[] = { "oom_score_adj", "oom_score", "status", "cgroup", "exe" };
+    static const char* const ok[] = { "oom_score_adj", "oom_score", "status", "cgroup", "exe", "fd" };
     for (unsigned i = 0; i < sizeof ok / sizeof ok[0]; i++) {
         const char* a = ok[i]; const char* b = rest;
         while (*a && *a == *b) { a++; b++; }
@@ -413,8 +418,10 @@ static int vfs_proc_alias(const char* c, char* out, size_t cap) {
             while (c[k] >= '0' && c[k] <= '9') { pid = pid * 10 + (c[k] - '0'); k++; d++; }
             if (!d || c[k] != '/') return 0;
             k++;
-            own = pid == task_tgid_current();
-            if (!own) fpid = pid;
+            int g = task_proc_resolve(pid);       /* §M90 — in the caller's pid namespace */
+            if (g <= 0) return 0;                  /* nobody by that number here: ENOENT */
+            own = g == task_tgid_current();
+            if (!own) fpid = g;
             else task_set_proc_target(0);           /* /proc/<own pid>: the caller */
         }
         /* an optional "task/<tid>/" */

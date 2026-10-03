@@ -26,7 +26,12 @@
  *           stack is single-instance; user: no id mapping).
  *   MNT     the VFS's own (task->mntns, vfs_mntns_new) — only its handle's
  *           number is produced here.
- *   PID     not yet: refused by unshare until pid numbers are per-namespace.
+ *   PID     REAL: a task has a number in its namespace and in each ancestor;
+ *           every pid crossing the system call boundary is translated to the
+ *           caller's view (getpid, kill, wait, siginfo, /proc…), the first
+ *           process of a namespace is its init (1), orphans inside go to it,
+ *           and its death takes the whole namespace down.  unshare and setns
+ *           move pid_for_children only, as on Linux.
  *
  * IDENTITY.  Each object has an inode number, which is what a program
  * compares (readlink of /proc/self/ns/X, or st_ino of the handle) to decide
@@ -73,6 +78,7 @@ uint32_t ns_ino_of(const struct task* t, int kind) {
 }
 uint32_t ns_child_ino_of(const struct task* t, int kind) {
     if (kind == NSK_TIME && t && t->ns_time_children) return t->ns_time_children->ino;
+    if (kind == NSK_PID && t && t->ns_pid_children) return t->ns_pid_children->ino;
     return ns_ino_of(t, kind);
 }
 
@@ -86,6 +92,7 @@ static struct nsobj* ns_ref(struct nsobj* o) {
 struct nsobj* ns_get(const struct task* t, int kind) { return ns_ref(obj_of(t, kind)); }
 struct nsobj* ns_get_child(const struct task* t, int kind) {
     if (kind == NSK_TIME && t && t->ns_time_children) return ns_ref(t->ns_time_children);
+    if (kind == NSK_PID && t && t->ns_pid_children) return ns_ref(t->ns_pid_children);
     return ns_get(t, kind);
 }
 void ns_put(struct nsobj* o) {
@@ -93,7 +100,11 @@ void ns_put(struct nsobj* o) {
     uint32_t f = spin_lock_irqsave(&g_ns_lock);
     int last = --o->refs == 0;
     spin_unlock_irqrestore(&g_ns_lock, f);
-    if (last) kfree(o);
+    if (last) {
+        struct nsobj* par = o->kind == NSK_PID ? o->parent : NULL;
+        kfree(o);
+        ns_put(par);
+    }
 }
 
 /* A new namespace of `kind`, starting as a copy of what `t` sees now. */
@@ -117,6 +128,7 @@ static struct nsobj* ns_new(const struct task* t, int kind) {
     return o;
 }
 
+struct nsobj* ns_pid_new(const struct task* t, int* err);
 static void set_slot(struct nsobj** slot, struct nsobj* o) {
     struct nsobj* old = *slot;
     *slot = o;
@@ -126,7 +138,11 @@ static void set_slot(struct nsobj** slot, struct nsobj* o) {
 int ns_unshare(struct task* t, unsigned long flags) {
     if (!t) return -22;
     /* Build every new object first, so an allocation failure changes nothing. */
-    struct nsobj *uts = NULL, *ipc = NULL, *cg = NULL, *tm = NULL;
+    struct nsobj *uts = NULL, *ipc = NULL, *cg = NULL, *tm = NULL, *pd = NULL;
+    if (flags & NS_CLONE_NEWPID) {
+        int e = 0;
+        if (!(pd = ns_pid_new(t, &e))) return e;
+    }
     if ((flags & NS_CLONE_NEWUTS)    && !(uts = ns_new(t, NSK_UTS)))    goto oom;
     if ((flags & NS_CLONE_NEWIPC)    && !(ipc = ns_new(t, NSK_IPC)))    goto oom;
     if ((flags & NS_CLONE_NEWCGROUP) && !(cg  = ns_new(t, NSK_CGROUP))) goto oom;
@@ -135,9 +151,10 @@ int ns_unshare(struct task* t, unsigned long flags) {
     if (ipc) set_slot(&t->ns[NSK_IPC], ipc);
     if (cg)  set_slot(&t->ns[NSK_CGROUP], cg);
     if (tm)  set_slot(&t->ns_time_children, tm);   /* children only — see the header */
+    if (pd)  set_slot(&t->ns_pid_children, pd);    /* likewise */
     return 0;
 oom:
-    ns_put(uts); ns_put(ipc); ns_put(cg); ns_put(tm);
+    ns_put(uts); ns_put(ipc); ns_put(cg); ns_put(tm); ns_put(pd);
     return -12;
 }
 
@@ -148,6 +165,10 @@ void ns_enter(struct task* t, int kind, struct nsobj* o) {
      * time namespace sets both). */
     if (kind == NSK_TIME) set_slot(&t->ns_time_children, ns_ref(o));
 }
+/* setns of a PID namespace moves only where children are born (Linux). */
+void ns_enter_pid_children(struct task* t, struct nsobj* o) {
+    if (t) set_slot(&t->ns_pid_children, ns_ref(o));
+}
 
 void ns_inherit(const struct task* parent, struct task* child) {
     for (int k = 0; k < NSK_COUNT; k++) child->ns[k] = ns_get(parent, k);
@@ -156,6 +177,11 @@ void ns_inherit(const struct task* parent, struct task* child) {
         child->ns[NSK_TIME] = ns_ref(parent->ns_time_children);
     }
     child->ns_time_children = ns_ref(child->ns[NSK_TIME]);
+    if (parent && parent->ns_pid_children) {
+        ns_put(child->ns[NSK_PID]);
+        child->ns[NSK_PID] = ns_ref(parent->ns_pid_children);
+    }
+    child->ns_pid_children = ns_ref(child->ns[NSK_PID]);
 }
 
 void ns_release(struct task* t) {
@@ -163,6 +189,8 @@ void ns_release(struct task* t) {
     for (int k = 0; k < NSK_COUNT; k++) { ns_put(t->ns[k]); t->ns[k] = NULL; }
     ns_put(t->ns_time_children);
     t->ns_time_children = NULL;
+    ns_put(t->ns_pid_children);
+    t->ns_pid_children = NULL;
 }
 
 /* ---- UTS ------------------------------------------------------------------- */
@@ -209,4 +237,94 @@ void ns_cgroup_view(const struct task* t, const char* full, char* out, size_t ca
     if (under && n > 1 && full[n] != 0 && full[n] != '/') under = 0;
     if (!under || n == 1) { s_cpy(out, full, cap); return; }
     s_cpy(out, full[n] ? full + n : "/", cap);
+}
+
+/* ---- PID ------------------------------------------------------------------- */
+
+/* A new pid namespace below the one `t`'s children are born in now (one
+ * reference), or NULL with *err = -12 ENOMEM / -28 ENOSPC (too deep, as
+ * Linux answers past its 32 levels — ours stops at PIDNS_MAX_LEVEL). */
+struct nsobj* ns_pid_new(const struct task* t, int* err) {
+    struct nsobj* par = t ? (t->ns_pid_children ? t->ns_pid_children : t->ns[NSK_PID]) : NULL;
+    int lvl = par ? par->level + 1 : 1;
+    if (lvl >= PIDNS_MAX_LEVEL) { if (err) *err = -28; return NULL; }
+    struct nsobj* o = ns_new(t, NSK_PID);
+    if (!o) { if (err) *err = -12; return NULL; }
+    o->level = lvl;
+    o->parent = ns_ref(par);
+    o->next_nr = 1;
+    return o;
+}
+
+int ns_pid_level(const struct task* t) {
+    struct nsobj* o = obj_of(t, NSK_PID);
+    return o ? o->level : 0;
+}
+
+void ns_pid_assign(struct task* child) {
+    if (!child) return;
+    for (int l = 0; l < PIDNS_MAX_LEVEL; l++) child->upid[l] = 0;
+    child->upid[0] = child->pid;
+    for (struct nsobj* o = obj_of(child, NSK_PID); o && o->level > 0; o = o->parent) {
+        uint32_t f = spin_lock_irqsave(&g_ns_lock);
+        int nr = o->next_nr++;
+        if (nr == 1) o->init_pid = child->pid;       /* the first is the init */
+        spin_unlock_irqrestore(&g_ns_lock, f);
+        if (o->level < PIDNS_MAX_LEVEL) child->upid[o->level] = nr;
+    }
+}
+
+int ns_pid_within(const struct task* t, const struct nsobj* ns) {
+    if (!ns) return 1;                                /* everything is in the initial one */
+    for (struct nsobj* o = obj_of(t, NSK_PID); o; o = o->parent)
+        if (o == ns) return 1;
+    return 0;
+}
+
+int ns_vnr(const struct task* viewer, const struct task* t) {
+    if (!t) return 0;
+    struct nsobj* v = obj_of(viewer, NSK_PID);
+    if (!v) return t->pid;                            /* the initial namespace: global */
+    if (!ns_pid_within(t, v)) return 0;               /* outside: invisible */
+    return v->level < PIDNS_MAX_LEVEL ? t->upid[v->level] : 0;
+}
+
+struct pid_find { const struct task* viewer; int nr; int found; };
+static void pid_find_cb(const struct task* t, int is_current, void* ctx) {
+    (void)is_current;
+    struct pid_find* f = (struct pid_find*)ctx;
+    if (f->found < 0 && t->state != TASK_DEAD && ns_vnr(f->viewer, t) == f->nr) f->found = t->pid;
+}
+int ns_pid_resolve(const struct task* viewer, int nr) {
+    if (nr <= 0) return -1;
+    if (!obj_of(viewer, NSK_PID)) {
+        struct task* t = task_find(nr);
+        return t ? t->pid : -1;
+    }
+    struct pid_find f = { viewer, nr, -1 };
+    task_for_each(pid_find_cb, &f);
+    return f.found;
+}
+
+int ns_pid_is_init(const struct task* t) {
+    struct nsobj* o = obj_of(t, NSK_PID);
+    return o && o->init_pid == t->pid;
+}
+
+struct pid_zap { const struct nsobj* ns; int self; int pids[128]; int n; };
+static void pid_zap_cb(const struct task* t, int is_current, void* ctx) {
+    (void)is_current;
+    struct pid_zap* z = (struct pid_zap*)ctx;
+    if (t->pid != z->self && t->state != TASK_DEAD && obj_of(t, NSK_PID) &&
+        ns_pid_within(t, z->ns) && z->n < 128) z->pids[z->n++] = t->pid;
+}
+void ns_pid_init_died(struct task* t) {
+    struct nsobj* o = obj_of(t, NSK_PID);
+    if (!o || o->init_pid != t->pid) return;
+    o->init_pid = 0;                                 /* no new process may join */
+    /* Linux: when a pid namespace's init dies, every other process in it (and
+     * below) is killed — the namespace cannot outlive its reaper. */
+    struct pid_zap z = { o, t->pid, { 0 }, 0 };
+    task_for_each(pid_zap_cb, &z);
+    for (int i = 0; i < z.n; i++) task_kill(z.pids[i]);
 }

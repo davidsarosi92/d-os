@@ -202,6 +202,11 @@ int  usock_peercred(struct usock* s, int* pid, int* uid, int* gid);
 /* §M90 — SOCK_SEQPACKET (message boundaries kept) on a fresh pair. */
 void usock_set_seqpacket(struct usock* a, struct usock* b);
 int  usock_is_seqpacket(struct usock* s);
+void usock_set_pipe(struct usock* a, struct usock* b);   /* §M90 */
+int  usock_is_pipe(struct usock* s);
+uint32_t usock_pipe_id(struct usock* s);
+/* §M90 — recv with MSG_PEEK / MSG_TRUNC / MSG_DONTWAIT (usock.c). */
+long usock_recv_flags(struct usock* s, void* buf, size_t n, int block, int flags);
 
 /* Tier A.3 — poll readiness signal.  usock_send / usock_close call this
  * after changing an fd's readiness so a task blocked in a (timeout < 0)

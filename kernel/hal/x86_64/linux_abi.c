@@ -601,7 +601,8 @@ static void linux_syscall_body(struct int_frame* f) {
             r.r8 = f->r8; r.r9 = f->r9; r.r10 = f->r10; r.r11 = f->r11;
             r.r12 = f->r12; r.r13 = f->r13; r.r14 = f->r14; r.r15 = f->r15;
             r.rip = f->rip; r.rflags = f->rflags; r.user_sp = f->rsp;
-            f->rax = (uint64_t)proc_fork(&r);
+            /* §M90 — the child as OUR pid namespace names it */
+            f->rax = (uint64_t)proc_fork_vnr(&r);
             return;
         }
         case LNX_execve:

@@ -26,6 +26,7 @@
 #include "vmm.h"
 #include "fd.h"
 #include "printf.h"
+#include "nsproxy.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -455,17 +456,29 @@ static int may_signal(struct task* me, struct task* t) {
 }
 
 static long send_to(int tid, int sig, int code) {
-    struct task* t = task_find(tid);
-    if (!t) return -E_SRCH;
     struct task* me = task_current();
+    /* §M90 — `tid` is a number in the SENDER's pid namespace. */
+    int g = ns_pid_resolve(me, tid);
+    struct task* t = g > 0 ? task_find(g) : NULL;
+    if (!t) return -E_SRCH;
     if (!may_signal(me, t)) return -E_PERM;
     if (sig == 0) return 0;                                  /* existence probe */
     if (sig < 0 || sig >= LNX_NSIG) return -E_INVAL;
+    /* §M90 — a pid namespace's init is protected from its own namespace:
+     * a signal it has no handler for is DROPPED when sent from inside (SIGKILL
+     * and SIGSTOP included), as on Linux — the container's init cannot be
+     * killed by a process it is supposed to reap.  From an ancestor namespace
+     * the signal goes through. */
+    if (ns_pid_is_init(t) && me && ns_pid_level(me) >= ns_pid_level(t)) {
+        struct lnx_sigstate* ts = state_of(t, 0);
+        uintptr_t h = (ts && ts->sh) ? ts->sh->a[sig].handler : 0;
+        if (sig == 9 || sig == SIGSTOP || h == 0) return 0;
+    }
     if (sig == SIGSTOP || sig == 20 /* SIGTSTP */ || sig == SIGCONT)
         return sys_kill(tid, sig) == 0 ? 0 : -E_PERM;        /* §M72 acts on these */
     struct lnx_siginfo si;
     si.signo = sig; si.code = code; si.addr = 0;
-    si.pid = me ? me->pid : 0;
+    si.pid = me ? ns_vnr(t, me) : 0;                 /* §M90 — as the receiver sees us */
     si.uid = me ? cred_uid(&me->cred) : 0;
     if (si.uid < 0) si.uid = 0;
     return lnx_sig_post(t, sig, &si) == 0 ? 0 : -E_INVAL;

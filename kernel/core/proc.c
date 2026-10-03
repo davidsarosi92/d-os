@@ -477,7 +477,13 @@ static int proc_exec_common(const void* image, size_t len,
     fd_close_all();                    /* reclaim any fds the program opened */
     vmm_space_switch(prev);
     if (me) task_swap_mm(me, prev);
-    vmm_space_destroy(s);
+    /* §M90 — the program's THREADS share `s` and may still be on their way out
+     * in the kernel (a joined thread has finished in user space, not yet left
+     * its CPU).  Destroying the space under them freed page tables a running
+     * thread was still switching to: the NEXT program's memory was corrupted
+     * (a second `pthreadtest` hung in join, or the kernel jumped to address 7
+     * from a task whose name had been overwritten).  The last user destroys it. */
+    if (!task_space_handoff(me, s)) vmm_space_destroy(s);
     int code = me ? me->exc_code : 0;
     if (me) me->exc_code = 0;
     return fault ? -(128 + fault) : code;
@@ -628,6 +634,10 @@ int proc_execve_env_k(const char* kpath, char* const uargv[], char* const uenvp[
     /* 4. Commit: swap to the new space, free the old one + scratch.  execve
      *    resets signal dispositions to default (custom handlers pointed into
      *    the old image); the restorer is re-registered by the new program. */
+    /* §M90 — the clear-child-tid address belongs to the OLD image (set by
+     * set_tid_address or CLONE_CHILD_CLEARTID); at exit it would be zeroed in
+     * the NEW one, corrupting whatever lives there.  Linux drops it at exec. */
+    me->clear_tid = NULL;
     for (int i = 0; i < NSIG; i++) me->sig_handler[i] = SIG_DFL;
     me->sig_pending = 0;
     for (unsigned i = 0; i < sizeof me->cred.exe; i++) me->cred.exe[i] = new_exe[i];
@@ -927,12 +937,18 @@ struct clone_opts { unsigned long flags; uintptr_t ctid; };
 #define CL_CHILD_CLEARTID 0x00200000ul
 #define CL_CHILD_SETTID   0x01000000ul
 #define CL_NSOBJ          (NS_CLONE_NEWUTS | NS_CLONE_NEWIPC | NS_CLONE_NEWCGROUP | NS_CLONE_NEWTIME)
+/* §M90 — a fork's return value, as the caller's pid namespace names the child. */
+static int fork_vnr(int pid) {
+    struct task* c = pid > 0 ? task_find(pid) : NULL;
+    return c ? ns_vnr(task_current(), c) : pid;
+}
+int proc_fork_vnr(struct user_regs* r) { int p = proc_fork(r); return p > 0 ? fork_vnr(p) : p; }
 
 int vfs_mntns_new(int parent);
 long proc_clone_fork(struct user_regs* r, unsigned long flags, uintptr_t stack,
                      uintptr_t ptid, uintptr_t ctid) {
     unsigned long known = 0xFFul | CL_VFORK | CL_PARENT | CL_PARENT_SETTID | CL_CHILD_CLEARTID |
-                          CL_CHILD_SETTID | NS_CLONE_NEWNS | CL_NSOBJ;
+                          CL_CHILD_SETTID | NS_CLONE_NEWNS | CL_NSOBJ | NS_CLONE_NEWPID;
     if (flags & ~known) {
         kprintf("clone: flags %lx not supported for a new process\n", flags & ~known);
         return -22;
@@ -943,16 +959,33 @@ long proc_clone_fork(struct user_regs* r, unsigned long flags, uintptr_t stack,
         cred_uid(&me->cred) != 0 && !cred_is_admin(&me->cred)) return -1;   /* EPERM */
     if ((flags & CL_PARENT_SETTID) && !vmm_user_access_ok(ptid, sizeof(int), 1)) return -14;
     if (stack) r->user_sp = stack;
-    struct clone_opts o = { flags, ctid };
+    /* CLONE_NEWPID: the CHILD is born in a new pid namespace and is its init.
+     * Done by making it, for this one fork, where the caller's children are
+     * born — so the numbering at spawn (ns_pid_assign) does the rest. */
+    struct nsobj* newns = NULL;
+    struct nsobj* saved_pidc = NULL;
+    if (flags & NS_CLONE_NEWPID) {
+        int e = 0;
+        newns = ns_pid_new(me, &e);
+        if (!newns) return e;                                 /* ENOMEM / ENOSPC */
+        saved_pidc = me->ns_pid_children;                     /* our reference stays here */
+        me->ns_pid_children = newns;                          /* ...only for this fork */
+    }
+    struct clone_opts o = { flags & ~NS_CLONE_NEWPID, ctid };
     me->fork_opts = &o;
     int pid = proc_fork(r);
     me->fork_opts = NULL;
+    if (newns) {
+        me->ns_pid_children = saved_pidc;
+        ns_put(newns);                     /* the child holds its own reference */
+    }
     if (pid < 0) return -11;                                  /* EAGAIN */
+    int vnr = fork_vnr(pid);
     if (flags & CL_PARENT_SETTID) {
-        int v = pid;
+        int v = vnr;
         copy_to_user(ptid, &v, sizeof v);
     }
-    return pid;
+    return vnr;
 }
 
 /* In proc_fork, before the child may run: what the clone flags change about

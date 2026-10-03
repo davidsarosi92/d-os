@@ -934,6 +934,7 @@ static struct task* spawn_common_ex(const char* name, void (*entry)(void),
     t->sid  = cur ? cur->sid  : 0;
     t->oom_score_adj = cur ? cur->oom_score_adj : 0;   /* §M90 — inherited */
     ns_inherit(cur, t);                      /* §M90 — namespaces, with references */
+    ns_pid_assign(t);                        /* §M90 — its number in each pid namespace */
     t->state       = TASK_RUNNABLE;
     /* §M32 — identity, inherited HERE and nowhere else.  Assigning creds from
      * a call site after spawn returns would be assigning them to a task another
@@ -2138,12 +2139,22 @@ static struct task* ring_find_locked(int pid) {
     return NULL;
 }
 static int adopter_for_locked(const struct task* dying) {
+    /* §M90 — within the dying task's PID NAMESPACE: a subreaper is only looked
+     * for among ancestors that namespace can see, and the namespace's own init
+     * is the reaper of last resort (Linux's find_new_reaper).  When the init
+     * itself dies its namespace is being killed; its children go up a level. */
+    struct nsobj* pns = dying->ns[NSK_PID];
     int pid = dying->ppid;
     for (int depth = 0; depth < 64 && pid > 0 && pid != g_init_pid; depth++) {
         struct task* a = ring_find_locked(pid);
         if (!a) break;
+        if (pns && !ns_pid_within(a, pns)) break;         /* left the namespace */
         if (a->child_subreaper && a->state != TASK_DEAD) return a->pid;
         pid = a->ppid;
+    }
+    if (pns && pns->init_pid && pns->init_pid != dying->pid) {
+        struct task* in = ring_find_locked(pns->init_pid);
+        if (in && in->state != TASK_DEAD) return in->pid;
     }
     return g_init_pid;
 }
@@ -2368,6 +2379,42 @@ int task_reap(int pid) {
     return 0;
 }
 
+/* §M90 — an address space created by `owner` is being given up while OTHER
+ * tasks may still use it (the threads of an excursion's program: it joins
+ * them in user space, but in the kernel they are still on their way out).
+ * Tell each to die, then hand the space to one of them under master_lock —
+ * its reap destroys it, as task_reap does for an exiting leader.  1 = handed
+ * on (the caller must NOT destroy it), 0 = nobody else uses it. */
+int task_space_handoff(struct task* owner, struct vmm_space* s) {
+    if (!s) return 0;
+    int pids[64], n = 0;
+    uint32_t fl = spin_lock_irqsave(&master_lock);
+    if (master_head) {
+        struct task* c = master_head;
+        do {
+            if (c != owner && c->mm == s && c->state != TASK_DEAD && n < 64) pids[n++] = c->pid;
+            c = c->next;
+        } while (c != master_head);
+    }
+    spin_unlock_irqrestore(&master_lock, fl);
+    for (int i = 0; i < n; i++) task_kill(pids[i]);
+    int handed = 0;
+    fl = spin_lock_irqsave(&master_lock);
+    if (master_head) {
+        struct task* c = master_head;
+        do {
+            if (c != owner && c->mm == s && c->user_task) {
+                c->mm_shared = 0;            /* this one's reap destroys the space */
+                handed = 1;
+                break;
+            }
+            c = c->next;
+        } while (c != master_head);
+    }
+    spin_unlock_irqrestore(&master_lock, fl);
+    return handed;
+}
+
 /* ------------------------------------------------------------------- */
 /* M27 — process model: init/reaper, kill-tree, parentage helpers.     */
 /* ------------------------------------------------------------------- */
@@ -2530,7 +2577,8 @@ void task_start_init(void) {
  * (nested inside the queue lock; safe because task_exit_code never holds both
  * at once — it releases master_lock before taking the queue lock). */
 static void wait_scan_locked(int parent_pid, int want,
-                             int* any_alive, int* dead_pid, int* dead_code) {
+                             int* any_alive, int* dead_pid, int* dead_code,
+                             const struct task* viewer, int* dead_vnr) {
     /* §M90 — a wait is the PROCESS's (any thread may reap its children), and
      * a THREAD is not a child to wait for: it is joined through its CLEARTID
      * futex, and counting it as an "alive child" made wait(-1) block forever
@@ -2545,7 +2593,10 @@ static void wait_scan_locked(int parent_pid, int want,
             if (c->ppid == parent_pid && (want <= 0 || c->pid == want) &&
                 !(c->tgid && c->tgid != c->pid)) {
                 if (c->state == TASK_DEAD) {
-                    if (*dead_pid < 0) { *dead_pid = c->pid; *dead_code = c->exit_code; }
+                    if (*dead_pid < 0) {
+                        *dead_pid = c->pid; *dead_code = c->exit_code;
+                        if (dead_vnr) *dead_vnr = ns_vnr(viewer, c);   /* §M90 */
+                    }
                 } else {
                     *any_alive = 1;
                 }
@@ -2593,15 +2644,18 @@ void task_exit_group(int code) {
  * exited yet (instead of sleeping).  containerd's reaper drains its children
  * with wait4(-1, WNOHANG) from a SIGCHLD loop; a wait that ignored the flag
  * parked that thread for as long as any child lived. */
-int task_wait_ex(int pid, int* code, int nohang) {
+int task_wait_ex(int pid, int* code, int nohang) { return task_wait_ex2(pid, code, nohang, NULL); }
+/* §M90 — the same, also giving the child's number as the caller's PID
+ * NAMESPACE sees it (computed while the child still exists). */
+int task_wait_ex2(int pid, int* code, int nohang, int* vnr_out) {
     struct task* self = task_current();
     if (!self) return -1;
     int me = task_tgid(self);                /* §M90 — the process waits */
 
     uint32_t f = waitq_lock(&child_exit_wq);
     for (;;) {
-        int any_alive, dead_pid, dead_code;
-        wait_scan_locked(me, pid, &any_alive, &dead_pid, &dead_code);
+        int any_alive, dead_pid, dead_code, dead_vnr = 0;
+        wait_scan_locked(me, pid, &any_alive, &dead_pid, &dead_code, self, &dead_vnr);
 
         if (dead_pid >= 0) {
             /* Found a dead child.  Capture the code now (under the queue
@@ -2611,6 +2665,7 @@ int task_wait_ex(int pid, int* code, int nohang) {
              * but we already hold the exit code, so we still return it. */
             waitq_unlock(&child_exit_wq, f);
             if (code) *code = dead_code;
+            if (vnr_out) *vnr_out = dead_vnr;
             /* §M73 — task_reap REFUSES while the child is still on its CPU
              * (DEAD is published just before its last context switch) and says
              * "caller retries" — and this caller did not.  A waiter is woken by
@@ -2825,6 +2880,8 @@ void task_exit_code(int code) {
             (void)kforce[i];
             task_kill(kids[i]);
         }
+        /* §M90 — the init of a pid namespace takes every process in it down. */
+        if (ns_pid_is_init(self)) ns_pid_init_died(self);
     }
 
     /* Remove from the rq so the next pick doesn't keep tripping over a DEAD
@@ -2899,7 +2956,7 @@ void task_exit_code(int code) {
         self->exit_sig_plus1 != 1) {
         struct task* par = task_find(self->ppid);
         if (par && par->linux_abi && par->state != TASK_DEAD)
-            lnx_sig_child_exit(par, self->pid, code & 0xFF, 0);
+            lnx_sig_child_exit(par, ns_vnr(par, self), code & 0xFF, 0);
     }
     task_notify_change();                    /* M22.4 — went DEAD */
 
@@ -3550,6 +3607,9 @@ const char* task_proc_exe(void) {
 void task_set_proc_target(int pid) {
     struct task* t = task_current();
     if (t) t->proc_target_pid = pid;
+}
+int task_proc_resolve(long nr) {
+    return ns_pid_resolve(task_current(), (int)nr);
 }
 int task_tgid_alive(int pid) {
     struct task* t = task_find(pid);

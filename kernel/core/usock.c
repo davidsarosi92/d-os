@@ -81,6 +81,8 @@ struct usock {
      * behaviour).  runc's sync pipe is one: a stream would merge two of its
      * JSON messages into one read. */
     int           seqpacket;
+    int           is_pipe;           /* §M90 — made by pipe(): reads as "pipe:[n]" */
+    uint32_t      pipe_id;           /* §M90 — one number for both ends of a pipe */
 };
 #define SEQ_HDR 4
 
@@ -464,3 +466,72 @@ void usock_set_seqpacket(struct usock* a, struct usock* b) {
     if (b) b->seqpacket = 1;
 }
 int usock_is_seqpacket(struct usock* s) { return s && s->seqpacket; }
+
+/* §M90 — mark a pair as a PIPE (it is a usock pair underneath) so /proc can
+ * name it as Linux does ("pipe:[n]" rather than "socket:[n]"). */
+void usock_set_pipe(struct usock* a, struct usock* b) {
+    static uint32_t next = 1;
+    uint32_t id = __atomic_fetch_add(&next, 1, __ATOMIC_RELAXED);
+    if (a) { a->is_pipe = 1; a->pipe_id = id; }
+    if (b) { b->is_pipe = 1; b->pipe_id = id; }
+}
+int usock_is_pipe(struct usock* s) { return s && s->is_pipe; }
+/* The number /proc shows: the PIPE's (shared by its two ends), else 0. */
+uint32_t usock_pipe_id(struct usock* s) { return s ? s->pipe_id : 0; }
+
+/* §M90 — recv with Linux's flags (recvfrom / recvmsg on a unix socket):
+ *   MSG_PEEK     (0x02) copy without consuming;
+ *   MSG_TRUNC    (0x20) on SOCK_SEQPACKET, return the message's REAL length
+ *                       even when it did not fit (runc asks the size of the
+ *                       next packet with recvfrom(fd, NULL, 0, PEEK|TRUNC));
+ *                       on a stream, the bytes are discarded, not copied;
+ *   MSG_DONTWAIT (0x40) never block (as non-blocking does).
+ * Returns bytes (or the length above), 0 at EOF, -11 EAGAIN when nothing
+ * waits and the call may not block. */
+long usock_recv_flags(struct usock* s, void* buf, size_t n, int block, int flags) {
+    if (!s) return -9;
+    int peek = flags & 0x02, trunc = flags & 0x20;
+    if (flags & 0x40) block = 0;
+    uint32_t f = waitq_lock(&s->readers);
+    while (block && s->count == 0 && s->peer != NULL) waitq_block(&s->readers);
+    if (s->count == 0) {
+        int open = s->peer != NULL;
+        waitq_unlock(&s->readers, f);
+        return open ? -11 : 0;
+    }
+    uint8_t* dst = (uint8_t*)buf;
+    long ret = 0;
+    int consumed = 0;
+    if (s->seqpacket) {
+        if (s->count < SEQ_HDR) { waitq_unlock(&s->readers, f); return -11; }
+        uint32_t len = 0;
+        for (int i = 0; i < SEQ_HDR; i++)
+            len |= (uint32_t)s->rx[(s->head + i) % USOCK_BUF] << (8 * i);
+        size_t take = len < n ? len : n;
+        for (size_t i = 0; i < take; i++)
+            dst[i] = s->rx[(s->head + SEQ_HDR + i) % USOCK_BUF];
+        if (!peek) {
+            s->head = (s->head + SEQ_HDR + (int)len) % USOCK_BUF;
+            s->count -= SEQ_HDR + (int)len;
+            consumed = 1;
+        }
+        ret = trunc ? (long)len : (long)take;
+    } else {
+        size_t take = (size_t)s->count < n ? (size_t)s->count : n;
+        if (!trunc) for (size_t i = 0; i < take; i++) dst[i] = s->rx[(s->head + i) % USOCK_BUF];
+        if (!peek) {
+            s->head = (s->head + (int)take) % USOCK_BUF;
+            s->count -= (int)take;
+            consumed = take > 0;
+        }
+        ret = (long)take;
+    }
+    waitq_unlock(&s->readers, f);
+    if (consumed) {
+        uint32_t wf = waitq_lock(&s->writers);
+        waitq_wake_all(&s->writers);
+        waitq_unlock(&s->writers, wf);
+        fd_readiness_changed(NULL);
+    }
+    return ret;
+}

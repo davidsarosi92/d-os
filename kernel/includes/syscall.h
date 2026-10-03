@@ -242,6 +242,9 @@ long sys_open_ex_k(const char* kpath, int flags, int nonblock, int opath); /* §
 int  sys_sock_peercred(int fd, int* pid, int* uid, int* gid);           /* §M90 */
 struct file;
 struct file* sys_fd_vfs_file(int fd);                                  /* §M90 */
+struct task;
+int  sys_fd_link_of(struct task* t, int fd, char* out, size_t cap);      /* §M90 */
+long sys_unix_recv_flags_u(int fd, uintptr_t ubuf, size_t n, int flags); /* §M90 */
 int  sys_fd_path(int fd, char* out, size_t cap);                       /* §M90 */
 int  sys_unlink(const char* upath);
 long sys_mmap_full(uintptr_t addr, size_t len, int prot, int flags,

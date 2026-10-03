@@ -675,9 +675,13 @@ static void gen_selfstatus(struct procfs_writer* w) {
     uint64_t priv = 0;
     task_mem_bytes(t, &priv, NULL, NULL);
     pw_puts(w, "Name:\t"); pw_puts(w, t->name);
-    pw_puts(w, "\nUmask:\t0022\nState:\tR (running)\nTgid:\t"); pw_put_uint(w, (unsigned)task_tgid(t));
-    pw_puts(w, "\nPid:\t"); pw_put_uint(w, (unsigned)t->pid);
-    pw_puts(w, "\nPPid:\t"); pw_put_uint(w, (unsigned)t->ppid);
+    /* §M90 — the numbers as the READER's pid namespace names them. */
+    struct task* rd = task_current();
+    struct task* lead = (t->tgid && t->tgid != t->pid) ? task_find(t->tgid) : t;
+    struct task* par = task_find(t->ppid);
+    pw_puts(w, "\nUmask:\t0022\nState:\tR (running)\nTgid:\t"); pw_put_uint(w, (unsigned)ns_vnr(rd, lead ? lead : t));
+    pw_puts(w, "\nPid:\t"); pw_put_uint(w, (unsigned)ns_vnr(rd, t));
+    pw_puts(w, "\nPPid:\t"); pw_put_uint(w, (unsigned)(par ? ns_vnr(rd, par) : 0));
     pw_puts(w, "\nUid:\t"); for (int i = 0; i < 4; i++) { pw_put_uint(w, (unsigned)uid); pw_putc(w, i < 3 ? '\t' : '\n'); }
     pw_puts(w, "Gid:\t"); for (int i = 0; i < 4; i++) { pw_put_uint(w, (unsigned)uid); pw_putc(w, i < 3 ? '\t' : '\n'); }
     pw_puts(w, "Groups:\t\nVmRSS:\t"); pw_put_uint(w, (unsigned)(priv / 1024)); pw_puts(w, " kB\n");

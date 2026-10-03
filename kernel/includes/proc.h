@@ -85,6 +85,8 @@ long proc_clone_fork(struct user_regs* r, unsigned long flags, uintptr_t stack,
 struct task;
 void proc_fork_apply(struct task* parent, struct task* child);
 void proc_fork_child_entry(void);
+/* proc_fork, returning the child's number in the caller's pid namespace. */
+int  proc_fork_vnr(struct user_regs* r);
 /* §M90 — the same with a KERNEL path (execveat; a memfd via /proc/self/fd/N). */
 int proc_execve_env_k(const char* kpath, char* const argv[], char* const envp[]);
 

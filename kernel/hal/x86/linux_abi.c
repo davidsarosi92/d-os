@@ -739,7 +739,8 @@ static void linux_syscall_body(struct int_frame* f) {
             r.ebx = f->ebx; r.ecx = f->ecx; r.edx = f->edx;
             r.esi = f->esi; r.edi = f->edi; r.ebp = f->ebp;
             r.eip = f->eip; r.eflags = f->eflags; r.user_sp = f->user_esp;
-            f->eax = (uint32_t)proc_fork(&r);
+            /* §M90 — the child as OUR pid namespace names it */
+            f->eax = (uint32_t)proc_fork_vnr(&r);
             return;
         }
 
