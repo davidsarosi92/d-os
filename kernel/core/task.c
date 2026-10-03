@@ -1629,7 +1629,12 @@ void task_yield(void) {
 
 int task_should_stop(void) {
     struct task* self = task_current();
-    return self ? self->kill_pending : 0;
+    if (!self) return 0;
+    /* §M90 — a pending SIGKILL is a stop too: a Linux process blocked in a
+     * read/recv/wait must leave the call so the signal can end it.  It did
+     * not — runc's kill(init, SIGKILL) left the container's init asleep in
+     * recvfrom forever, and runc waiting for it in wait4. */
+    return self->kill_pending || (self->sig_pending & (1u << 9)) != 0;
 }
 
 /* §M49 — a REAL timed sleep: the caller leaves every runqueue until its

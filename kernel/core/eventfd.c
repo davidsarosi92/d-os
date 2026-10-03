@@ -21,6 +21,7 @@
 #include "fd.h"
 #include "kmalloc.h"
 #include "waitq.h"
+#include "task.h"
 #include "lock.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -78,6 +79,7 @@ long eventfd_read(struct eventfd* e, void* buf, size_t n, int block) {
         }
         spin_unlock_irqrestore(&e->lock, fl);
         if (!block) return -11;                                /* EAGAIN */
+        if (task_should_stop()) return -4;                     /* §M90 — killed: EINTR */
         uint32_t f = waitq_lock(&e->wq);
         if (!__atomic_load_n(&e->count, __ATOMIC_ACQUIRE)) waitq_block(&e->wq);
         waitq_unlock(&e->wq, f);
@@ -99,6 +101,7 @@ long eventfd_write(struct eventfd* e, const void* buf, size_t n, int block) {
         }
         spin_unlock_irqrestore(&e->lock, fl);
         if (!block) return -11;
+        if (task_should_stop()) return -4;                     /* §M90 */
         uint32_t f = waitq_lock(&e->wq);
         if (__atomic_load_n(&e->count, __ATOMIC_ACQUIRE) + v > EFD_MAX) waitq_block(&e->wq);
         waitq_unlock(&e->wq, f);

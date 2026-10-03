@@ -16,6 +16,7 @@
 #include "ktimer.h"
 #include "timer.h"
 #include "waitq.h"
+#include "task.h"
 #include "kmalloc.h"
 #include "lock.h"
 #include "fd.h"             /* fd_readiness_signal — the shared poll wake */
@@ -182,6 +183,7 @@ long timerfd_read(struct timerfd* tf, void* buf, size_t n, int block) {
             waitq_unlock(&tf->wq, f);
             continue;
         }
+        if (task_should_stop()) { waitq_unlock(&tf->wq, f); return -4; }   /* §M90 — killed */
         waitq_block(&tf->wq);
         waitq_unlock(&tf->wq, f);
     }

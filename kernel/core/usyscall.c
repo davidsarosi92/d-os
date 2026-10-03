@@ -1500,6 +1500,7 @@ int fd_readiness_wait(int (*scan)(void* ctx), void* ctx, int timeout_ms) {
         uint32_t f = waitq_lock(&readiness_wq);
         ready = scan(ctx);
         if (ready > 0) { waitq_unlock(&readiness_wq, f); break; }
+        if (task_should_stop()) { waitq_unlock(&readiness_wq, f); ready = -4; break; }   /* §M90 */
         waitq_block(&readiness_wq);
         waitq_unlock(&readiness_wq, f);
         ready = 0;

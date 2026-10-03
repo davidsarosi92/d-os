@@ -206,8 +206,14 @@ long usock_recv(struct usock* s, void* buf, size_t n, int block,
 
     /* Wait until there is something to receive — bytes or a passed fd — or the
      * peer has closed (then we return EOF/0), or the caller is non-blocking. */
-    while (block && s->count == 0 && s->fdq_count == 0 && s->peer != NULL)
+    while (block && s->count == 0 && s->fdq_count == 0 && s->peer != NULL) {
+        if (task_should_stop()) {                 /* §M90 — killed while waiting */
+            waitq_unlock(&s->readers, f);
+            if (passfile_out) *passfile_out = NULL;
+            return -4;                            /* EINTR */
+        }
         waitq_block(&s->readers);
+    }
 
     uint8_t* dst = (uint8_t*)buf;
     size_t got = 0;
@@ -415,6 +421,7 @@ int usock_accept(struct usock* l, int block, struct usock** out) {
     uint32_t f = waitq_lock(&l->readers);
     while (l->acc_n == 0) {
         if (!block) { waitq_unlock(&l->readers, f); return -11; }
+        if (task_should_stop()) { waitq_unlock(&l->readers, f); return -4; }   /* §M90 */
         waitq_block(&l->readers);
     }
     *out = l->accq[0];
@@ -444,6 +451,7 @@ long usock_write(struct usock* s, const void* buf, size_t n, int block) {
         struct usock* p = s->peer;
         if (!p) return -32;
         uint32_t f = waitq_lock(&p->writers);
+        if (task_should_stop()) { waitq_unlock(&p->writers, f); return -4; }   /* §M90 */
         if (s->peer && (s->peer->seqpacket
                         ? (size_t)(USOCK_BUF - s->peer->count) < n + SEQ_HDR
                         : s->peer->count >= USOCK_BUF))
@@ -493,7 +501,10 @@ long usock_recv_flags(struct usock* s, void* buf, size_t n, int block, int flags
     int peek = flags & 0x02, trunc = flags & 0x20;
     if (flags & 0x40) block = 0;
     uint32_t f = waitq_lock(&s->readers);
-    while (block && s->count == 0 && s->peer != NULL) waitq_block(&s->readers);
+    while (block && s->count == 0 && s->peer != NULL) {
+        if (task_should_stop()) { waitq_unlock(&s->readers, f); return -4; }   /* §M90 */
+        waitq_block(&s->readers);
+    }
     if (s->count == 0) {
         int open = s->peer != NULL;
         waitq_unlock(&s->readers, f);

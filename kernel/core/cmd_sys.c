@@ -1408,6 +1408,37 @@ static void sy_fdlinktest(const char* args) {
     vfs_unlink("/fdlinktest.f");
     console_write(ok ? "fdlink: ok\n" : "fdlink: FAIL\n");
 }
+/* §M90 — `killwaittest`: a SIGKILL ends a blocked call.  A helper sleeps in a
+ * blocking unix-socket read nobody will ever satisfy; a pending SIGKILL plus
+ * the wake a signal brings must make the read return EINTR (so the process can
+ * die).  Before, the read went straight back to sleep — runc's kill of a
+ * container's init then waited for it forever. */
+static struct usock* g_kw_b;
+static volatile long g_kw_ret;
+static volatile int g_kw_done;
+static void kw_reader(void) {
+    char c;
+    g_kw_ret = usock_recv(g_kw_b, &c, 1, 1, NULL);
+    g_kw_done = 1;
+}
+static void sy_killwaittest(const char* args) {
+    (void)args;
+    struct usock *a = NULL;
+    g_kw_b = NULL; g_kw_done = 0; g_kw_ret = 99;
+    if (usock_pair(&a, &g_kw_b) != 0) { console_write("killwait: FAIL (pair)\n"); return; }
+    struct task* t = task_spawn("killwait-r", kw_reader);
+    task_msleep(50);
+    int still = !g_kw_done;                          /* really blocked */
+    if (t) {
+        __atomic_or_fetch(&t->sig_pending, 1u << 9, __ATOMIC_ACQ_REL);   /* SIGKILL */
+        task_signal_wake(t);
+    }
+    for (int i = 0; i < 100 && !g_kw_done; i++) task_msleep(2);
+    kprintf("killwait: blocked %d, returned %d with %d (want -4 EINTR)\n", still, g_kw_done, (int)g_kw_ret);
+    int ok = still && g_kw_done && g_kw_ret == -4;
+    if (g_kw_done) { usock_close(a); usock_close(g_kw_b); }   /* else the reader still uses them */
+    console_write(ok ? "killwait: ok\n" : "killwait: FAIL\n");
+}
 /* §M90 — `renametest`: rename across directories (docker writes a layer's
  * metadata in tmp/ and renames it into the store), a directory over an EMPTY
  * directory, and the two refusals that keep the tree a tree: a directory into
@@ -1554,6 +1585,8 @@ SHELL_CMD(pidnstest) = { "pidnstest", "", "pid namespaces: numbers, visibility, 
                           SHELL_G_TEST, sy_pidnstest, SHELL_P_ANY };
 SHELL_CMD(fdlinktest) = { "fdlinktest", "", "/proc/<pid>/fd/N names per descriptor kind",
                            SHELL_G_TEST, sy_fdlinktest, SHELL_P_ANY };
+SHELL_CMD(killwaittest) = { "killwaittest", "", "a pending SIGKILL ends a blocked read",
+                             SHELL_G_TEST, sy_killwaittest, SHELL_P_ANY };
 SHELL_CMD(fifotest) = { "fifotest", "", "named pipes: open rules, EOF/HUP, a blocking reader",
                          SHELL_G_TEST, sy_fifotest, SHELL_P_ANY };
 SHELL_CMD(unlinkopentest) = { "unlinkopentest", "", "an unlinked file stays readable while open",
