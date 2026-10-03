@@ -11,6 +11,7 @@
 
 #include "lnx_signal.h"   /* §M89 */
 #include "abi.h"
+#include "nsproxy.h"
 #include "dosgui.h"     /* §M65 — the toolkit build op */
 #include "printf.h"
 #include "epoll.h"        /* EPOLL_CTL_* — the guest's own numbers */
@@ -129,7 +130,7 @@ static long abi_mknod(unsigned long upath, unsigned long mode) {
     if (fmt == 0010000u)                  r = vfs_mkfifo(kp);
     else if (fmt == 0 || fmt == 0100000u) r = vfs_create(kp);
     else {
-        kprintf("mknod: '%s' type %o refused - device/socket nodes are not made by mknod here\n",
+        kprintf("mknod: '%s' type 0x%x refused - device/socket nodes are not made by mknod here\n",
                 kp, fmt);
         return -1;                                             /* EPERM */
     }
@@ -260,9 +261,21 @@ static long h_chown(struct abi_ctx* c) {
 /* §M90 — fchown(fd, uid, gid): chown of the file a descriptor names (docker
  * chowns every file of a layer it copies, by descriptor).  Through the
  * descriptor's path, so it is the same check and the same store as chown. */
+/* §M90 — fchown/fchmod on a descriptor with NO path behind it: a pipe, a
+ * socket, an eventfd.  Linux gives those an anonymous inode whose owner and
+ * mode can be set; here such an object carries no owner and no access check
+ * at all — holding the descriptor IS the access — so the change is accepted
+ * and there is nothing to record.  containerd's shim chowns the pipes it
+ * hands a container as stdio to the container's user, and failed there.
+ * A descriptor that is not open is still EBADF. */
+static int abi_fd_pathless(int fd) {
+    struct kstat_full k;
+    return sys_fstat_full_k(fd, &k) == 0;
+}
 static long h_fchown(struct abi_ctx* c) {
     char kp[256];
-    if (sys_fd_path((int)c->a[0], kp, sizeof kp) != 0) return -9;   /* EBADF */
+    if (sys_fd_path((int)c->a[0], kp, sizeof kp) != 0)
+        return abi_fd_pathless((int)c->a[0]) ? 0 : -9;              /* EBADF */
     return chown_err(vfs_chown(kp[0] ? kp : "/", (int)c->a[1], (int)c->a[2]));
 }
 /* §M90 — fchmod(fd, mode): the mode of the file behind a descriptor, through
@@ -271,7 +284,8 @@ static long h_fchown(struct abi_ctx* c) {
  * bootstrap.json, and the start failed there. */
 static long h_fchmod(struct abi_ctx* c) {
     char kp[256];
-    if (sys_fd_path((int)c->a[0], kp, sizeof kp) != 0) return -9;   /* EBADF */
+    if (sys_fd_path((int)c->a[0], kp, sizeof kp) != 0)
+        return abi_fd_pathless((int)c->a[0]) ? 0 : -9;              /* EBADF (see fchown) */
     int r = vfs_chmod(kp[0] ? kp : "/", (uint32_t)c->a[1] & 07777u);
     if (r == 0)  return 0;
     if (r == -2) return -1;                  /* EPERM: not the owner      */
@@ -697,32 +711,41 @@ static long h_chroot(struct abi_ctx* c) {
 }
 
 /* §M90 — unshare(flags).  WHAT IS SEPARATED, honestly:
- *   CLONE_NEWNS   a new mount namespace id (task->mntns).  Every mount here is
- *                 already PRIVATE — this kernel has no mount propagation at
- *                 all — so the propagation changes a runtime makes right after
- *                 (MS_PRIVATE|MS_REC on "/") are true as asked.  Mounts made
- *                 inside the new namespace are not yet kept out of the
- *                 machine's tree (mount() below refuses what it cannot keep).
+ *   CLONE_NEWNS   a new mount namespace (task->mntns, vfs_mntns_new): binds
+ *                 made in it are its own.  Every mount here is PRIVATE — there
+ *                 is no mount propagation at all — so the propagation changes
+ *                 a runtime makes right after (MS_PRIVATE|MS_REC) are true.
+ *   CLONE_NEWUTS / NEWIPC / NEWCGROUP / NEWTIME
+ *                 namespace objects (nsproxy.c, which says per kind what each
+ *                 one separates here; NEWTIME, as on Linux, applies to the
+ *                 caller's CHILDREN).
  *   CLONE_FS      a task's root and cwd are already its own (cred copy).
  *   CLONE_FILES   a private copy of a shared descriptor table.
  *   CLONE_SYSVSEM no System V semaphores exist: nothing to separate.
- * Any other namespace (PID, NET, UTS, IPC, USER, CGROUP, TIME) is REFUSED with
- * EINVAL rather than pretended. */
+ * NET, USER and PID are REFUSED with EINVAL rather than pretended: the network
+ * stack is single-instance, there is no uid mapping, and pid numbers are not
+ * yet per namespace. */
 #define CLONE_NEWNS_   0x00020000ul
 #define CLONE_FS_      0x00000200ul
 #define CLONE_FILES_   0x00000400ul
 #define CLONE_SYSVSEM_ 0x00040000ul
+#define CLONE_NSOBJ_   (NS_CLONE_NEWUTS | NS_CLONE_NEWIPC | NS_CLONE_NEWCGROUP | NS_CLONE_NEWTIME)
 static long h_unshare(struct abi_ctx* c) {
     unsigned long fl = c->a[0];
-    unsigned long known = CLONE_NEWNS_ | CLONE_FS_ | CLONE_FILES_ | CLONE_SYSVSEM_;
+    unsigned long known = CLONE_NEWNS_ | CLONE_FS_ | CLONE_FILES_ | CLONE_SYSVSEM_ | CLONE_NSOBJ_;
     if (fl & ~known) {
-        kprintf("unshare: flags %lx not supported (only NEWNS/FS/FILES/SYSVSEM)\n", fl & ~known);
+        kprintf("unshare: flags %lx not supported (NET/USER/PID namespaces do not exist yet)\n",
+                fl & ~known);
         return -ABI_EINVAL;
     }
     struct task* t = task_current();
     if (!t) return -ABI_EINVAL;
+    if ((fl & (CLONE_NEWNS_ | CLONE_NSOBJ_)) &&
+        cred_uid(&t->cred) != 0 && !cred_is_admin(&t->cred)) return -ABI_EPERM;
+    if (fl & CLONE_NSOBJ_) {
+        if (ns_unshare(t, fl & CLONE_NSOBJ_) != 0) return -12;     /* ENOMEM */
+    }
     if (fl & CLONE_NEWNS_) {
-        if (cred_uid(&t->cred) != 0 && !cred_is_admin(&t->cred)) return -ABI_EPERM;
         int ns = vfs_mntns_new(t->mntns);
         if (ns < 0) return -12;                          /* ENOMEM: the table is full */
         t->mntns = ns;
@@ -783,37 +806,30 @@ static long h_mount(struct abi_ctx* c) {
  * an empty directory — and every runtime follows pivot_root with
  * umount2(put_old, MNT_DETACH) + rmdir, whose result (the old root
  * unreachable) is exactly this.  That umount is answered 0 below. */
-/* §M90 — setns(fd, nstype): join the namespace a /proc/<…>/ns handle names.
- * Every kind but mount has exactly ONE namespace on this machine, which the
- * caller is already in — so joining it is true as asked (0), after checking
- * the descriptor really is a handle and `nstype` (0 = any) matches it.  A
- * MOUNT handle names a namespace this file cannot recover from the descriptor
- * (the handle is a shared /proc file, not a reference), so joining one is
- * refused rather than guessed. */
+/* §M90 — setns(fd, nstype): join the namespace a /proc/<pid>/ns handle names
+ * — the one it named when it was OPENED (procfs keeps a reference), so a
+ * namespace whose last member has gone can still be joined, as on Linux.
+ * `nstype` 0 = any kind, else it must match the handle.  NET and USER have
+ * one namespace each (joining it is true as asked); PID likewise until pid
+ * numbers are per namespace. */
+int procfs_ns_handle(struct file* f, int* kind, struct nsobj** obj, int* mnt, uint32_t* ino);
 static long h_setns(struct abi_ctx* c) {
-    char p[96];
-    if (sys_fd_path((int)c->a[0], p, sizeof p) != 0) return -9;           /* EBADF */
-    const char* pre = "/proc/self/ns/";
-    unsigned i = 0;
-    while (pre[i] && p[i] == pre[i]) i++;
-    if (pre[i]) return -ABI_EINVAL;                                       /* not a handle */
-    static const struct { const char* k; unsigned long flag; } kinds[] = {
-        { "net", 0x40000000ul }, { "mnt", 0x00020000ul }, { "pid", 0x20000000ul },
-        { "uts", 0x04000000ul }, { "ipc", 0x08000000ul }, { "cgroup", 0x02000000ul },
-        { "user", 0x10000000ul }, { "time", 0x00000080ul },
+    static const unsigned long flag_of[NSK_COUNT] = {
+        NS_CLONE_NEWNET, NS_CLONE_NEWNS, NS_CLONE_NEWPID, NS_CLONE_NEWUTS,
+        NS_CLONE_NEWIPC, NS_CLONE_NEWCGROUP, NS_CLONE_NEWUSER, NS_CLONE_NEWTIME,
     };
-    for (unsigned k = 0; k < sizeof kinds / sizeof kinds[0]; k++) {
-        const char* a = kinds[k].k; const char* b = p + i;
-        while (*a && *a == *b) { a++; b++; }
-        if (*a || *b) continue;
-        if (c->a[1] && c->a[1] != kinds[k].flag) return -ABI_EINVAL;
-        if (kinds[k].flag == 0x00020000ul) {
-            kprintf("setns: joining a mount namespace by handle is not supported yet\n");
-            return -ABI_EINVAL;
-        }
-        return 0;
-    }
-    return -ABI_EINVAL;
+    struct file* f = sys_fd_vfs_file((int)c->a[0]);
+    if (!f) return -9;                                                    /* EBADF */
+    int kind, mnt; struct nsobj* o; uint32_t ino;
+    if (!procfs_ns_handle(f, &kind, &o, &mnt, &ino)) return -ABI_EINVAL;  /* not a handle */
+    if (c->a[1] && c->a[1] != flag_of[kind]) return -ABI_EINVAL;
+    struct task* t = task_current();
+    if (!t) return -ABI_EINVAL;
+    if (cred_uid(&t->cred) != 0 && !cred_is_admin(&t->cred)) return -ABI_EPERM;
+    if (kind == NSK_MNT) { t->mntns = mnt; return 0; }
+    if (kind == NSK_NET || kind == NSK_USER || kind == NSK_PID) return 0;
+    ns_enter(t, kind, o);
+    return 0;
 }
 static long h_pivot_root(struct abi_ctx* c) {
     char nr[256], po[256];
@@ -934,7 +950,36 @@ static long h_sendfile(struct abi_ctx* c) {
     }
     return total;
 }
-static long h_uname(struct abi_ctx* c) { return sys_uname((struct kutsname*)c->a[0]); }
+/* §M90 — uname: Linux's struct utsname is SIX 65-byte fields; the sixth,
+ * domainname, was never written (the guest kept whatever its stack held).
+ * The node and domain names are the caller's UTS namespace's. */
+static long h_uname(struct abi_ctx* c) {
+    uintptr_t u = (uintptr_t)c->a[0];
+    if (!abi_w_ok(u, 6 * 65)) return -ABI_EFAULT;
+    if (sys_uname((struct kutsname*)u) != 0) return -ABI_EFAULT;      /* the first five */
+    const char* d = ns_domainname(task_current());
+    char* dst = (char*)u + 5 * 65;
+    int i = 0;
+    for (; d[i] && i < 64; i++) dst[i] = d[i];
+    for (; i < 65; i++) dst[i] = 0;
+    return 0;
+}
+/* §M90 — sethostname / setdomainname, in the caller's UTS namespace (runc
+ * names the container this way).  Administrator only, as on Linux
+ * (CAP_SYS_ADMIN in the namespace's owner). */
+static long abi_setname(struct abi_ctx* c, int domain) {
+    struct task* t = task_current();
+    if (!t) return -ABI_EINVAL;
+    if (cred_uid(&t->cred) != 0 && !cred_is_admin(&t->cred)) return -ABI_EPERM;
+    size_t n = (size_t)c->a[1];
+    if (n > NS_HOST_MAX) return -ABI_EINVAL;
+    char k[NS_HOST_MAX + 1];
+    if (n && !abi_r_ok(c->a[0], n)) return -ABI_EFAULT;
+    for (size_t i = 0; i < n; i++) k[i] = ((const char*)(uintptr_t)c->a[0])[i];
+    return (domain ? ns_set_domainname(t, k, n) : ns_set_hostname(t, k, n)) == 0 ? 0 : -ABI_EINVAL;
+}
+static long h_sethostname(struct abi_ctx* c)   { return abi_setname(c, 0); }
+static long h_setdomainname(struct abi_ctx* c) { return abi_setname(c, 1); }
 static long h_dup(struct abi_ctx* c) {
     int nfd = sys_dupfd((int)c->a[0], 0);
     return nfd < 0 ? -ABI_EBADF : nfd;
@@ -1540,6 +1585,36 @@ static long pipe_common(struct abi_ctx* c, unsigned long flags) {
     return 0;
 }
 static long h_pipe(struct abi_ctx* c)  { return pipe_common(c, 0); }
+/* §M90 — socketpair(domain, type, protocol, sv[2]): a connected pair of
+ * AF_UNIX stream sockets (the same usock pair pipe() is built on, here as
+ * sockets, so SO_PEERCRED, shutdown and SCM_RIGHTS all work on it).  It was
+ * missing on every guest; runc talks to its init process over one ("unable
+ * to create init pipe").  SOCK_NONBLOCK and SOCK_CLOEXEC are honoured; other
+ * domains and types are refused — EAFNOSUPPORT / EPROTONOSUPPORT, as Linux
+ * answers for a pair it cannot make. */
+static long h_socketpair(struct abi_ctx* c) {
+    int domain = (int)c->a[0], type = (int)c->a[1];
+    if (domain != 1 /* AF_UNIX */) return -97;                 /* EAFNOSUPPORT */
+    int st = type & 0xF;
+    if (st != 1 /* SOCK_STREAM */ && st != 5 /* SOCK_SEQPACKET */) {
+        kprintf("socketpair: type %d not supported (stream and seqpacket only)\n", st);
+        return -93;                                            /* EPROTONOSUPPORT */
+    }
+    if (!abi_user_w_ok(c->a[3], 2 * sizeof(int))) return -ABI_EFAULT;
+    int k[2];
+    if (sys_socketpair_k2(k, st == 5) != 0) return -24;        /* EMFILE */
+    if (type & 0x800 /* SOCK_NONBLOCK */) {
+        struct ofile* a = fd_lookup(k[0]);
+        struct ofile* b = fd_lookup(k[1]);
+        if (a) a->nonblock = 1;
+        if (b) b->nonblock = 1;
+    }
+    abi_cx(k[0], (unsigned long)type);                         /* SOCK_CLOEXEC = O_CLOEXEC */
+    abi_cx(k[1], (unsigned long)type);
+    ((int*)(uintptr_t)c->a[3])[0] = k[0];
+    ((int*)(uintptr_t)c->a[3])[1] = k[1];
+    return 0;
+}
 static long h_pipe2(struct abi_ctx* c) { return pipe_common(c, c->a[1]); }
 
 static long h_wait(struct abi_ctx* c) {
@@ -2364,9 +2439,27 @@ static long h_getsockopt(struct abi_ctx* c) {
         case ABI_SO_ERROR:      v = 0; break;   /* errors are reported by the call that hit them */
         case ABI_SO_SNDBUF:
         case ABI_SO_RCVBUF:     v = 32768; break;
-        /* No peer credentials are tracked yet: answering zeros would say "the
-         * peer is root, pid 0", which an authorising server would believe. */
-        case ABI_SO_PEERCRED:   return -92;     /* ENOPROTOOPT */
+        /* §M90 — struct ucred { pid, uid, gid } as recorded at connect
+         * (usock.c).  Only a unix socket has one; Linux answers ENOPROTOOPT
+         * for the others.  Never-connected: pid 0, uid and gid -1, as Linux. */
+        case ABI_SO_PEERCRED: {
+            int pid = 0, uid = -1, gid = -1;
+            int r = sys_sock_peercred(fd, &pid, &uid, &gid);
+            if (r < 0) return -92;                               /* ENOPROTOOPT */
+            if (r > 0) { pid = 0; uid = -1; gid = -1; }
+            if (!ulen || !abi_user_r_ok(ulen, sizeof(uint32_t))) return -ABI_EFAULT;
+            uint32_t room = *(uint32_t*)(uintptr_t)ulen;
+            int32_t cr[3] = { pid, uid, gid };
+            uint32_t w = room < 12 ? room : 12;
+            if (w) {
+                if (!uval || !abi_user_w_ok(uval, w)) return -ABI_EFAULT;
+                for (uint32_t i = 0; i < w; i++)
+                    ((uint8_t*)(uintptr_t)uval)[i] = ((const uint8_t*)cr)[i];
+            }
+            if (!abi_user_w_ok(ulen, sizeof(uint32_t))) return -ABI_EFAULT;
+            *(uint32_t*)(uintptr_t)ulen = w;
+            return 0;
+        }
         default: break;
         }
     }
@@ -2432,6 +2525,7 @@ static const struct {
     [ABI_EXECVE]          = { "execve",          h_execve },
     /* §M24 — the socket surface, shared by all three arches at once. */
     [ABI_SOCKET]       = { "socket",       h_socket       },
+    [ABI_SOCKETPAIR]   = { "socketpair",   h_socketpair   },   /* §M90 */
     [ABI_BIND]         = { "bind",         h_bind         },
     [ABI_CONNECT]      = { "connect",      h_connect      },
     [ABI_LISTEN]       = { "listen",       h_listen       },
@@ -2538,6 +2632,8 @@ static const struct {
     [ABI_READLINKAT]   = { "readlinkat",   h_readlinkat   },
     [ABI_SENDFILE]     = { "sendfile",     h_sendfile     },
     [ABI_UNAME]        = { "uname",        h_uname        },
+    [ABI_SETHOSTNAME]  = { "sethostname",  h_sethostname  },   /* §M90 */
+    [ABI_SETDOMAINNAME]= { "setdomainname",h_setdomainname},   /* §M90 */
     [ABI_DUP]          = { "dup",          h_dup          },
     [ABI_DUP2]         = { "dup2",         h_dup2         },
     [ABI_DUP3]         = { "dup3",         h_dup3         },
@@ -2590,9 +2686,21 @@ static int abi_traced(void) {
         /* The process's NAME: a thread is named "thread", so ask its leader. */
         struct task* lead = (me->tgid && me->tgid != me->pid) ? task_find(me->tgid) : me;
         const char* n = lead ? lead->name : me->name;
+        int same = 1;
         for (int i = 0; ; i++) {
-            if (g_trace_name[i] != n[i]) return 0;
-            if (!n[i]) return 1;
+            if (g_trace_name[i] != n[i]) { same = 0; break; }
+            if (!n[i]) break;
+        }
+        if (same) return 1;
+        /* §M90 — or the PROGRAM: the last component of /proc/self/exe.  A task
+         * name is whatever the program last called itself (prctl PR_SET_NAME,
+         * runc's init re-executing /proc/self/exe), the binary is not. */
+        const char* e = lead ? lead->cred.exe : me->cred.exe;
+        const char* b = e;
+        for (const char* q = e; *q; q++) if (*q == '/') b = q + 1;
+        for (int i = 0; ; i++) {
+            if (g_trace_name[i] != b[i]) return 0;
+            if (!b[i]) return 1;
         }
     }
     /* §M90 — a pid means its whole PROCESS: Go's work runs on threads. */
@@ -2610,6 +2718,8 @@ int abi_dispatch(const struct abi_map* map, unsigned long nr,
                  unsigned long a0, unsigned long a1, unsigned long a2,
                  unsigned long a3, unsigned long a4, unsigned long a5,
                  long* out) {
+    /* §M90 — a /proc/<pid> target lives for one call (vfs_proc_alias). */
+    { struct task* pt = task_current(); if (pt) pt->proc_target_pid = 0; }
     enum abi_op op = abi_lookup(map, nr);
     { struct task* me = task_current(); if (me) me->guest_nr = (int)nr + 1; }
     int tr = abi_traced() && (g_trace_all || !abi_trace_noise(op));

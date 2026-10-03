@@ -100,6 +100,9 @@ struct lnx_delivery {
 /* Post `sig` to `t` with `info` (NULL = SI_USER from the caller).  Returns 0,
  * or -1 for a bad signal number. */
 int  lnx_sig_post(struct task* t, int sig, const struct lnx_siginfo* info);
+/* §M90 — SIGCHLD for an exited child, only to a parent with a handler
+ * (lnx_signal.c); safe with interrupts off, never allocates. */
+void lnx_sig_child_exit(struct task* parent, int child_pid, int status, int killed_by);
 
 /* On the way back to user mode: is there a signal to run a HANDLER for?
  * Pending signals whose disposition is to ignore are dropped here, and a

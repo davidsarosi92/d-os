@@ -39,6 +39,9 @@
 #include "netlink.h"   /* §M90 */
 #include "fd.h"
 #include "fifo.h"
+#include "nsproxy.h"
+int procfs_ns_stat_ino(const struct inode* in, uint64_t* ino);          /* procfs.c */
+int procfs_ns_handle(struct file* f, int* kind, struct nsobj** obj, int* mnt, uint32_t* ino);
 #include "timerfd.h"
 #include "eventfd.h"       /* §M53 stage 3 — timer descriptors */
 #include "epoll.h"          /* §M56 — readiness sets            */
@@ -683,9 +686,12 @@ int sys_socketpair(int* fds) {
  * pointer's origin is known, so the gated wrapper above checks and this does
  * not — calling the wrapper with a kernel array from inside a ring-3 syscall
  * is refused, which is how musl's pipe() came to fail on i386 (§M59). */
-int sys_socketpair_k(int* fds) {
+int sys_socketpair_k(int* fds) { return sys_socketpair_k2(fds, 0); }
+/* §M90 — the same, SOCK_SEQPACKET when `seqpacket`. */
+int sys_socketpair_k2(int* fds, int seqpacket) {
     struct usock *ua, *ub;
     if (usock_pair(&ua, &ub) != 0) return -1;
+    if (seqpacket) usock_set_seqpacket(ua, ub);
 
     struct ofile *oa = ofile_from_sock(ua), *ob = ofile_from_sock(ub);
     if (!oa || !ob) {                          /* OOM — tear the pair back down */
@@ -858,6 +864,8 @@ static void stat_full_of(const struct inode* in, struct kstat_full* o) {
                   : in->type == INODE_FIFO ? KS_IFIFO : KS_IFREG;
     if (in->type == INODE_SYMLINK) perm = 0777u;
     o->mode = fmt | perm;
+    /* §M90 — a namespace handle reports its NAMESPACE's number (procfs.c). */
+    { uint64_t nsi; if (procfs_ns_stat_ino(in, &nsi)) o->ino = nsi; }
     o->uid  = in->owner_uid < 0 ? 0 : in->owner_uid;
     o->gid  = in->owner_gid < 0 ? 0 : in->owner_gid;
 }
@@ -889,7 +897,13 @@ int sys_fstat_full_k(int fd, struct kstat_full* out) {
     switch (o->kind) {
     case FD_VFS:
     case FD_FIFO:                                   /* §M90 — the FIFO's own inode */
-        if (o->file && o->file->inode) { stat_full_of(o->file->inode, out); return 0; }
+        if (o->file && o->file->inode) {
+            stat_full_of(o->file->inode, out);
+            /* §M90 — an open namespace handle: the namespace it was opened on */
+            uint32_t nsi;
+            if (procfs_ns_handle(o->file, NULL, NULL, NULL, &nsi)) out->ino = nsi;
+            return 0;
+        }
         out->mode = KS_IFREG | 0644u; return 0;
     case FD_SOCK: case FD_NETSOCK: out->mode = KS_IFSOCK | 0777u; return 0;
     case FD_CONSOLE:               out->mode = KS_IFCHR | 0620u;  return 0;
@@ -1013,7 +1027,7 @@ static void ustr(char* d, const char* s) {
 int sys_uname(struct kutsname* out) {
     if (!out || !user_w(out, sizeof(*out))) return -1;   /* §1.1 */
     ustr(out->sysname,  "d-os");
-    ustr(out->nodename, "d-os");
+    ustr(out->nodename, ns_hostname(task_current()));   /* §M90 — its UTS namespace */
     ustr(out->release,  "0.1");
     ustr(out->version,  "M36 userland");
     /* The REAL architecture, from the one place that knows it.  This used to be
@@ -2372,11 +2386,19 @@ void usyscall_boundary_test(int on) {
  * descriptor: its family (Linux numbering: 1 = AF_UNIX, 2 = AF_INET), its type
  * (1 = SOCK_STREAM, 2 = SOCK_DGRAM) and whether it is listening.  0, or -1 when
  * `fd` is not a socket at all (the caller turns that into ENOTSOCK). */
+/* §M90 — SO_PEERCRED of a unix socket: 0 = connected (fields filled),
+ * 1 = a unix socket never connected, -1 = not a unix socket. */
+int sys_sock_peercred(int fd, int* pid, int* uid, int* gid) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_SOCK) return -1;
+    return usock_peercred(o->sock, pid, uid, gid) == 0 ? 0 : 1;
+}
 int sys_socket_info(int fd, int* family, int* type, int* listening) {
     struct ofile* o = fd_lookup(fd);
     if (!o) return -1;
     if (o->kind == FD_SOCK) {
-        *family = 1; *type = 1;                   /* AF_UNIX streams only */
+        *family = 1;                              /* AF_UNIX: stream, or §M90 seqpacket */
+        *type = usock_is_seqpacket(o->sock) ? 5 : 1;
         *listening = usock_is_listener(o->sock);
         return 0;
     }
@@ -2542,6 +2564,12 @@ int sys_fd_path(int fd, char* out, size_t cap) {
     if (!o || (o->kind != FD_VFS && o->kind != FD_FIFO) || !o->file || !o->file->dentry) return -1;
     if (o->file->inode && o->file->inode->unlink_dir) return -1;   /* deleted */
     return vfs_dentry_path(o->file->dentry, out, cap) == 0 ? 0 : -1;
+}
+
+/* §M90 — the VFS open file behind `fd` (FD_VFS), or NULL. */
+struct file* sys_fd_vfs_file(int fd) {
+    struct ofile* o = fd_lookup(fd);
+    return (o && o->kind == FD_VFS) ? o->file : NULL;
 }
 
 /* §M90 — see vfs.c (fd_vfs_dentry): the dentry of the caller's descriptor. */

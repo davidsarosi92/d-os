@@ -845,7 +845,7 @@ int modload_load(const char* path) {
 
     kprintf("insmod: loaded '%s' (%d bytes, %d relocations, %d kernel symbols)\n",
             slot->name, (int)total, (int)nrel, (int)nksym);
-    klog(KLOG_INFO, "mod", "loaded %s from %s", slot->name, path);
+    klog(KLOG_INFO, "mod", "loaded %s from %s\n", slot->name, path);
 
     /* A loaded driver is not a started one.  §M66's `drv start` is what brings
      * it up, and keeping the two separate means loading a module for a device

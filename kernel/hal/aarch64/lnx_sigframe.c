@@ -94,6 +94,11 @@ static int build(struct trapframe* f, struct task* t, const struct lnx_delivery*
     if (d->info.code == LNX_SI_USER || d->info.code == LNX_SI_TKILL) {
         wr32(si + 16, (uint32_t)d->info.pid);
         wr32(si + 20, (uint32_t)d->info.uid);
+    } else if (d->info.signo == 17 && d->info.code >= 1 && d->info.code <= 6) {
+        /* §M90 — SIGCHLD (CLD_*): si_pid, si_uid, si_status (carried in .addr) */
+        wr32(si + 16, (uint32_t)d->info.pid);
+        wr32(si + 20, (uint32_t)d->info.uid);
+        wr32(si + 24, (uint32_t)d->info.addr);
     } else {
         wr64(si + 16, d->info.addr);
     }

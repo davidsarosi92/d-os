@@ -533,6 +533,12 @@ struct task {
     /* §M90 — the process a /proc/<pid>/X path named during THIS task's current
      * lookup (vfs_proc_alias), consumed by procfs at open.  0 = self. */
     int       proc_target_pid;
+    /* §M90 — namespaces (nsproxy.c): one object per kind, NULL = the initial
+     * namespace.  Indexed by enum ns_kind; mount stays `mntns`.  A time
+     * namespace made by unshare is entered by CHILDREN only, so it waits in
+     * ns_time_children (Linux's time_for_children). */
+    struct nsobj* ns[8];
+    struct nsobj* ns_time_children;
     /* §M90 — close-on-exec bits of the PRIVATE descriptor table (bit i =
      * fds_inline[i]); a shared table keeps its own (struct fdtable).  Read and
      * written only through fd.h's fd_*cloexec* helpers, which pick the right

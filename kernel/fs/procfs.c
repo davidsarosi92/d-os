@@ -36,6 +36,7 @@
 #include "hal_api.h"     /* §M90 — hal_cpu_model */
 #include "percpu.h"      /* §M90 — smp_ncpus */
 #include "cgroupfs.h"
+#include "nsproxy.h"
 #include "fd.h"      /* §M90 — fd_nth_open */    /* §M90 — /proc/self/cgroup */
 #include <stddef.h>
 #include <stdint.h>
@@ -107,7 +108,15 @@ struct file_state {
     char*  content;
     size_t size;
     int    pid;                     /* §M90 — the process the path named, 0 = opener */
+    /* §M90 — a namespace HANDLE (/proc/<pid>/ns/X): the namespace it named
+     * when it was opened, held by reference — what setns(fd) joins and what
+     * fstat reports, even after every member has left. */
+    int           ns_kind;          /* -1: not a handle */
+    struct nsobj* ns_obj;           /* NULL = the initial one (or MNT) */
+    int           ns_mnt;           /* NSK_MNT: the VFS mount namespace id */
+    uint32_t      ns_ino;
 };
+static int ns_kind_of_node(const struct procfs_node* n);   /* below */
 
 /* §M90 — see procfs.h.  The target is recorded on the opening task by the
  * path lookup (vfs_proc_alias) and consumed at open, in the same call. */
@@ -130,6 +139,15 @@ static struct file_state* procfs_generate(struct file* f, struct procfs_node* no
     st->size    = w.len;
     struct task* cur = task_current();
     st->pid = (cur && cur->proc_target_pid > 0) ? cur->proc_target_pid : 0;
+    st->ns_kind = ns_kind_of_node(node);
+    if (st->ns_kind >= 0) {
+        struct task* tg = procfs_target();
+        int k = st->ns_kind & 0xFF, child = st->ns_kind >> 8;
+        st->ns_ino = child ? ns_child_ino_of(tg, k) : ns_ino_of(tg, k);
+        st->ns_mnt = tg ? tg->mntns : 0;
+        st->ns_obj = child ? ns_get_child(tg, k) : ns_get(tg, k);
+        st->ns_kind = k;
+    }
     f->private  = st;
     f->inode->size = st->size;                  /* update for stat */
     return st;
@@ -188,6 +206,7 @@ static ssize_t procfs_read(struct file* f, void* buf, size_t n, uint64_t off) {
 static int procfs_close(struct file* f) {
     if (f && f->private) {
         struct file_state* st = (struct file_state*)f->private;
+        if (st->ns_kind >= 0) ns_put(st->ns_obj);
         if (st->content) kfree(st->content);
         kfree(st);
         f->private = NULL;
@@ -626,8 +645,11 @@ static void gen_mounts(struct procfs_writer* w)    { gen_mounts_common(w, 0); }
  * line runc, containerd and dockerd read to find the cgroup they run in. */
 static void gen_selfcgroup(struct procfs_writer* w) {
     char path[256];
-    cgroup_path_of(procfs_target(), path, sizeof path);
-    pw_puts(w, "0::"); pw_puts(w, path); pw_putc(w, '\n');
+    char view[256];
+    struct task* t = procfs_target();
+    cgroup_path_of(t, path, sizeof path);
+    ns_cgroup_view(t, path, view, sizeof view);          /* §M90 — its cgroup namespace */
+    pw_puts(w, "0::"); pw_puts(w, view); pw_putc(w, '\n');
 }
 static struct procfs_node nd_selfcgroup = { .name = "self/cgroup",    .gen = gen_selfcgroup };
 
@@ -694,6 +716,33 @@ static void gen_oomscore(struct procfs_writer* w) { pw_puts(w, "0\n"); }
 static struct procfs_node nd_oomadj   = { .name = "self/oom_score_adj", .gen = gen_oomadj,
                                           .write = write_oomadj };
 static struct procfs_node nd_oomscore = { .name = "self/oom_score", .gen = gen_oomscore };
+
+/* §M90 — /proc/<pid>/timens_offsets: the clock offsets of the time namespace
+ * its children are born in.  Only zero offsets exist (nsproxy.c says why), so
+ * this reads zeros and refuses anything else; runc checks the file to decide
+ * whether time namespaces exist at all. */
+static void gen_timens(struct procfs_writer* w) {
+    pw_puts(w, "monotonic           0         0\nboottime            0         0\n");
+}
+static long write_timens(struct task* t, const char* buf, size_t n) {
+    (void)t;
+    /* Lines "<clock> <secs> <nsecs>"; accepted only when every number is 0. */
+    for (size_t i = 0; i < n; i++) {
+        char c = buf[i];
+        if (c >= '1' && c <= '9') {
+            /* a non-zero digit: allowed only inside the CLOCK field ("1"/"7" are
+             * the numeric clock ids), i.e. as the first token of its line */
+            size_t s = i;
+            while (s > 0 && buf[s - 1] != '\n') s--;
+            int first = 1;
+            for (size_t q = s; q < i; q++) if (buf[q] == ' ' || buf[q] == '\t') { first = 0; break; }
+            if (!first) return -22;          /* EINVAL: a non-zero offset */
+        }
+    }
+    return (long)n;
+}
+static struct procfs_node nd_timens = { .name = "self/timens_offsets", .gen = gen_timens,
+                                        .write = write_timens };
 static struct procfs_node nd_mountinfo  = { .name = "self/mountinfo", .gen = gen_mountinfo };
 static struct procfs_node nd_selfmounts = { .name = "self/mounts",    .gen = gen_mounts };
 /* §M90 — /proc/self/ns/<kind>: namespace HANDLES.  A program opens one to
@@ -704,28 +753,73 @@ static struct procfs_node nd_selfmounts = { .name = "self/mounts",    .gen = gen
  * the Linux numbers of the initial namespaces) and by setns.  Reading one
  * gives that same line. */
 static const char* const g_ns_kinds[] = { "net", "mnt", "pid", "uts", "ipc", "cgroup", "user", "time" };
-static void gen_ns_line(struct procfs_writer* w, const char* kind);
-#define NS_GEN(k) static void gen_ns_##k(struct procfs_writer* w) { gen_ns_line(w, #k); }
-NS_GEN(net) NS_GEN(mnt) NS_GEN(pid) NS_GEN(uts) NS_GEN(ipc) NS_GEN(cgroup) NS_GEN(user) NS_GEN(time)
+/* §M90 — every handle answers for the namespace of the process the PATH
+ * named (/proc/self, /proc/<pid>, a task directory), from nsproxy.c; the
+ * *_for_children pair names where that process's next child will be born. */
+#define NS_GEN(k, K) static void gen_ns_##k(struct procfs_writer* w) { \
+        pw_puts(w, #k ":["); pw_put_uint(w, ns_ino_of(procfs_target(), K)); pw_puts(w, "]\n"); }
+NS_GEN(net, NSK_NET) NS_GEN(mnt, NSK_MNT) NS_GEN(pid, NSK_PID) NS_GEN(uts, NSK_UTS)
+NS_GEN(ipc, NSK_IPC) NS_GEN(cgroup, NSK_CGROUP) NS_GEN(user, NSK_USER) NS_GEN(time, NSK_TIME)
+static void gen_ns_tfc(struct procfs_writer* w) {
+    pw_puts(w, "time:["); pw_put_uint(w, ns_child_ino_of(procfs_target(), NSK_TIME)); pw_puts(w, "]\n");
+}
+static void gen_ns_pfc(struct procfs_writer* w) {
+    pw_puts(w, "pid:["); pw_put_uint(w, ns_child_ino_of(procfs_target(), NSK_PID)); pw_puts(w, "]\n");
+}
 static struct procfs_node nd_ns[] = {
     { .name = "net", .gen = gen_ns_net }, { .name = "mnt", .gen = gen_ns_mnt },
     { .name = "pid", .gen = gen_ns_pid }, { .name = "uts", .gen = gen_ns_uts },
     { .name = "ipc", .gen = gen_ns_ipc }, { .name = "cgroup", .gen = gen_ns_cgroup },
     { .name = "user", .gen = gen_ns_user }, { .name = "time", .gen = gen_ns_time },
+    { .name = "time_for_children", .gen = gen_ns_tfc },
+    { .name = "pid_for_children",  .gen = gen_ns_pfc },
 };
-/* The inode numbers Linux gives its initial namespaces (procfs_ns_ino). */
+/* The kind a handle node stands for: the enum value, plus 0x100 for a
+ * *_for_children node; -1 for anything that is not a handle. */
+static int ns_kind_of_node(const struct procfs_node* n) {
+    for (unsigned i = 0; i < sizeof nd_ns / sizeof nd_ns[0]; i++)
+        if (n == &nd_ns[i]) return i < NSK_COUNT ? (int)i : (i == 8 ? (0x100 | NSK_TIME) : (0x100 | NSK_PID));
+    return -1;
+}
+/* readlink of a handle: "<kind>:[<ino>]" for the process the path named. */
 unsigned long procfs_ns_ino(const char* kind) {
-    static const unsigned long ino[] = { 4026531840ul, 4026531841ul, 4026531836ul,
-        4026531838ul, 4026531839ul, 4026531835ul, 4026531837ul, 4026531834ul };
+    static const char* const tail[] = { "time_for_children", "pid_for_children" };
+    for (unsigned i = 0; i < 2; i++) {
+        const char* a = tail[i]; const char* b = kind;
+        while (*a && *a == *b) { a++; b++; }
+        if (!*a && !*b) return ns_child_ino_of(procfs_target(), i == 0 ? NSK_TIME : NSK_PID);
+    }
     for (unsigned i = 0; i < sizeof g_ns_kinds / sizeof g_ns_kinds[0]; i++) {
         const char* a = g_ns_kinds[i]; const char* b = kind;
         while (*a && *a == *b) { a++; b++; }
-        if (!*a && !*b) return ino[i];
+        if (!*a && !*b) return ns_ino_of(procfs_target(), (int)i);
     }
     return 0;
 }
-static void gen_ns_line(struct procfs_writer* w, const char* kind) {
-    pw_puts(w, kind); pw_puts(w, ":["); pw_put_uint(w, (uint32_t)procfs_ns_ino(kind)); pw_puts(w, "]\n");
+/* §M90 — st_ino of a handle (stat by path): the namespace's number, which is
+ * what a program compares.  1 and *ino set, or 0 for any other inode. */
+int procfs_ns_stat_ino(const struct inode* in, uint64_t* ino) {
+    /* §M90 — the procfs ROOT is inode 1 on Linux (PROC_ROOT_INO), and runc
+     * (filepath-securejoin) refuses a /proc whose root says otherwise —
+     * "unsafe procfs detected".  The number is what makes it /proc. */
+    if (in && proc_dir && in == proc_dir->inode) { *ino = 1; return 1; }
+    if (!in || in->ops != &procfs_file_ops || !in->private) return 0;
+    int k = ns_kind_of_node((const struct procfs_node*)in->private);
+    if (k < 0) return 0;
+    *ino = (k & 0x100) ? ns_child_ino_of(procfs_target(), k & 0xFF) : ns_ino_of(procfs_target(), k);
+    return 1;
+}
+/* §M90 — an OPEN handle: what it captured at open (fstat, setns).
+ * 1 = it is one; 0 = not a handle. */
+int procfs_ns_handle(struct file* f, int* kind, struct nsobj** obj, int* mnt, uint32_t* ino) {
+    if (!f || !f->inode || f->inode->ops != &procfs_file_ops || !f->private) return 0;
+    struct file_state* st = (struct file_state*)f->private;
+    if (st->ns_kind < 0) return 0;
+    if (kind) *kind = st->ns_kind;
+    if (obj)  *obj  = st->ns_obj;
+    if (mnt)  *mnt  = st->ns_mnt;
+    if (ino)  *ino  = st->ns_ino;
+    return 1;
 }
 static void attach_ns_dir(void) {
     struct dentry* self = proc_subdir("self", 4);
@@ -778,6 +872,7 @@ void procfs_init(void) {
     attach_node(&nd_selfstatus);
     attach_node(&nd_oomadj);
     attach_node(&nd_oomscore);
+    attach_node(&nd_timens);
     attach_fd_dir();
     attach_ns_dir();
     attach_node(&nd_selfmounts);

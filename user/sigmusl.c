@@ -23,6 +23,10 @@
  *   8. REAL-TIME — SIGRTMAX-2 (what a musl JDK's NativeThread uses): a handler
  *      is accepted, the signal is held while blocked, shows in sigpending,
  *      and arrives when unblocked.
+ *   9. SIGCHLD — (§M90) a parent with a SIGCHLD handler is told when its child
+ *      exits: si_code CLD_EXITED, si_pid the child, si_status its code — and
+ *      when the handler runs the child is already collectable (waitpid
+ *      WNOHANG finds it), which is how containerd's shim reaps.
  * ============================================================================= */
 
 #define _GNU_SOURCE
@@ -34,6 +38,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 
 static int g_fail;
 static void verdict(int ok, const char* what) {
@@ -121,6 +126,16 @@ static void* s7_thread(void* a) {
     s7_ready = 1;
     for (unsigned long i = 0; i < 3000000000ul && !s7_hit; i++) __asm__ volatile ("" ::: "memory");
     return NULL;
+}
+
+/* 9 — SIGCHLD.  The handler reaps the way a subreaper does: wait WNOHANG. */
+static volatile int s9_hit, s9_code, s9_pid, s9_status, s9_reapable;
+static void h_chld(int sig, siginfo_t* si, void* uc) {
+    (void)sig; (void)uc;
+    s9_hit++;
+    s9_code = si->si_code; s9_pid = si->si_pid; s9_status = si->si_status;
+    int st;
+    s9_reapable = (int)waitpid(-1, &st, WNOHANG);
 }
 
 int main(void) {
@@ -229,6 +244,25 @@ int main(void) {
         verdict(ok && held && s8_hit == 1,
                 "a real-time signal: accepted, held while blocked, delivered on unblock");
         if (!(ok && held && s8_hit == 1)) printf("sigmusl: rt=%d ok=%d held=%d hits=%d\n", rt, ok, held, s8_hit);
+    }
+
+    /* 9 */
+    {
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = h_chld;
+        sa.sa_flags = SA_SIGINFO;
+        sigaction(SIGCHLD, &sa, NULL);
+        pid_t c = fork();
+        if (c == 0) _exit(3);
+        for (int i = 0; i < 2000 && !s9_hit; i++) usleep(1000);
+        int st = -1;
+        pid_t w = waitpid(c, &st, WNOHANG);
+        int ok = s9_hit == 1 && s9_code == CLD_EXITED && s9_pid == c && s9_status == 3 &&
+                 s9_reapable == c && w <= 0;   /* already collected inside the handler */
+        verdict(ok, "SIGCHLD: the parent's handler runs with the child's pid and status, child reapable");
+        if (!ok) printf("sigmusl: hit=%d code=%d pid=%d (child %d) status=%d reapable=%d w=%d\n",
+                        s9_hit, s9_code, s9_pid, (int)c, s9_status, s9_reapable, (int)w);
+        signal(SIGCHLD, SIG_DFL);
     }
 
     printf("sigmusl: %s (%d failed)\n", g_fail ? "FAIL" : "ALL PASS", g_fail);

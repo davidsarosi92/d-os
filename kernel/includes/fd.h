@@ -163,6 +163,11 @@ void usock_set_owner(struct usock* s, struct ofile* o);
 int  usock_can_read (struct usock* s);   /* bytes buffered? (poll POLLIN)  */
 int  usock_can_write(struct usock* s);   /* peer open + space? (POLLOUT)   */
 int  usock_peer_open (struct usock* s);  /* other end still there? (§M56.1)  */
+/* §M90 — SO_PEERCRED: the peer recorded at connect; -1 if never connected. */
+int  usock_peercred(struct usock* s, int* pid, int* uid, int* gid);
+/* §M90 — SOCK_SEQPACKET (message boundaries kept) on a fresh pair. */
+void usock_set_seqpacket(struct usock* a, struct usock* b);
+int  usock_is_seqpacket(struct usock* s);
 
 /* Tier A.3 — poll readiness signal.  usock_send / usock_close call this
  * after changing an fd's readiness so a task blocked in a (timeout < 0)

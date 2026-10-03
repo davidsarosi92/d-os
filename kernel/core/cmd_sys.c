@@ -41,6 +41,8 @@
 #include "driver.h"
 #include "flock.h"
 #include "fifo.h"
+#include "nsproxy.h"
+int procfs_ns_handle(struct file* f, int* kind, struct nsobj** obj, int* mnt, uint32_t* ino);
 #include <stdint.h>
 #include <stddef.h>
 
@@ -1132,6 +1134,127 @@ static void sy_oomtest(const char* args) {
              !foreign_mi;
     console_write(ok ? "oomtest: ok\n" : "oomtest: FAIL\n");
 }
+/* §M90 — `peercredtest`: SO_PEERCRED as containerd's ttrpc reads it.  Both
+ * ends of a socketpair name the caller; through a NAMED listener the client
+ * sees the listener's owner and the accepted end sees the connecting process;
+ * an endpoint never connected has no peer (-1).  All in one task, so every
+ * recorded pid must equal the caller's process id — a zero (the old "no
+ * credentials") or a stale value fails it. */
+static void sy_peercredtest(const char* args) {
+    (void)args;
+    struct task* me = task_current();
+    int mypid = task_tgid(me);
+    struct usock *a = NULL, *b = NULL;
+    int pa = -9, ua = -9, ga = -9, pb = -9, ub = -9, gb = -9;
+    int rp = usock_pair(&a, &b);
+    int ra = a ? usock_peercred(a, &pa, &ua, &ga) : -9;
+    int rb = b ? usock_peercred(b, &pb, &ub, &gb) : -9;
+    if (a) usock_close(a);
+    if (b) usock_close(b);
+    struct usock* l = usock_new();
+    struct usock* cl = usock_new();
+    struct usock* lone = usock_new();
+    int pc = -9, uc = -9, gc = -9, ps = -9, us = -9, gs = -9, dummy;
+    int rl = -9, rc = -9, rs = -9, rn = 0;
+    struct usock* srv = NULL;
+    if (l && cl && lone && usock_bind(l, "@peercredtest") == 0 && usock_listen(l, 2) == 0 &&
+        usock_connect(cl, "@peercredtest") == 0 && usock_accept(l, 0, &srv) == 0 && srv) {
+        rl = 0;
+        rc = usock_peercred(cl, &pc, &uc, &gc);
+        rs = usock_peercred(srv, &ps, &us, &gs);
+    }
+    rn = lone ? usock_peercred(lone, &dummy, &dummy, &dummy) : 0;
+    if (srv) usock_close(srv);
+    if (cl) usock_close(cl);
+    if (l) usock_close(l);
+    if (lone) usock_close(lone);
+    kprintf("peercred: me %d; pair %d/%d pids %d %d; listener %d client->%d server->%d; "
+            "unconnected %d\n", mypid, ra, rb, pa, pb, rl, pc, ps, rn);
+    int ok = rp == 0 && ra == 0 && rb == 0 && pa == mypid && pb == mypid &&
+             rl == 0 && rc == 0 && rs == 0 && pc == mypid && ps == mypid &&
+             ua == uc && ga == gs && rn == -1;
+    console_write(ok ? "peercred: ok\n" : "peercred: FAIL\n");
+}
+/* §M90 — `nstest`: namespaces as objects (nsproxy.c).  A helper task
+ * unshares UTS, IPC, cgroup and time; its UTS number changes and its own
+ * hostname does not touch the host's; /proc/self/ns/uts reads the new number;
+ * the TIME namespace applies to its CHILD only (time_for_children); and
+ * setns() through the SHELL's handle (/proc/<shell pid>/ns/uts, a foreign
+ * pid) takes it back to the host's namespace and name. */
+static volatile int g_nst_done, g_nst_ok;
+static volatile int g_nst_shell;
+static char g_nst_line[192];
+static void nst_child(void) { task_msleep(200); }
+static void nst_helper(void) {
+    struct task* me = task_current();
+    uint32_t uts0 = ns_ino_of(me, NSK_UTS), tm0 = ns_ino_of(me, NSK_TIME);
+    int u = ns_unshare(me, NS_CLONE_NEWUTS | NS_CLONE_NEWIPC | NS_CLONE_NEWCGROUP | NS_CLONE_NEWTIME);
+    uint32_t uts1 = ns_ino_of(me, NSK_UTS);
+    int hs = ns_set_hostname(me, "box", 3);
+    struct task* sh = task_find(g_nst_shell);
+    int mine = ns_hostname(me)[0] == 'b', host_kept = sh && ns_hostname(sh)[0] == 'd';
+    int time_self_same = ns_ino_of(me, NSK_TIME) == tm0;
+    int time_child_new = ns_child_ino_of(me, NSK_TIME) != tm0;
+    struct task* ch = task_spawn("nstest-child", nst_child);
+    int child_in = ch && ns_ino_of(ch, NSK_TIME) == ns_child_ino_of(me, NSK_TIME);
+    /* /proc/self/ns/uts names the new namespace */
+    char b[32] = { 0 };
+    struct file* f = vfs_open("/proc/self/ns/uts", VFS_RDONLY);
+    if (f) { vfs_read(f, b, sizeof b - 1); vfs_close(f); }
+    unsigned long shown = 0;
+    for (int i = 0; b[i]; i++) if (b[i] >= '0' && b[i] <= '9') shown = shown * 10 + (unsigned long)(b[i] - '0');
+    /* setns back through the shell's handle */
+    char hp[48];
+    bt_path(hp, "/proc/", g_nst_shell, "/ns/uts", -1, "");
+    struct file* hf = vfs_open(hp, VFS_RDONLY);
+    int kind = -1, mnt = 0; struct nsobj* o = (struct nsobj*)1; uint32_t hino = 0;
+    int is_h = hf && procfs_ns_handle(hf, &kind, &o, &mnt, &hino);
+    if (is_h) ns_enter(me, kind, o);
+    if (hf) vfs_close(hf);
+    int back = ns_ino_of(me, NSK_UTS) == uts0 && ns_hostname(me)[0] == 'd';
+    kprintf("nstest: unshare=%d uts %u -> %u (handle shows %u) sethostname=%d own=%d host-kept=%d "
+            "time: self-same=%d children-new=%d child-in=%d; setns handle=%d kind=%d back=%d\n",
+            u, uts0, uts1, (unsigned)shown, hs, mine, host_kept, time_self_same, time_child_new,
+            child_in, is_h, kind, back);
+    g_nst_line[0] = 1;
+    g_nst_ok = u == 0 && uts1 != uts0 && shown == uts1 && hs == 0 && mine && host_kept &&
+               time_self_same && time_child_new && child_in && is_h && kind == NSK_UTS && back;
+    g_nst_done = 1;
+}
+static void sy_nstest(const char* args) {
+    (void)args;
+    g_nst_done = 0; g_nst_ok = 0; g_nst_line[0] = 0;
+    g_nst_shell = task_tgid(task_current());
+    task_spawn("nstest", nst_helper);
+    for (int i = 0; i < 300 && !g_nst_done; i++) task_msleep(5);
+    if (!g_nst_line[0]) kprintf("nstest: (helper did not finish)\n");
+    console_write(g_nst_done && g_nst_ok ? "nstest: ok\n" : "nstest: FAIL\n");
+}
+/* §M90 — `seqpackettest`: SOCK_SEQPACKET keeps message boundaries.  Two sends
+ * arrive as two receives (a stream would hand back "abcde" in one), a message
+ * read into a short buffer loses its tail instead of leaking it into the next
+ * read, and an empty ring then has nothing (not the dropped tail). */
+static void sy_seqpackettest(const char* args) {
+    (void)args;
+    struct usock *a = NULL, *b = NULL;
+    if (usock_pair(&a, &b) != 0) { console_write("seqpacket: FAIL (pair)\n"); return; }
+    usock_set_seqpacket(a, b);
+    char r[16];
+    long s1 = usock_send(a, "ab", 2, NULL), s2 = usock_send(a, "cde", 3, NULL);
+    long r1 = usock_recv(b, r, sizeof r, 0, NULL);
+    int m1 = r1 == 2 && r[0] == 'a' && r[1] == 'b';
+    long r2 = usock_recv(b, r, sizeof r, 0, NULL);
+    int m2 = r2 == 3 && r[0] == 'c' && r[2] == 'e';
+    long s3 = usock_send(a, "hello", 5, NULL);
+    long r3 = usock_recv(b, r, 2, 0, NULL);                 /* truncated to "he" */
+    int m3 = r3 == 2 && r[0] == 'h' && r[1] == 'e';
+    long r4 = usock_recv(b, r, sizeof r, 0, NULL);          /* the tail is gone */
+    usock_close(a); usock_close(b);
+    kprintf("seqpacket: send %d %d -> recv %d %d; 'hello' into 2 -> %d, then %d (want 2 3 2 0)\n",
+            (int)s1, (int)s2, (int)r1, (int)r2, (int)r3, (int)r4);
+    int ok = s1 == 2 && s2 == 3 && m1 && m2 && s3 == 5 && m3 && r4 == 0;
+    console_write(ok ? "seqpacket: ok\n" : "seqpacket: FAIL\n");
+}
 /* §M90 — `renametest`: rename across directories (docker writes a layer's
  * metadata in tmp/ and renames it into the store), a directory over an EMPTY
  * directory, and the two refusals that keep the tree a tree: a directory into
@@ -1233,6 +1356,12 @@ SHELL_CMD(subreapertest) = { "subreapertest", "", "orphans go to the nearest chi
                               SHELL_G_TEST, sy_subreapertest, SHELL_P_ANY };
 SHELL_CMD(oomtest) = { "oomtest", "", "/proc/<pid>/oom_score_adj: write, inherit, foreign read",
                         SHELL_G_TEST, sy_oomtest, SHELL_P_ANY };
+SHELL_CMD(peercredtest) = { "peercredtest", "", "SO_PEERCRED on unix sockets",
+                             SHELL_G_TEST, sy_peercredtest, SHELL_P_ANY };
+SHELL_CMD(nstest) = { "nstest", "", "UTS/IPC/cgroup/time namespaces, handles, setns",
+                       SHELL_G_TEST, sy_nstest, SHELL_P_ANY };
+SHELL_CMD(seqpackettest) = { "seqpackettest", "", "SOCK_SEQPACKET keeps message boundaries",
+                              SHELL_G_TEST, sy_seqpackettest, SHELL_P_ANY };
 SHELL_CMD(fifotest) = { "fifotest", "", "named pipes: open rules, EOF/HUP, a blocking reader",
                          SHELL_G_TEST, sy_fifotest, SHELL_P_ANY };
 SHELL_CMD(unlinkopentest) = { "unlinkopentest", "", "an unlinked file stays readable while open",

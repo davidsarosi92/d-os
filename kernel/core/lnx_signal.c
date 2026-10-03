@@ -184,6 +184,28 @@ int lnx_sig_post(struct task* t, int sig, const struct lnx_siginfo* info) {
     return 0;
 }
 
+/* §M90 — SIGCHLD to a Linux parent when its child process has exited.  Linux
+ * discards a signal whose disposition is IGNORE — SIGCHLD's default — at the
+ * moment it is sent, so a parent with no handler is not even woken (a wake
+ * would turn its blocking read into a spurious EINTR); only a parent that
+ * INSTALLED a handler gets it.  Called from task_exit_code after DEAD is
+ * published and with interrupts off, so it must not allocate: a parent with a
+ * handler has its Linux signal state already, and one without needs nothing.
+ * `killed_by` 0 = exited with `status`, else the signal that ended it. */
+void lnx_sig_child_exit(struct task* parent, int child_pid, int status, int killed_by) {
+    struct lnx_sigstate* s = state_of(parent, 0);
+    if (!s || !s->sh) return;
+    uintptr_t h = s->sh->a[17].handler;
+    if (h == 0 || h == 1) return;                            /* DFL (= ignore) or IGN */
+    struct lnx_siginfo si;
+    si.signo = 17;
+    si.code  = killed_by ? 2 /* CLD_KILLED */ : 1 /* CLD_EXITED */;
+    si.pid   = child_pid;
+    si.uid   = 0;
+    si.addr  = (uintptr_t)(killed_by ? killed_by : status);  /* si_status lives here */
+    lnx_sig_post(parent, 17, &si);
+}
+
 static uintptr_t pick_stack(struct lnx_sigstate* s, uint32_t flags, uintptr_t sp, int* on_alt) {
     *on_alt = 0;
     if (!(flags & LNX_SA_ONSTACK) || (s->ss_flags & LNX_SS_DISABLE) || !s->ss_size) return sp;

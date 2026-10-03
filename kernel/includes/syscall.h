@@ -239,6 +239,9 @@ int  sys_fsync(int fd);                                                /* §M90 
 int  sys_netlink_socket(int proto, int nonblock);                      /* §M90 */
 int  sys_open_k(const char* kpath, int flags);                         /* §M90 */
 long sys_open_ex_k(const char* kpath, int flags, int nonblock, int opath); /* §M90 */
+int  sys_sock_peercred(int fd, int* pid, int* uid, int* gid);           /* §M90 */
+struct file;
+struct file* sys_fd_vfs_file(int fd);                                  /* §M90 */
 int  sys_fd_path(int fd, char* out, size_t cap);                       /* §M90 */
 int  sys_unlink(const char* upath);
 long sys_mmap_full(uintptr_t addr, size_t len, int prot, int flags,
@@ -249,6 +252,7 @@ int  sys_socketpair(int* fds);          /* fds[0],fds[1] = connected unix pair *
 int  sys_pipe(int* fds);                /* fds[0]=read, fds[1]=write            */
 int  sys_pipe_k(int* fds);              /* kernel array (§M59)                 */
 int  sys_socketpair_k(int* fds);
+int  sys_socketpair_k2(int* fds, int seqpacket);   /* §M90 — SOCK_SEQPACKET */
 int  sys_dup2(int oldfd, int newfd);    /* redirect a descriptor               */
 int  sys_kill(int pid, int sig);        /* post a signal to a task             */
 /* §M53 stage 3 — see the SYS_TIMERFD_* notes above. */

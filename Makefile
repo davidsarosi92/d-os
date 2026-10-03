@@ -847,6 +847,7 @@ CORE_C_SRCS := \
     kernel/core/timerfd.c \
     kernel/core/eventfd.c \
     kernel/core/fifo.c \
+    kernel/core/nsproxy.c \
     kernel/core/flock.c \
     kernel/core/netlink.c \
     kernel/core/itimer.c \
@@ -903,6 +904,7 @@ CORE_C_SRCS := \
     kernel/core/timerfd.c \
     kernel/core/eventfd.c \
     kernel/core/fifo.c \
+    kernel/core/nsproxy.c \
     kernel/core/flock.c \
     kernel/core/netlink.c \
     kernel/core/itimer.c \
@@ -1218,6 +1220,7 @@ CORE_C_SRCS := \
     kernel/core/timerfd.c \
     kernel/core/eventfd.c \
     kernel/core/fifo.c \
+    kernel/core/nsproxy.c \
     kernel/core/flock.c \
     kernel/core/netlink.c \
     kernel/core/itimer.c \
@@ -2787,15 +2790,29 @@ modules: $(MODULES)
 # is not three refusals every time, and the tests still have a path to point at.
 # A test fixture that pollutes normal operation stops being run.
 MODULES_GOOD := $(filter-out %/stale-abi.ko %/stale-fp.ko,$(MODULES))
-user/modules.bin: $(MODULES) scripts/pack-rootfs.py
+# §M90 — the packed /modules image is PER ARCH ($(BUILD_DIR)/modules/), like
+# the .ko files in it.  It used to be user/modules.bin, ONE file for every
+# arch: after an i386 build it was newer than aarch64's .ko files, so the next
+# aarch64 build did not rebuild it and embedded the i386 modules ("insmod:
+# wrong ELF class (32-bit object)" — no loopback device on ARM, and dockerd's
+# sandbox failed with "Link not found").  The per-arch artifact cache cannot
+# file it by e_machine either: a packed image has no ELF header to ask.  The
+# symbols are renamed back so the kernel still says _binary_user_modules_bin_*.
+MODULES_BIN := $(BUILD_DIR)/modules/modules.bin
+MODULES_SYM := _binary_$(subst /,_,$(subst .,_,$(MODULES_BIN)))
+$(MODULES_BIN): $(MODULES) scripts/pack-rootfs.py
 	python3 scripts/pack-rootfs.py $@ \
 	    $(foreach m,$(MODULES_GOOD),$(m):/modules/$(notdir $(m))) \
 	    $(BUILD_DIR)/modules/stale-abi.ko:/modules/test/stale-abi.ko \
 	    $(BUILD_DIR)/modules/stale-fp.ko:/modules/test/stale-fp.ko
 
-$(OBJ_DIR)/user/modules_blob.o: user/modules.bin
+$(OBJ_DIR)/user/modules_blob.o: $(MODULES_BIN)
 	@mkdir -p $(@D)
-	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) $< $@
+	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) \
+	    --redefine-sym $(MODULES_SYM)_start=_binary_user_modules_bin_start \
+	    --redefine-sym $(MODULES_SYM)_end=_binary_user_modules_bin_end \
+	    --redefine-sym $(MODULES_SYM)_size=_binary_user_modules_bin_size \
+	    $< $@
 
 $(KERNEL_BIN): $(OBJS) $(LINKER_SCRIPT)
 	@mkdir -p $(BUILD_DIR)

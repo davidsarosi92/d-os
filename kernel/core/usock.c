@@ -22,6 +22,8 @@
 #include "fd.h"
 #include "kmalloc.h"
 #include "waitq.h"
+#include "task.h"
+#include "cred.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -65,7 +67,31 @@ struct usock {
      * recv after it drains.  Before this, a full ring made write(2) return 0,
      * which a stream writer cannot interpret (it is neither EAGAIN nor EOF). */
     struct waitq  writers;
+    /* §M90 — SO_PEERCRED.  `own_*`: the process that created this endpoint
+     * (a listener: the one that called listen).  `peer_*`: who was at the
+     * other end WHEN THE CONNECTION WAS MADE — Linux records it then, and it
+     * survives the peer closing.  containerd's ttrpc refuses a connection
+     * whose credentials it cannot read. */
+    int           own_pid, own_uid, own_gid;
+    int           peer_pid, peer_uid, peer_gid;
+    int           has_peercred;
+    /* §M90 — SOCK_SEQPACKET: the ring holds MESSAGES, each a 4-byte length
+     * then its bytes.  A send is one message, whole or not at all; a recv
+     * returns exactly one, dropping what does not fit (Linux's MSG_TRUNC
+     * behaviour).  runc's sync pipe is one: a stream would merge two of its
+     * JSON messages into one read. */
+    int           seqpacket;
 };
+#define SEQ_HDR 4
+
+/* The calling process's credentials, as SO_PEERCRED reports them. */
+static void usock_my_creds(int* pid, int* uid, int* gid) {
+    struct task* t = task_current();
+    *pid = t ? task_tgid(t) : 0;
+    int u = t ? cred_uid(&t->cred) : 0, g = t ? cred_gid(&t->cred) : 0;
+    *uid = u < 0 ? 0 : u;
+    *gid = g < 0 ? 0 : g;
+}
 
 void usock_set_owner(struct usock* s, struct ofile* o) { if (s) s->owner = o; }
 
@@ -81,6 +107,13 @@ int usock_pair(struct usock** a, struct usock** b) {
     waitq_init(&sa->writers);
     waitq_init(&sb->writers);
     sa->ever_connected = sb->ever_connected = 1;
+    /* §M90 — both ends were made by the caller, so each one's peer is it. */
+    usock_my_creds(&sa->own_pid, &sa->own_uid, &sa->own_gid);
+    sb->own_pid = sa->own_pid; sb->own_uid = sa->own_uid; sb->own_gid = sa->own_gid;
+    sa->peer_pid = sb->peer_pid = sa->own_pid;
+    sa->peer_uid = sb->peer_uid = sa->own_uid;
+    sa->peer_gid = sb->peer_gid = sa->own_gid;
+    sa->has_peercred = sb->has_peercred = 1;
     *a = sa;
     *b = sb;
     return 0;
@@ -98,6 +131,22 @@ long usock_send(struct usock* s, const void* buf, size_t n, struct ofile* passfi
     uint32_t f = waitq_lock(&p->readers);
     const uint8_t* src = (const uint8_t*)buf;
     size_t wrote = 0;
+    if (p->seqpacket) {
+        /* One message: all of it with its header, or nothing (0 = no room). */
+        if (n + SEQ_HDR > USOCK_BUF) { waitq_unlock(&p->readers, f); return -90; }  /* EMSGSIZE */
+        if ((size_t)(USOCK_BUF - p->count) < n + SEQ_HDR) { waitq_unlock(&p->readers, f); return 0; }
+        uint32_t len = (uint32_t)n;
+        for (int i = 0; i < SEQ_HDR; i++)
+            p->rx[(p->head + p->count + i) % USOCK_BUF] = (uint8_t)(len >> (8 * i));
+        p->count += SEQ_HDR;
+        for (size_t i = 0; i < n; i++) p->rx[(p->head + p->count + i) % USOCK_BUF] = src[i];
+        p->count += (int)n;
+        if (passfile && p->fdq_count < USOCK_FDQ) p->fdq[p->fdq_count++] = ofile_ref(passfile);
+        waitq_wake_all(&p->readers);
+        waitq_unlock(&p->readers, f);
+        fd_readiness_changed(p->owner);
+        return (long)n;                  /* an empty message is sent and counts 0 bytes */
+    }
     while (wrote < n && p->count < USOCK_BUF) {
         p->rx[(p->head + p->count) % USOCK_BUF] = src[wrote++];
         p->count++;
@@ -161,13 +210,31 @@ long usock_recv(struct usock* s, void* buf, size_t n, int block,
     uint8_t* dst = (uint8_t*)buf;
     size_t got = 0;
     was_full = s->count >= USOCK_BUF;
+    int took_msg = 0;
+    if (s->seqpacket) {
+        if (s->count >= SEQ_HDR) {               /* exactly one message */
+            uint32_t len = 0;
+            for (int i = 0; i < SEQ_HDR; i++) {
+                len |= (uint32_t)s->rx[s->head] << (8 * i);
+                s->head = (s->head + 1) % USOCK_BUF;
+            }
+            s->count -= SEQ_HDR;
+            for (uint32_t i = 0; i < len; i++) {
+                if (got < n) dst[got++] = s->rx[s->head];   /* the rest is truncated */
+                s->head = (s->head + 1) % USOCK_BUF;
+            }
+            s->count -= (int)len;
+            took_msg = 1;
+            was_full = 1;                        /* room for a whole message may have appeared */
+        }
+    } else
     while (got < n && s->count > 0) {
         dst[got++] = s->rx[s->head];
         s->head = (s->head + 1) % USOCK_BUF;
         s->count--;
     }
 
-    if (got > 0) {                       /* §M90 — room for a blocked writer */
+    if (got > 0 || took_msg) {           /* §M90 — room for a blocked writer */
         uint32_t wf = waitq_lock(&s->writers);
         waitq_wake_all(&s->writers);
         waitq_unlock(&s->writers, wf);
@@ -187,13 +254,17 @@ long usock_recv(struct usock* s, void* buf, size_t n, int block,
      * slept until something unrelated woke it, and an edge-triggered epoll
      * (Go's netpoller) would never hear of it at all.  Only the full -> not
      * full transition matters: usock_can_write is "count < USOCK_BUF". */
-    if (got > 0 && was_full) fd_readiness_changed(NULL);
+    if ((got > 0 || took_msg) && was_full) fd_readiness_changed(NULL);
     return (long)got;
 }
 
 /* Readiness queries for poll(2). */
 int usock_can_read(struct usock* s)  { return s && (s->count > 0 || s->acc_n > 0); }
-int usock_can_write(struct usock* s) { return s && s->peer && s->peer->count < USOCK_BUF; }
+int usock_can_write(struct usock* s) {
+    if (!s || !s->peer) return 0;
+    /* a SEQPACKET peer has room only for a header plus at least one byte */
+    return s->peer->count < USOCK_BUF - (s->peer->seqpacket ? SEQ_HDR : 0);
+}
 /* §M56.1 — is the other end still there?  `peer` is cleared by usock_close, so
  * this is the whole hangup story for a pipe or socketpair.  Kept separate from
  * can_read so a reader can drain what is already buffered before it acts on
@@ -266,6 +337,7 @@ struct usock* usock_new(void) {
     if (!s) return NULL;
     waitq_init(&s->readers);
     waitq_init(&s->writers);
+    usock_my_creds(&s->own_pid, &s->own_uid, &s->own_gid);   /* §M90 */
     return s;
 }
 
@@ -301,6 +373,7 @@ int usock_listen(struct usock* s, int backlog) {
     if (!s->path[0]) return -22;              /* an unbound listener cannot be reached */
     s->listening = 1;
     s->backlog = backlog < 1 ? 1 : backlog > USOCK_ACCQ ? USOCK_ACCQ : backlog;
+    usock_my_creds(&s->own_pid, &s->own_uid, &s->own_gid);   /* §M90 — at listen */
     return 0;
 }
 
@@ -319,6 +392,12 @@ int usock_connect(struct usock* s, const char* name) {
     if (l->acc_n >= l->backlog) { waitq_unlock(&l->readers, lf); kfree(srv); return -11; }  /* EAGAIN */
     srv->peer = s; s->peer = srv;
     srv->ever_connected = s->ever_connected = 1;
+    /* §M90 — the credentials, as of now: the client sees the listener's
+     * owner, the server end sees the connecting process. */
+    srv->own_pid = l->own_pid; srv->own_uid = l->own_uid; srv->own_gid = l->own_gid;
+    s->peer_pid = l->own_pid;  s->peer_uid = l->own_uid;  s->peer_gid = l->own_gid;
+    usock_my_creds(&srv->peer_pid, &srv->peer_uid, &srv->peer_gid);
+    srv->has_peercred = s->has_peercred = 1;
     l->accq[l->acc_n++] = srv;
     waitq_wake_all(&l->readers);
     waitq_unlock(&l->readers, lf);
@@ -357,12 +436,31 @@ long usock_write(struct usock* s, const void* buf, size_t n, int block) {
     for (;;) {
         if (!s->peer) return -32;
         long w = usock_send(s, buf, n, NULL);
+        if (w == -90) return -90;                                   /* EMSGSIZE */
         if (w != 0 || n == 0) return w < 0 ? -32 : w;
         if (!block) return -11;
         struct usock* p = s->peer;
         if (!p) return -32;
         uint32_t f = waitq_lock(&p->writers);
-        if (s->peer && s->peer->count >= USOCK_BUF) waitq_block(&p->writers);
+        if (s->peer && (s->peer->seqpacket
+                        ? (size_t)(USOCK_BUF - s->peer->count) < n + SEQ_HDR
+                        : s->peer->count >= USOCK_BUF))
+            waitq_block(&p->writers);
         waitq_unlock(&p->writers, f);
     }
 }
+
+/* §M90 — SO_PEERCRED: 0 and the recorded peer, or -1 when this endpoint was
+ * never connected (Linux then answers pid 0, uid/gid -1 — the caller does). */
+int usock_peercred(struct usock* s, int* pid, int* uid, int* gid) {
+    if (!s || !s->has_peercred) return -1;
+    *pid = s->peer_pid; *uid = s->peer_uid; *gid = s->peer_gid;
+    return 0;
+}
+
+/* §M90 — make a fresh pair SOCK_SEQPACKET (both ends), before any data. */
+void usock_set_seqpacket(struct usock* a, struct usock* b) {
+    if (a) a->seqpacket = 1;
+    if (b) b->seqpacket = 1;
+}
+int usock_is_seqpacket(struct usock* s) { return s && s->seqpacket; }

@@ -491,6 +491,7 @@ static long linux_socketcall_k(int call, const uint32_t* a) {
         [LSOC_ACCEPT]      = ABI_ACCEPT,
         [LSOC_GETSOCKNAME] = ABI_GETSOCKNAME,
         [LSOC_GETPEERNAME] = ABI_GETPEERNAME,
+        [LSOC_SOCKETPAIR]  = ABI_SOCKETPAIR,      /* §M90 */
         [LSOC_SEND]        = ABI_SEND,
         [LSOC_RECV]        = ABI_RECV,
         [LSOC_SENDTO]      = ABI_SENDTO,

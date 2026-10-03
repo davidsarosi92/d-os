@@ -366,7 +366,12 @@ static int vfs_proc_alias(const char* c, char* out, size_t cap) {
     size_t i = 0;
     while (pre[i] && c[i] == pre[i]) i++;
     if (pre[i]) return 0;
-    task_set_proc_target(0);                        /* §M90 — see above */
+    /* §M90 — the target is NOT reset here: a path is canonicalised more than
+     * once on its way through the VFS, and the second pass sees this alias's
+     * own output ("/proc/self/…") — resetting then erased the target the
+     * first pass set.  Its lifetime is bounded by the call instead: every
+     * Linux syscall starts with it cleared (abi_dispatch), and procfs clears
+     * it when an open consumes it. */
     const char* rest = NULL;
     int own = 0;                                    /* the caller's own process */
     long fpid = 0;                                  /* a foreign process's pid */
@@ -387,6 +392,7 @@ static int vfs_proc_alias(const char* c, char* out, size_t cap) {
             k++;
             own = pid == task_tgid_current();
             if (!own) fpid = pid;
+            else task_set_proc_target(0);           /* /proc/<own pid>: the caller */
         }
         /* an optional "task/<tid>/" */
         const char* tk = "task/";
@@ -400,8 +406,13 @@ static int vfs_proc_alias(const char* c, char* out, size_t cap) {
         }
         if (k == i + 5 && own && c[k - 1] == '/' && c[i] == 's') return 0;   /* plain /proc/self/X */
         int is_ns = c[k] == 'n' && c[k + 1] == 's' && (c[k + 2] == '/' || c[k + 2] == 0);
-        if (!own && !is_ns) {
-            if (!fpid || !proc_foreign_ok(c + k) || !task_tgid_alive((int)fpid)) return 0;
+        if (!own) {
+            /* Another process's file: its handles (ns/…) or a per-process file
+             * that answers for it — and then procfs must generate for THAT
+             * process, not for the caller (a namespace handle of another pid
+             * used to name the caller's own namespace). */
+            if (!fpid || !task_tgid_alive((int)fpid)) return 0;
+            if (!is_ns && !proc_foreign_ok(c + k)) return 0;
             task_set_proc_target((int)fpid);
         }
         rest = c + k;

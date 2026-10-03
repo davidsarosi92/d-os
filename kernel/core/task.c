@@ -77,7 +77,8 @@
  * context_switch that swaps away from it.
  * ============================================================================= */
 
-#include "lnx_signal.h"   /* §M89 */
+#include "lnx_signal.h"
+#include "nsproxy.h"   /* §M89 */
 #include "task.h"
 #include "swap.h"
 #include "watchdog.h"   /* §M31 L3 — hw_watchdog_pet from the tick */
@@ -932,6 +933,7 @@ static struct task* spawn_common_ex(const char* name, void (*entry)(void),
     t->mntns  = cur ? cur->mntns  : 0;       /* §M90 — and in its mount namespace */
     t->sid  = cur ? cur->sid  : 0;
     t->oom_score_adj = cur ? cur->oom_score_adj : 0;   /* §M90 — inherited */
+    ns_inherit(cur, t);                      /* §M90 — namespaces, with references */
     t->state       = TASK_RUNNABLE;
     /* §M32 — identity, inherited HERE and nowhere else.  Assigning creds from
      * a call site after spawn returns would be assigning them to a task another
@@ -2359,6 +2361,7 @@ int task_reap(int pid) {
     }
 
     lnx_sig_free(t);                         /* §M89 — Linux signal state */
+    ns_release(t);                           /* §M90 — namespace references */
     if (t->kstack_base) kfree(t->kstack_base);
     kfree(t);
     task_notify_change();                    /* M22.4 — task disappeared */
@@ -2885,6 +2888,16 @@ void task_exit_code(int code) {
         uint32_t wf = waitq_lock(&child_exit_wq);
         waitq_wake_all(&child_exit_wq);
         waitq_unlock(&child_exit_wq, wf);
+    }
+    /* §M90 — SIGCHLD to a Linux parent, AFTER DEAD is published: a parent that
+     * reaps from its SIGCHLD handler with wait4(-1, WNOHANG) (containerd's
+     * shim, every shell) must find the child collectable when the signal
+     * lands, or it consumes the signal, finds nothing, and waits forever.
+     * Only for a PROCESS (a thread's exit tells its parent nothing). */
+    if (self->linux_abi && task_tgid(self) == self->pid && self->ppid > 0) {
+        struct task* par = task_find(self->ppid);
+        if (par && par->linux_abi && par->state != TASK_DEAD)
+            lnx_sig_child_exit(par, self->pid, code & 0xFF, 0);
     }
     task_notify_change();                    /* M22.4 — went DEAD */
 
