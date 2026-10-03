@@ -304,7 +304,27 @@ static const char* vfs_canon_plain(const char* path, char* buf, size_t cap) {
  * "/proc/self/fd" as a directory and then chmods "22" relative to it, so a
  * check on the raw argument alone never sees the link.  1 if `out` holds the
  * rewritten path. */
+/* §M90 — the program behind /proc/self/exe (or the /proc/<pid> target's), as a
+ * path; "" when unknown.  task.c; weak so a build without tasks links. */
+const char* task_proc_exe(void) __attribute__((weak));
+const char* task_proc_exe(void) { return ""; }
 static int vfs_fd_magic(const char* path, char* out, size_t cap) {
+    /* §M90 — /proc/self/exe OPENS the running program, as on Linux (readlink
+     * of it was answered since §M89, opening it was ENOENT).  runc re-executes
+     * itself through it to start a container's init. */
+    {
+        const char* e = "/proc/self/exe";
+        size_t i = 0;
+        while (e[i] && path[i] == e[i]) i++;
+        if (!e[i] && !path[i]) {
+            const char* x = task_proc_exe();
+            if (!x || !x[0]) return 0;
+            size_t o = 0;
+            for (; x[o] && o + 1 < cap; o++) out[o] = x[o];
+            out[o] = 0;
+            return 1;
+        }
+    }
     static const char* const pre[2] = { "/proc/self/fd/", "/proc/thread-self/fd/" };
     for (int w = 0; w < 2; w++) {
         size_t i = 0;
@@ -327,17 +347,20 @@ static int vfs_fd_magic(const char* path, char* out, size_t cap) {
     return 0;
 }
 
-/* §M90 — /proc has no per-process or per-thread tree; these spellings all
- * name the CALLER's view, which is what /proc/self serves:
+/* §M90 — /proc has no per-process tree of dentries; every spelling maps onto
+ * /proc/self, and for ANOTHER process the target is recorded so procfs
+ * generates for it:
  *   /proc/thread-self/X               -> /proc/self/X
- *   /proc/<pid>[/task/<tid>]/X        -> /proc/self/X  when <pid> is the
- *                                        caller's own process (Go names its
- *                                        own threads this way: netns.Get)
  *   /proc/self/task/<tid>/X           -> /proc/self/X
- *   /proc/<any pid>[/task/<tid>]/ns/X -> /proc/self/ns/X  (one namespace of
- *                                        each kind but mount)
- * Another process's fd table, status or mountinfo stay unanswered — a wrong
- * answer is worse than a missing one.  1 if `out` holds the rewrite. */
+ *   /proc/<own pid>[/task/<tid>]/X    -> /proc/self/X  (Go names its own
+ *                                        threads this way: netns.Get)
+ *   /proc/<other pid>[/task/<tid>]/X  -> /proc/self/X, target = <other pid>,
+ *                                        for ns/… and the per-process files in
+ *                                        proc_foreign_ok (status, cgroup,
+ *                                        oom_score_adj, oom_score, exe)
+ * Another process's fd table or mountinfo stay unanswered — a wrong answer
+ * (the caller's own, under another pid) is worse than a missing one.
+ * 1 if `out` holds the rewrite. */
 int task_tgid_current(void) __attribute__((weak));
 int task_tgid_current(void) { return -1; }
 /* §M90 — /proc/<another pid>/X: the alias below maps it onto /proc/self/X and
@@ -353,7 +376,7 @@ int  task_tgid_alive(int pid) { (void)pid; return 0; }
  * under a foreign pid — better ENOENT than the caller's data under another
  * process's name. */
 static int proc_foreign_ok(const char* rest) {
-    static const char* const ok[] = { "oom_score_adj", "oom_score", "status", "cgroup" };
+    static const char* const ok[] = { "oom_score_adj", "oom_score", "status", "cgroup", "exe" };
     for (unsigned i = 0; i < sizeof ok / sizeof ok[0]; i++) {
         const char* a = ok[i]; const char* b = rest;
         while (*a && *a == *b) { a++; b++; }

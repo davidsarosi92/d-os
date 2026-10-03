@@ -678,7 +678,10 @@ static void linux_syscall_body(struct int_frame* f) {
                 r.r8  = f->r8;  r.r9  = f->r9;  r.r10 = f->r10; r.r11 = f->r11;
                 r.r12 = f->r12; r.r13 = f->r13; r.r14 = f->r14; r.r15 = f->r15;
                 r.rip = f->rip; r.rflags = f->rflags; r.user_sp = f->rsp;
-                f->rax = (uint64_t)proc_fork(&r);
+                /* §M90 — every flag honoured or refused (proc_clone_fork);
+                 * amd64: (flags, stack, ptid, ctid, tls). */
+                f->rax = (uint64_t)proc_clone_fork(&r, flags, (uintptr_t)a1,
+                                                   (uintptr_t)a2, (uintptr_t)a3);
                 return;
             }
             if (!a1) { f->rax = (uint64_t)-LNX_EINVAL; return; }

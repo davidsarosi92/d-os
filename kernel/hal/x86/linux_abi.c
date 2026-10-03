@@ -819,7 +819,10 @@ static void linux_syscall_body(struct int_frame* f) {
             r.esi = f->esi; r.edi = f->edi; r.ebp = f->ebp;
             r.eip = f->eip; r.eflags = f->eflags; r.user_sp = f->user_esp;
             if (!(flags & LNX_CLONE_VM)) {          /* a fork in disguise */
-                f->eax = (uint32_t)proc_fork(&r);
+                /* §M90 — every flag honoured or refused (proc_clone_fork);
+                 * i386: (flags, stack, ptid, tls, ctid). */
+                f->eax = (uint32_t)proc_clone_fork(&r, flags, (uintptr_t)f->ecx,
+                                                   (uintptr_t)f->edx, (uintptr_t)f->edi);
                 return;
             }
             if (!f->ecx) { f->eax = (uint32_t)-LNX_EINVAL; return; }

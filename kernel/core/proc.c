@@ -535,7 +535,36 @@ int proc_execve(const char* path, char* const uargv[]) {
     return proc_execve_env(path, uargv, NULL);
 }
 
+/* §M90 — the program file to load for `kpath`: a VFS open, or — for
+ * /proc/self/fd/N (or thread-self) naming a memfd — a read-only file over
+ * that memfd's bytes (shm_file).  runc starts every container's init from a
+ * sealed memfd copy of itself this way. */
+static struct file* exec_open(const char* kpath) {
+    static const char* const pre[2] = { "/proc/self/fd/", "/proc/thread-self/fd/" };
+    for (int w = 0; w < 2; w++) {
+        int i = 0;
+        while (pre[w][i] && kpath[i] == pre[w][i]) i++;
+        if (pre[w][i]) continue;
+        int fd = 0, d = 0;
+        while (kpath[i] >= '0' && kpath[i] <= '9') { fd = fd * 10 + (kpath[i++] - '0'); d++; }
+        if (!d || kpath[i]) break;
+        struct ofile* o = fd_lookup(fd);
+        if (o && o->kind == FD_SHM && o->shm) return shm_file(o->shm);
+        break;
+    }
+    return vfs_open(kpath, VFS_RDONLY);
+}
+
 int proc_execve_env(const char* path, char* const uargv[], char* const uenvp[]) {
+    /* §1.1 — `path` is the calling program's pointer, so copy it in
+     * (validated) before the VFS sees it. */
+    char kpath[256];
+    if (u_strcopy(kpath, path, sizeof kpath) < 0) return -1;
+    return proc_execve_env_k(kpath, uargv, uenvp);
+}
+
+/* §M90 — the same from a KERNEL path (execveat builds one). */
+int proc_execve_env_k(const char* kpath, char* const uargv[], char* const uenvp[]) {
     struct task* me = task_current();
     if (!me || !me->mm) return -1;           /* only a user process can exec  */
 
@@ -553,11 +582,8 @@ int proc_execve_env(const char* path, char* const uargv[], char* const uenvp[]) 
         return (argc == E2BIG_RC || envc == E2BIG_RC) ? E2BIG_RC : -1;
     }
 
-    /* 2. Read the ELF file into a kernel buffer.  §1.1 — `path` is the calling
-     *    program's pointer, so copy it in (validated) before the VFS sees it. */
-    char kpath[256];
-    if (u_strcopy(kpath, path, sizeof kpath) < 0) { kfree(strbuf); return -1; }
-    struct file* f = vfs_open(kpath, VFS_RDONLY);
+    /* 2. Open the program (a file, or a memfd through /proc/self/fd/N). */
+    struct file* f = exec_open(kpath);
     if (!f) { kfree(strbuf); return -1; }
     /* §M89 — what /proc/self/exe will name (vfs_canonical joins the cwd and
      * resolves "..", within this task's root).  Computed now, COMMITTED at the
@@ -872,4 +898,92 @@ void user_excursion_fault(int sig) {
     if (!me || me->user_task || !me->exc_kstack) return;   /* a real process */
     me->exc_fault = sig ? sig : 11;
     user_excursion_teleport();
+}
+
+/* =============================================================================
+ * §M90 — clone() of the FORK shape (no CLONE_VM), honouring its flags.
+ *
+ * It used to be "a fork in disguise" with every flag ignored — including the
+ * new STACK, which glibc's clone(fn, stack, flags, arg) depends on: it puts
+ * fn and arg on that stack and the child takes them from there, so a child
+ * left on the parent's stack ran whatever it found.  runc's nsexec creates
+ * every stage of a container's init this way, with CLONE_PARENT.
+ *
+ * Honoured: the stack; CSIGNAL (the exit signal, 0 = none); CLONE_PARENT (the
+ * child is a sibling: its parent is the caller's parent, who waits for it);
+ * CLONE_PARENT_SETTID; CLONE_CHILD_SETTID / CLONE_CHILD_CLEARTID (in the
+ * CHILD's memory); CLONE_VFORK (served as a fork — POSIX leaves the shared
+ * memory half undefined); CLONE_NEWNS / NEWUTS / NEWIPC / NEWCGROUP / NEWTIME
+ * (the child is born in new ones).  Anything else — CLONE_NEWPID, NEWNET,
+ * NEWUSER, CLONE_FILES or CLONE_SIGHAND without a shared address space,
+ * CLONE_PIDFD — is REFUSED with EINVAL and named, never dropped.
+ * ============================================================================= */
+#include "nsproxy.h"
+#include "uaccess.h"
+struct clone_opts { unsigned long flags; uintptr_t ctid; };
+#define CL_VFORK          0x00004000ul
+#define CL_PARENT         0x00008000ul
+#define CL_PARENT_SETTID  0x00100000ul
+#define CL_CHILD_CLEARTID 0x00200000ul
+#define CL_CHILD_SETTID   0x01000000ul
+#define CL_NSOBJ          (NS_CLONE_NEWUTS | NS_CLONE_NEWIPC | NS_CLONE_NEWCGROUP | NS_CLONE_NEWTIME)
+
+int vfs_mntns_new(int parent);
+long proc_clone_fork(struct user_regs* r, unsigned long flags, uintptr_t stack,
+                     uintptr_t ptid, uintptr_t ctid) {
+    unsigned long known = 0xFFul | CL_VFORK | CL_PARENT | CL_PARENT_SETTID | CL_CHILD_CLEARTID |
+                          CL_CHILD_SETTID | NS_CLONE_NEWNS | CL_NSOBJ;
+    if (flags & ~known) {
+        kprintf("clone: flags %lx not supported for a new process\n", flags & ~known);
+        return -22;
+    }
+    struct task* me = task_current();
+    if (!me) return -22;
+    if ((flags & (NS_CLONE_NEWNS | CL_NSOBJ)) &&
+        cred_uid(&me->cred) != 0 && !cred_is_admin(&me->cred)) return -1;   /* EPERM */
+    if ((flags & CL_PARENT_SETTID) && !vmm_user_access_ok(ptid, sizeof(int), 1)) return -14;
+    if (stack) r->user_sp = stack;
+    struct clone_opts o = { flags, ctid };
+    me->fork_opts = &o;
+    int pid = proc_fork(r);
+    me->fork_opts = NULL;
+    if (pid < 0) return -11;                                  /* EAGAIN */
+    if (flags & CL_PARENT_SETTID) {
+        int v = pid;
+        copy_to_user(ptid, &v, sizeof v);
+    }
+    return pid;
+}
+
+/* In proc_fork, before the child may run: what the clone flags change about
+ * it.  A plain fork has no options and is left exactly as it was. */
+void proc_fork_apply(struct task* parent, struct task* child) {
+    const struct clone_opts* o = parent ? (const struct clone_opts*)parent->fork_opts : NULL;
+    if (!o || !child) return;
+    if (o->flags & CL_PARENT) child->ppid = parent->ppid;
+    child->exit_sig_plus1 = (int)(o->flags & 0xFF) + 1;
+    if (o->flags & CL_CHILD_SETTID)   child->set_child_tid = o->ctid;
+    if (o->flags & CL_CHILD_CLEARTID) child->clear_tid = (int*)o->ctid;
+    if (o->flags & NS_CLONE_NEWNS) {
+        int ns = vfs_mntns_new(child->mntns);
+        if (ns >= 0) child->mntns = ns;
+        else kprintf("clone: no mount namespace left for pid %d\n", child->pid);
+    }
+    if (o->flags & CL_NSOBJ) {
+        if (ns_unshare(child, o->flags & CL_NSOBJ) != 0)
+            kprintf("clone: out of memory for pid %d's namespaces\n", child->pid);
+        /* clone(CLONE_NEWTIME) puts the CHILD itself in the new time namespace
+         * (unshare would only prepare it for children). */
+        if ((o->flags & NS_CLONE_NEWTIME) && child->ns_time_children)
+            ns_enter(child, NSK_TIME, child->ns_time_children);
+    }
+}
+
+/* The fork child, in its own address space, just before user mode. */
+void proc_fork_child_entry(void) {
+    struct task* me = task_current();
+    if (!me || !me->set_child_tid) return;
+    int v = me->pid;
+    copy_to_user(me->set_child_tid, &v, sizeof v);
+    me->set_child_tid = 0;
 }

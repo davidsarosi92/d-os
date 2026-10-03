@@ -566,6 +566,21 @@ static long h_fcntl(struct abi_ctx* c) {
     }
     if (cmd == 2) return fd_set_cloexec(fd, (int)(arg & 1)) < 0 ? -ABI_EBADF : 0;   /* F_SETFD */
     if (cmd == 4) { sys_socket_setnonblock(fd, (arg & 04000) ? 1 : 0); return 0; }   /* F_SETFL */
+    /* §M90 — memfd seals: F_ADD_SEALS (1033), F_GET_SEALS (1034).  Each seal
+     * is ENFORCED by shm_write / shm_truncate.  Linux also refuses a WRITE
+     * seal while a writable shared mapping exists (EBUSY); mappings are not
+     * counted here, so that one refusal is not made. */
+    if (cmd == 1033 || cmd == 1034) {
+        struct ofile* o = fd_lookup(fd);
+        if (!o) return -ABI_EBADF;
+        if (o->kind != FD_SHM || !o->shm) return -ABI_EINVAL;
+        if (cmd == 1034) return (long)o->shm->seals;
+        if (o->shm->seals & SHM_SEAL_SEAL) return -1;                  /* EPERM */
+        if ((unsigned long)arg & ~0x1Ful) return -ABI_EINVAL;
+        o->shm->seals |= (uint32_t)arg & 0xFu;                         /* FUTURE_WRITE (0x10) = WRITE here */
+        if ((unsigned long)arg & 0x10ul) o->shm->seals |= SHM_SEAL_WRITE;
+        return 0;
+    }
     if (cmd == 3) return sys_socket_getnonblock(fd) > 0 ? 04000 : 0;                /* F_GETFL */
     return 0;
 }
@@ -1646,6 +1661,30 @@ static long h_execve(struct abi_ctx* c) {
                             (char* const*)(uintptr_t)c->a[2]);
     return r == -7 ? -7 : (r < 0 ? -ABI_ENOENT : r);
 }
+/* §M90 — execveat(dirfd, path, argv, envp, flags).  AT_EMPTY_PATH with an
+ * empty path executes the descriptor itself (fexecve) — a memfd included,
+ * which is how runc starts a container's init from its sealed copy; otherwise
+ * `path` relative to `dirfd`, as every *at call. */
+static long h_execveat(struct abi_ctx* c) {
+    char kp[256];
+    if (abi_path(c->a[1], kp, sizeof kp) != 0) return -ABI_EFAULT;
+    char* const* av = (char* const*)(uintptr_t)c->a[2];
+    char* const* ev = (char* const*)(uintptr_t)c->a[3];
+    if (kp[0] == 0) {
+        if (!(c->a[4] & 0x1000 /* AT_EMPTY_PATH */)) return -ABI_ENOENT;
+        char fp[32] = "/proc/self/fd/";
+        int fd = (int)c->a[0], n = 14;
+        char dg[12]; int d = 0;
+        if (fd < 0) return -9;                                         /* EBADF */
+        do { dg[d++] = (char)('0' + fd % 10); fd /= 10; } while (fd && d < 11);
+        while (d) fp[n++] = dg[--d];
+        fp[n] = 0;
+        int r = proc_execve_env_k(fp, av, ev);
+        return r == -7 ? -7 : (r < 0 ? -ABI_ENOENT : r);
+    }
+    long r = AT_WRAP(c->a[0], (long)proc_execve_env_k(kp, av, ev));
+    return r == -7 ? -7 : (r < 0 ? -ABI_ENOENT : r);
+}
 
 /* ---- §M89 — the calls a JVM makes before main() ----------------------------
  *
@@ -1991,6 +2030,10 @@ static long h_memfd_create(struct abi_ctx* c) {
     int r = sys_memfd(0);
     if (r < 0) return -ABI_ENOMEM;
     if (c->a[1] & 1u) fd_set_cloexec(r, 1);             /* MFD_CLOEXEC */
+    /* §M90 — Linux: without MFD_ALLOW_SEALING the object starts sealed
+     * against further seals (F_SEAL_SEAL), so F_ADD_SEALS answers EPERM. */
+    struct ofile* o = fd_lookup(r);
+    if (o && o->shm && !(c->a[1] & 2u)) o->shm->seals = SHM_SEAL_SEAL;
     return r;
 }
 /* ftruncate: a memfd is sized; a regular file is EXTENDED by writing a zero
@@ -2001,7 +2044,11 @@ static long h_ftruncate(struct abi_ctx* c) {
     long size = (long)c->a[1];
     struct ofile* o = fd_lookup(fd);
     if (!o) return -ABI_EBADF;
-    if (o->kind == FD_SHM) return sys_memfd_resize(fd, (size_t)size) < 0 ? -ABI_EINVAL : 0;
+    if (o->kind == FD_SHM) {                       /* §M90 — grow or shrink, seals obeyed */
+        if (size < 0) return -ABI_EINVAL;
+        int e = shm_truncate(o->shm, (uint64_t)size);
+        return e == 0 ? 0 : (e == -1 ? -1 /* EPERM: sealed */ : e);
+    }
     if (o->kind != FD_VFS || !o->file || !o->file->inode || size < 0) return -ABI_EINVAL;
     uint64_t cur = o->file->inode->size;
     if ((uint64_t)size == cur) return 0;
@@ -2523,6 +2570,7 @@ static const struct {
     [ABI_PIPE]            = { "pipe",            h_pipe },
     [ABI_PIPE2]           = { "pipe2",           h_pipe2 },
     [ABI_EXECVE]          = { "execve",          h_execve },
+    [ABI_EXECVEAT]        = { "execveat",        h_execveat },   /* §M90 */
     /* §M24 — the socket surface, shared by all three arches at once. */
     [ABI_SOCKET]       = { "socket",       h_socket       },
     [ABI_SOCKETPAIR]   = { "socketpair",   h_socketpair   },   /* §M90 */

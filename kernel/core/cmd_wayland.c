@@ -113,9 +113,9 @@ static void cmd_waykeymap(void) {
     kprintf("---- BEGIN XKB KEYMAP (%u bytes) ----\n", size);
     struct shm* s = km->shm;
     for (uint32_t off = 0; off + 1 < size; off++) {
-        uint32_t fi = off / 4096, fo = off % 4096;
-        if ((int)fi >= s->nframes) break;
-        console_putchar((char)*(volatile uint8_t*)(uintptr_t)(s->frames[fi] + fo));
+        const uint8_t* b = (const uint8_t*)shm_kptr(s, off);   /* §M90 — direct map */
+        if (!b) break;
+        console_putchar((char)*b);
     }
     console_write("---- END XKB KEYMAP ----\n");
     ofile_unref(km);

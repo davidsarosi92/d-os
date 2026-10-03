@@ -78,6 +78,15 @@ void proc_path_value(char* out, int cap);
  * exactly `envp`, or the default one when it is NULL).  Returns -7 (E2BIG)
  * when argv + envp do not fit the initial stack page — refused, never cut. */
 int proc_execve_env(const char* path, char* const argv[], char* const envp[]);
+/* §M90 — clone() without CLONE_VM, every flag honoured or refused (proc.c);
+ * the hooks proc_fork calls on each arch around the child. */
+long proc_clone_fork(struct user_regs* r, unsigned long flags, uintptr_t stack,
+                     uintptr_t ptid, uintptr_t ctid);
+struct task;
+void proc_fork_apply(struct task* parent, struct task* child);
+void proc_fork_child_entry(void);
+/* §M90 — the same with a KERNEL path (execveat; a memfd via /proc/self/fd/N). */
+int proc_execve_env_k(const char* kpath, char* const argv[], char* const envp[]);
 
 /* M35 — clone(): create a thread sharing the caller's address space + fds,
  * starting at ring-3 `entry` with `stack`.  Returns the new thread's tid (a

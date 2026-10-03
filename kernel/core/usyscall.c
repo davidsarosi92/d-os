@@ -358,6 +358,11 @@ long sys_write_k(int fd, const void* buf, size_t n) {
     if (o->kind == FD_EVENT) return eventfd_write(o->efd, buf, n, !o->nonblock);   /* §M90 */
     if (o->kind == FD_NETLINK) return nl_send(o->nl, buf, n);                      /* §M90 */
     if (o->kind == FD_FIFO) return fifo_write(o, buf, n, !o->nonblock);            /* §M90 */
+    if (o->kind == FD_SHM && o->shm) {             /* §M90 — a memfd is written like a file */
+        long w = shm_write(o->shm, o->shm_pos, buf, n);
+        if (w > 0) o->shm_pos += (uint64_t)w;
+        return w;
+    }
     return -1;                                 /* shm: not write(2)-able */
 }
 
@@ -445,6 +450,11 @@ long sys_read_k(int fd, void* buf, size_t n) {
     if (o->kind == FD_EVENT) return eventfd_read(o->efd, buf, n, block);   /* §M90 */
     if (o->kind == FD_NETLINK) return nl_recv(o->nl, buf, n, block, 0, 0); /* §M90 */
     if (o->kind == FD_FIFO) return fifo_read(o, buf, n, block);           /* §M90 */
+    if (o->kind == FD_SHM && o->shm) {             /* §M90 — and read like one */
+        size_t r = shm_read(o->shm, o->shm_pos, buf, n);
+        o->shm_pos += r;
+        return (long)r;
+    }
     if (o->kind == FD_TIMER) {
         long r = timerfd_read(o->tfd, buf, n, block);
         /* Reading a timerfd RESETS its expiration count, so it stops being
@@ -583,6 +593,15 @@ int sys_close(int fd) {
 
 long sys_lseek(int fd, long off, int whence) {
     struct ofile* o = fd_lookup(fd);
+    if (o && o->kind == FD_SHM && o->shm) {        /* §M90 — memfd position */
+        uint64_t b = whence == SEEK_SET ? 0 : whence == SEEK_CUR ? o->shm_pos
+                   : whence == SEEK_END ? o->shm->size : (uint64_t)-1;
+        if (b == (uint64_t)-1) return -1;
+        long np = (long)b + off;
+        if (np < 0) return -1;
+        o->shm_pos = (uint64_t)np;
+        return np;
+    }
     if (!o || o->kind != FD_VFS) return -1;
     struct file* f = o->file;
     uint64_t base;
@@ -907,6 +926,10 @@ int sys_fstat_full_k(int fd, struct kstat_full* out) {
         out->mode = KS_IFREG | 0644u; return 0;
     case FD_SOCK: case FD_NETSOCK: out->mode = KS_IFSOCK | 0777u; return 0;
     case FD_CONSOLE:               out->mode = KS_IFCHR | 0620u;  return 0;
+    case FD_SHM:                   /* §M90 — a memfd: a regular file of its size */
+        out->mode = KS_IFREG | 0777u;
+        out->size = o->shm ? o->shm->size : 0;
+        return 0;
     default:                       out->mode = KS_IFREG | 0600u; return 0;   /* shm, timer, epoll */
     }
 }

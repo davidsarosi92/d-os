@@ -539,6 +539,14 @@ struct task {
      * ns_time_children (Linux's time_for_children). */
     struct nsobj* ns[8];
     struct nsobj* ns_time_children;
+    /* §M90 — clone() of the fork shape (proc_clone_fork): the options the
+     * parent is forking with (set around proc_fork, consumed by
+     * proc_fork_apply), the child's exit signal plus one (0 = the default,
+     * SIGCHLD; 1 = none — clone's CSIGNAL 0), and CLONE_CHILD_SETTID's
+     * address, written by the child in its own space before user mode. */
+    const void*   fork_opts;
+    int           exit_sig_plus1;
+    uintptr_t     set_child_tid;
     /* §M90 — close-on-exec bits of the PRIVATE descriptor table (bit i =
      * fds_inline[i]); a shared table keeps its own (struct fdtable).  Read and
      * written only through fd.h's fd_*cloexec* helpers, which pick the right

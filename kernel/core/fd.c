@@ -14,6 +14,7 @@
 #include "flock.h"   /* §M90 — locks die with their description */
 #include "netlink.h" /* §M90 */
 #include "pmm.h"
+#include "pcache.h"   /* §M90 — a memfd that was exec'd */
 #include "kmalloc.h"
 #include "printf.h"
 #include "task.h"
@@ -150,59 +151,181 @@ void ofile_unref(struct ofile* o) {
 
 /* ---- shared memory -------------------------------------------------------- */
 
-struct shm* shm_create(size_t size) {
-    int n = (int)((size + 4095) / 4096);
-    if (n <= 0) n = 1;
-    if (n > SHM_MAX_FRAMES) return NULL;
+static void shm_cache_drop(struct shm* s);
+/* §M90 — make room for `n` frames in the list (it grows by doubling). */
+static int shm_reserve(struct shm* s, int n) {
+    if (n <= s->cap) return 0;
+    if (n > SHM_MAX_FRAMES) return -1;
+    int nc = s->cap ? s->cap : 16;
+    while (nc < n) nc *= 2;
+    if (nc > SHM_MAX_FRAMES) nc = SHM_MAX_FRAMES;
+    uint64_t* nf = (uint64_t*)kcalloc((size_t)nc, sizeof *nf);
+    if (!nf) return -1;
+    for (int i = 0; i < s->nframes; i++) nf[i] = s->frames[i];
+    kfree(s->frames);
+    s->frames = nf;
+    s->cap = nc;
+    return 0;
+}
+/* Hold frames up to page `n` (exclusive), zeroed.  0 or -1 (OOM / limit). */
+static int shm_fill(struct shm* s, int n) {
+    if (n <= s->nframes) return 0;
+    if (shm_reserve(s, n) != 0) return -1;
+    for (int i = s->nframes; i < n; i++) {
+        pmm_phys_t f = pmm_alloc_frame_user_low();   /* §M72 — user memory */
+        if (f == PMM_ALLOC_FAIL) return -1;          /* keep what we already have */
+        uint8_t* p = (uint8_t*)phys_to_virt(f);
+        for (int b = 0; b < 4096; b++) p[b] = 0;
+        s->frames[i] = (uint64_t)f;
+        s->nframes = i + 1;
+    }
+    return 0;
+}
 
+struct shm* shm_create(size_t size) {
+    uint64_t n = (size + 4095) / 4096;
+    if (n == 0) n = 1;
+    if (n > SHM_MAX_FRAMES) return NULL;
     struct shm* s = (struct shm*)kcalloc(1, sizeof *s);
     if (!s) return NULL;
     s->refcount = 1;
-    s->nframes  = n;
-    for (int i = 0; i < n; i++) {
-        pmm_phys_t f = pmm_alloc_frame_user_low();   /* §M72 — user memory */
-        if (f == PMM_ALLOC_FAIL) {              /* OOM or reserve — unwind */
-            for (int j = 0; j < i; j++) pmm_free_frame(s->frames[j]);
-            kfree(s);
-            return NULL;
-        }
-        /* Zero the frame through the identity map (frames are < 1 GiB). */
-        uint8_t* p = (uint8_t*)phys_to_virt(f);
-        for (int b = 0; b < 4096; b++) p[b] = 0;
-        s->frames[i] = f;
+    if (shm_fill(s, (int)n) != 0) {                  /* OOM or reserve — unwind */
+        for (int j = 0; j < s->nframes; j++) pmm_free_frame((pmm_phys_t)s->frames[j]);
+        kfree(s->frames);
+        kfree(s);
+        return NULL;
     }
+    s->size = size;
     return s;
 }
 
 /* Grow a shm object to at least `size` bytes (§M40).  Linux's memfd_create
  * returns a ZERO-length object that the caller then ftruncate()s to the size it
  * wants — which is exactly what a Wayland client does before handing the fd to
- * wl_shm_create_pool.  Shrinking is not supported (nothing needs it, and the
- * frames may already be mapped); an already-large-enough object succeeds. */
+ * wl_shm_create_pool. */
 int shm_grow(struct shm* s, size_t size) {
     if (!s) return -1;
-    int n = (int)((size + 4095) / 4096);
-    if (n <= s->nframes) return 0;
-    if (n > SHM_MAX_FRAMES) return -1;
-    for (int i = s->nframes; i < n; i++) {
-        pmm_phys_t f = pmm_alloc_frame_user_low();   /* §M72 — user memory */
-        if (f == PMM_ALLOC_FAIL) return -1;     /* keep what we already grew to */
-        uint8_t* p = (uint8_t*)phys_to_virt(f);
-        for (int b = 0; b < 4096; b++) p[b] = 0;
-        s->frames[i] = f;
-        s->nframes = i + 1;
+    return shm_truncate(s, size) == 0 || (uint64_t)size <= s->size ? 0 : -1;
+}
+
+int shm_truncate(struct shm* s, uint64_t size) {
+    if (!s) return -22;
+    shm_cache_drop(s);
+    if (size > s->size && (s->seals & SHM_SEAL_GROW))   return -1;   /* EPERM */
+    if (size < s->size && (s->seals & SHM_SEAL_SHRINK)) return -1;
+    uint64_t n = (size + 4095) / 4096;
+    if (n > SHM_MAX_FRAMES) return -27;                              /* EFBIG */
+    if (shm_fill(s, (int)n) != 0) return -12;
+    /* Bytes past a shrink read back as zero after a later grow, as on Linux. */
+    if (size < s->size) {
+        for (uint64_t o = size; o < s->size; ) {
+            uint8_t* p = (uint8_t*)shm_kptr(s, o);
+            uint64_t room = 4096 - (o % 4096);
+            if (room > s->size - o) room = s->size - o;
+            if (p) for (uint64_t b = 0; b < room; b++) p[b] = 0;
+            o += room;
+        }
     }
+    s->size = size;
     return 0;
 }
 
+void* shm_kptr(struct shm* s, uint64_t off) {
+    if (!s) return NULL;
+    uint64_t fi = off / 4096;
+    if (fi >= (uint64_t)s->nframes) return NULL;
+    return (uint8_t*)phys_to_virt((pmm_phys_t)s->frames[fi]) + (off % 4096);
+}
+
+size_t shm_read(struct shm* s, uint64_t off, void* dst, size_t n) {
+    if (!s || off >= s->size) return 0;
+    if (n > s->size - off) n = (size_t)(s->size - off);
+    size_t done = 0;
+    while (done < n) {
+        uint8_t* p = (uint8_t*)shm_kptr(s, off + done);
+        if (!p) break;
+        size_t room = 4096 - (size_t)((off + done) % 4096);
+        if (room > n - done) room = n - done;
+        for (size_t b = 0; b < room; b++) ((uint8_t*)dst)[done + b] = p[b];
+        done += room;
+    }
+    return done;
+}
+
+static void shm_cache_drop(struct shm* s) {
+    if (s && s->ino && s->ino->pc_id) pcache_invalidate(s->ino);
+}
+long shm_write(struct shm* s, uint64_t off, const void* src, size_t n) {
+    if (!s) return -9;
+    shm_cache_drop(s);
+    if (s->seals & SHM_SEAL_WRITE) return -1;                          /* EPERM */
+    uint64_t end = off + n;
+    if (end > s->size) {
+        if (s->seals & SHM_SEAL_GROW) return -1;
+        if ((end + 4095) / 4096 > SHM_MAX_FRAMES) return -27;          /* EFBIG */
+        if (shm_fill(s, (int)((end + 4095) / 4096)) != 0) return -12;
+    }
+    size_t done = 0;
+    while (done < n) {
+        uint8_t* p = (uint8_t*)shm_kptr(s, off + done);
+        if (!p) break;
+        size_t room = 4096 - (size_t)((off + done) % 4096);
+        if (room > n - done) room = n - done;
+        for (size_t b = 0; b < room; b++) p[b] = ((const uint8_t*)src)[done + b];
+        done += room;
+    }
+    if (off + done > s->size) s->size = off + done;
+    return (long)done;
+}
+
+/* §M90 — exec of a memfd.  The ELF loader reads a `struct file` through its
+ * inode's ops; this gives the shm object one, read-only, with no dentry (a
+ * memfd has no name in any directory).  Created once per object, freed with
+ * it.  The page cache may keep copies of its pages under the inode's id; any
+ * change to the bytes drops them (shm_cache_drop), so a later exec of the
+ * same memfd cannot run stale code. */
+static ssize_t shm_file_read(struct file* f, void* buf, size_t n, uint64_t off) {
+    struct shm* s = f && f->inode ? (struct shm*)f->inode->private : NULL;
+    return s ? (ssize_t)shm_read(s, off, buf, n) : -1;
+}
+static const struct file_ops shm_file_ops = { .read = shm_file_read };
+struct file* shm_file(struct shm* s) {
+    if (!s) return NULL;
+    if (!s->ino) {
+        struct inode* in = (struct inode*)kcalloc(1, sizeof *in);
+        if (!in) return NULL;
+        vfs_inode_defaults(in);
+        in->type = INODE_FILE;
+        in->ops = &shm_file_ops;
+        in->private = s;
+        in->mode = 0755;
+        s->ino = in;
+    }
+    s->ino->size = s->size;
+    struct file* f = (struct file*)kcalloc(1, sizeof *f);
+    if (!f) return NULL;
+    f->inode = s->ino;
+    f->flags = VFS_RDONLY;
+    f->magic = VFS_FILE_MAGIC;
+    s->ino->opens++;
+    /* No reference of its own: the loader reads the whole image while the
+     * caller's descriptor still holds the object (execveat(fd) /
+     * /proc/self/fd/N), and copies or caches every page it maps — nothing it
+     * builds points back into this object once the exec is done. */
+    return f;
+}
+
 struct shm* shm_ref(struct shm* s) {
-    if (s) s->refcount++;
+    if (s) __atomic_add_fetch(&s->refcount, 1, __ATOMIC_ACQ_REL);
     return s;
 }
 
 void shm_unref(struct shm* s) {
     if (!s) return;
-    if (--s->refcount > 0) return;
-    for (int i = 0; i < s->nframes; i++) pmm_free_frame(s->frames[i]);
+    if (__atomic_sub_fetch(&s->refcount, 1, __ATOMIC_ACQ_REL) > 0) return;
+    shm_cache_drop(s);
+    for (int i = 0; i < s->nframes; i++) pmm_free_frame((pmm_phys_t)s->frames[i]);
+    kfree(s->frames);
+    kfree(s->ino);
     kfree(s);
 }

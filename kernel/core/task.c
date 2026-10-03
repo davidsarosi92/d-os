@@ -2894,7 +2894,9 @@ void task_exit_code(int code) {
      * shim, every shell) must find the child collectable when the signal
      * lands, or it consumes the signal, finds nothing, and waits forever.
      * Only for a PROCESS (a thread's exit tells its parent nothing). */
-    if (self->linux_abi && task_tgid(self) == self->pid && self->ppid > 0) {
+    /* clone()'s CSIGNAL: exit_sig_plus1 1 = no signal at all; 0 = SIGCHLD. */
+    if (self->linux_abi && task_tgid(self) == self->pid && self->ppid > 0 &&
+        self->exit_sig_plus1 != 1) {
         struct task* par = task_find(self->ppid);
         if (par && par->linux_abi && par->state != TASK_DEAD)
             lnx_sig_child_exit(par, self->pid, code & 0xFF, 0);
@@ -3533,6 +3535,17 @@ int task_mntns_current(void) {
 }
 
 /* §M90 — the caller's process id, for /proc/<pid>/… aliasing in vfs.c. */
+/* §M90 — /proc/self/exe as an openable path (vfs.c's magic links): the
+ * program of the /proc/<pid> target of this lookup, else the caller's. */
+const char* task_proc_exe(void) {
+    struct task* t = task_current();
+    if (!t) return "";
+    if (t->proc_target_pid > 0) {
+        struct task* x = task_find(t->proc_target_pid);
+        if (x) return x->cred.exe;
+    }
+    return t->cred.exe;
+}
 /* §M90 — the /proc/<pid> target of the current lookup (vfs.c, procfs.c). */
 void task_set_proc_target(int pid) {
     struct task* t = task_current();

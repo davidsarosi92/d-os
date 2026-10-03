@@ -62,6 +62,7 @@ static void fork_child_bootstrap(void) {
      * immediately after fork). */
     if (me->has_tls) hal_set_tls_base(me->tls_base);
 
+    proc_fork_child_entry();                /* §M90 — CLONE_CHILD_SETTID, in OUR space */
     enter_user_mode_regs(&regs);            /* → ring 3 at the fork point; no return */
 }
 
@@ -111,6 +112,7 @@ int proc_fork(struct user_regs* parent_regs) {
     /* Claim the reap so init leaves the child as a POSIX zombie for the
      * parent's waitpid() (task_wait). */
     task_set_reap_owned(child, 1);
+    proc_fork_apply(parent, child);     /* §M90 — clone()'s flags (proc.c) */
     task_release(child);                /* §4.96: built completely, now it may run */
     return child->pid;                       /* parent: fork() returns child pid */
 }

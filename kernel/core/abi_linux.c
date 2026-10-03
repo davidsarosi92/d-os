@@ -113,6 +113,7 @@ static const struct abi_nument linux_i386_ents[] = {
     {  94, ABI_FCHMOD },  /* §M90 */
     {  74, ABI_SETHOSTNAME }, { 121, ABI_SETDOMAINNAME },  /* §M90 */
     { 360, ABI_SOCKETPAIR },  /* §M90 */
+    { 358, ABI_EXECVEAT },  /* §M90 */
     /* §M90 — the extended-attribute family: set/lset/fset, get/lget/fget,
      * list/llist/flist, remove/lremove/fremove, consecutive on every guest. */
     { 226, ABI_XATTR_SET },
@@ -243,6 +244,7 @@ static const struct abi_nument linux_amd64_ents[] = {
     {  91, ABI_FCHMOD },  /* §M90 */
     { 170, ABI_SETHOSTNAME }, { 171, ABI_SETDOMAINNAME },  /* §M90 */
     {  53, ABI_SOCKETPAIR },  /* §M90 */
+    { 322, ABI_EXECVEAT },  /* §M90 */
     /* §M90 — the extended-attribute family: set/lset/fset, get/lget/fget,
      * list/llist/flist, remove/lremove/fremove, consecutive on every guest. */
     { 188, ABI_XATTR_SET },
@@ -357,6 +359,7 @@ static const struct abi_nument linux_arm64_ents[] = {
     {  52, ABI_FCHMOD },  /* §M90 */
     { 161, ABI_SETHOSTNAME }, { 162, ABI_SETDOMAINNAME },  /* §M90 */
     { 199, ABI_SOCKETPAIR },  /* §M90 */
+    { 281, ABI_EXECVEAT },  /* §M90 */
     /* §M90 — the extended-attribute family: set/lset/fset, get/lget/fget,
      * list/llist/flist, remove/lremove/fremove, consecutive on every guest. */
     { 5, ABI_XATTR_SET },

@@ -702,6 +702,11 @@ static void gen_oomadj(struct procfs_writer* w) {
 }
 static long write_oomadj(struct task* t, const char* buf, size_t n) {
     long v = 0; int neg = 0; size_t i = 0, d = 0;
+    size_t full = n;
+    /* Linux parses the write as a C STRING (kstrtoint of the stripped
+     * buffer): a NUL ends it.  runc's nsexec writes the value with its
+     * terminating NUL included, and was refused EINVAL. */
+    for (size_t q = 0; q < n; q++) if (buf[q] == 0) { n = q; break; }
     while (i < n && (buf[i] == ' ' || buf[i] == '\t')) i++;
     if (i < n && (buf[i] == '-' || buf[i] == '+')) { neg = buf[i] == '-'; i++; }
     while (i < n && buf[i] >= '0' && buf[i] <= '9' && d < 6) { v = v * 10 + (buf[i] - '0'); i++; d++; }
@@ -710,7 +715,7 @@ static long write_oomadj(struct task* t, const char* buf, size_t n) {
     if (neg) v = -v;
     if (v < -1000 || v > 1000) return -22;
     t->oom_score_adj = (int)v;
-    return (long)n;
+    return (long)full;                                  /* the whole write was consumed */
 }
 static void gen_oomscore(struct procfs_writer* w) { pw_puts(w, "0\n"); }
 static struct procfs_node nd_oomadj   = { .name = "self/oom_score_adj", .gen = gen_oomadj,

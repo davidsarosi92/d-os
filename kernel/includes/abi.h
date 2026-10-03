@@ -192,6 +192,7 @@ enum abi_op {
     ABI_FCHMOD,                                        /* §M90 */
     ABI_SETHOSTNAME, ABI_SETDOMAINNAME,                /* §M90 — UTS namespaces */
     ABI_SOCKETPAIR,                                    /* §M90 */
+    ABI_EXECVEAT,                                      /* §M90 */
     ABI_RMDIR,              /* §M90 */  /* §M90 — lchown maps to ABI_CHOWN: no per-call
                                * link handling, see h_fchownat */
     /* §M73 — identity.  The answer is the task's §M32 credential: a container

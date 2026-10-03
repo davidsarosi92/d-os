@@ -67,6 +67,9 @@ struct ofile {
     struct fifo*   fifo;
     unsigned       fifo_role;
     uint32_t       fifo_wseen;
+    /* §M90 — APPENDED.  FD_SHM: the file position for read/write/lseek (a
+     * memfd is read and written like a file — runc copies its binary into one). */
+    uint64_t       shm_pos;
 };
 
 /* Wrap a resource in a fresh ofile (refcount 1), or NULL on OOM. */
@@ -112,23 +115,54 @@ void          ofile_unref(struct ofile* o);
 
 /* ---- shared-memory object (stage 4) --------------------------------------- */
 
-#define SHM_MAX_FRAMES 64       /* 64 × 4 KiB = 256 KiB max per object (plenty) */
+/* §M90 — no longer 64 frames: a memfd is a FILE as far as its users go (runc
+ * copies its whole multi-megabyte binary into one and executes it), so the
+ * frame list grows on demand up to this many pages (256 MiB). */
+#define SHM_MAX_FRAMES 65536
 
+/* memfd seals (F_ADD_SEALS / F_GET_SEALS), Linux's values. */
+#define SHM_SEAL_SEAL   0x1u
+#define SHM_SEAL_SHRINK 0x2u
+#define SHM_SEAL_GROW   0x4u
+#define SHM_SEAL_WRITE  0x8u
+
+struct inode;
 struct shm {
-    int      refcount;          /* independent of the ofile refcount: a frame
+    int       refcount;         /* independent of the ofile refcount: a frame
                                  * set can outlive an fd once mmap'd */
-    int      nframes;
-    uint32_t frames[SHM_MAX_FRAMES];   /* physical frame addresses */
+    int       nframes;          /* frames held (whole pages)                 */
+    int       cap;              /* entries in `frames`                       */
+    uint64_t* frames;           /* PHYSICAL frame addresses — reach the bytes
+                                 * through shm_kptr/shm_read/shm_write, never by
+                                 * casting one (RAM is only reachable through
+                                 * phys_to_virt, and frames are not contiguous) */
+    uint64_t  size;             /* §M90 — bytes, as fstat/read/write see them */
+    uint32_t  seals;            /* §M90 — SHM_SEAL_*                          */
+    struct inode* ino;          /* §M90 — anonymous inode for exec (shm_file) */
 };
 
-/* Create a shared-memory object of `size` bytes (rounded up to pages), frames
- * zeroed.  Returns NULL on OOM / too large. */
+/* Create a shared-memory object of `size` bytes (rounded up to pages, at least
+ * one), frames zeroed.  Returns NULL on OOM / too large. */
 struct shm* shm_create(size_t size);
 struct shm* shm_ref   (struct shm* s);
 /* Grow to at least `size` bytes (Linux memfd_create + ftruncate shape).  0 on
  * success; shrinking is not supported. */
 int         shm_grow  (struct shm* s, size_t size);
 void        shm_unref (struct shm* s);   /* frees frames at refcount 0 */
+/* §M90 — the bytes, as a file.  A kernel pointer to byte `off` (valid to the
+ * end of ITS page only), or NULL past the frames. */
+void*       shm_kptr  (struct shm* s, uint64_t off);
+/* Copy out up to `n` bytes at `off` (bounded by `size`); bytes copied. */
+size_t      shm_read  (struct shm* s, uint64_t off, void* dst, size_t n);
+/* Copy in at `off`, growing frames and `size` as needed; bytes written or a
+ * NEGATIVE errno (-1 EPERM: sealed, -27 EFBIG, -12 ENOMEM). */
+long        shm_write (struct shm* s, uint64_t off, const void* src, size_t n);
+/* ftruncate: new size (grow or shrink; shrink keeps the frames — they may be
+ * mapped — and only moves the end).  0 or a negative errno (seals). */
+int         shm_truncate(struct shm* s, uint64_t size);
+/* A read-only VFS file over the object (an anonymous inode), for the ELF
+ * loader: exec of a memfd.  Close with vfs_close.  NULL on OOM. */
+struct file* shm_file (struct shm* s);
 
 /* ---- unix socket pair + fd passing (stage 5) ------------------------------ */
 

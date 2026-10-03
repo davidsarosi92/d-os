@@ -78,6 +78,7 @@ static void fork_child_bootstrap(void) {
         g_entry_gs = 0x23;
     }
 
+    proc_fork_child_entry();                /* §M90 — CLONE_CHILD_SETTID, in OUR space */
     enter_user_mode_regs(&regs);            /* → ring 3 at the fork point; no return */
 }
 
@@ -135,6 +136,7 @@ int proc_fork(struct user_regs* parent_regs) {
      * (Caveat: a child never waited-for now leaks as a zombie — the POSIX
      * semantics; reaping orphaned zombies on parent exit is a follow-up.) */
     task_set_reap_owned(child, 1);
+    proc_fork_apply(parent, child);     /* §M90 — clone()'s flags (proc.c) */
     task_release(child);                /* §4.96: built completely, now it may run */
     return child->pid;                       /* parent: fork() returns child pid */
 }

@@ -1115,7 +1115,7 @@ static void sy_oomtest(const char* args) {
     long w1 = ot_write("/proc/self/oom_score_adj", "-250\n");
     long a = ot_read("/proc/self/oom_score_adj"), b = ot_read(p);
     struct task* c = task_spawn("oomtest-child", ot_child);
-    long cv = -1, bad = 0, foreign_mi = 0;
+    long cv = -1, bad = 0, foreign_mi = 0, nul = 0;
     if (c) {
         bt_path(q, "/proc/", c->pid, "/oom_score_adj", -1, "");
         bt_path(r, "/proc/", c->pid, "/mountinfo", -1, "");
@@ -1124,14 +1124,18 @@ static void sy_oomtest(const char* args) {
         foreign_mi = f ? 1 : 0;
         if (f) vfs_close(f);
     }
+    /* written as runc's nsexec does: with the string's terminating NUL */
+    struct file* nf = vfs_open("/proc/self/oom_score_adj", VFS_WRONLY);
+    nul = nf ? vfs_write(nf, "-250\0", 5) : -1;
+    if (nf) vfs_close(nf);
     bad = ot_write("/proc/self/oom_score_adj", "5000");
     long after = ot_read("/proc/self/oom_score_adj");
     me->oom_score_adj = saved;
-    kprintf("oomtest: write=%d self=%d own-pid=%d child(foreign pid)=%d out-of-range=%d "
+    kprintf("oomtest: write=%d self=%d own-pid=%d child(foreign pid)=%d with-NUL=%d out-of-range=%d "
             "still=%d foreign-mountinfo-opened=%d\n",
-            (int)w1, (int)a, (int)b, (int)cv, (int)bad, (int)after, (int)foreign_mi);
-    int ok = w1 == 5 && a == -250 && b == -250 && cv == -250 && bad < 0 && after == -250 &&
-             !foreign_mi;
+            (int)w1, (int)a, (int)b, (int)cv, (int)nul, (int)bad, (int)after, (int)foreign_mi);
+    int ok = w1 == 5 && a == -250 && b == -250 && cv == -250 && nul == 5 && bad < 0 &&
+             after == -250 && !foreign_mi;
     console_write(ok ? "oomtest: ok\n" : "oomtest: FAIL\n");
 }
 /* §M90 — `peercredtest`: SO_PEERCRED as containerd's ttrpc reads it.  Both
@@ -1255,6 +1259,42 @@ static void sy_seqpackettest(const char* args) {
     int ok = s1 == 2 && s2 == 3 && m1 && m2 && s3 == 5 && m3 && r4 == 0;
     console_write(ok ? "seqpacket: ok\n" : "seqpacket: FAIL\n");
 }
+/* §M90 — `memfdtest`: a memfd behaves as a FILE.  Write 10 000 bytes (three
+ * pages, so a frame boundary is crossed twice), seek back and read them
+ * whole, fstat reports the size, a shrink moves the end and zeroes what it
+ * cut off, and the seals are ENFORCED: after GROW|SHRINK|WRITE a write and a
+ * truncate are refused, and after SEAL no further seal is accepted.  The
+ * whole runc chain depends on this: it copies itself into one and runs it. */
+static void sy_memfdtest(const char* args) {
+    (void)args;
+    int fd = sys_memfd(0);
+    struct ofile* o = fd >= 0 ? fd_lookup(fd) : NULL;
+    if (!o || !o->shm) { console_write("memfd: FAIL (create)\n"); return; }
+    static uint8_t buf[10000], back[10000];
+    for (int i = 0; i < 10000; i++) buf[i] = (uint8_t)(i * 7 + 3);
+    long w = sys_write_k(fd, buf, sizeof buf);
+    long sk = sys_lseek(fd, 0, SEEK_SET);
+    long r = sys_read_k(fd, back, sizeof back);
+    int same = r == 10000;
+    for (int i = 0; same && i < 10000; i++) if (back[i] != buf[i]) same = 0;
+    struct kstat_full k;
+    int st = sys_fstat_full_k(fd, &k) == 0 && k.size == 10000 && (k.mode & KS_IFMT) == KS_IFREG;
+    int sh = shm_truncate(o->shm, 5000);
+    uint8_t z = 0xFF;
+    int t2 = shm_truncate(o->shm, 6000);
+    shm_read(o->shm, 5500, &z, 1);                      /* past the old cut: zero */
+    o->shm->seals |= SHM_SEAL_GROW | SHM_SEAL_SHRINK | SHM_SEAL_WRITE;
+    long wsealed = shm_write(o->shm, 0, "x", 1);
+    int tsealed = shm_truncate(o->shm, 100);
+    o->shm->seals |= SHM_SEAL_SEAL;
+    sys_close(fd);
+    kprintf("memfd: write=%d seek=%d read=%d same=%d fstat=%d shrink=%d regrow=%d zero=%d "
+            "sealed-write=%d sealed-truncate=%d\n", (int)w, (int)sk, (int)r, same, st, sh, t2,
+            z == 0, (int)wsealed, tsealed);
+    int ok = w == 10000 && sk == 0 && same && st && sh == 0 && t2 == 0 && z == 0 &&
+             wsealed == -1 && tsealed == -1;
+    console_write(ok ? "memfd: ok\n" : "memfd: FAIL\n");
+}
 /* §M90 — `renametest`: rename across directories (docker writes a layer's
  * metadata in tmp/ and renames it into the store), a directory over an EMPTY
  * directory, and the two refusals that keep the tree a tree: a directory into
@@ -1362,6 +1402,8 @@ SHELL_CMD(nstest) = { "nstest", "", "UTS/IPC/cgroup/time namespaces, handles, se
                        SHELL_G_TEST, sy_nstest, SHELL_P_ANY };
 SHELL_CMD(seqpackettest) = { "seqpackettest", "", "SOCK_SEQPACKET keeps message boundaries",
                               SHELL_G_TEST, sy_seqpackettest, SHELL_P_ANY };
+SHELL_CMD(memfdtest) = { "memfdtest", "", "a memfd as a file: read/write/seek/truncate/seals",
+                          SHELL_G_TEST, sy_memfdtest, SHELL_P_ANY };
 SHELL_CMD(fifotest) = { "fifotest", "", "named pipes: open rules, EOF/HUP, a blocking reader",
                          SHELL_G_TEST, sy_fifotest, SHELL_P_ANY };
 SHELL_CMD(unlinkopentest) = { "unlinkopentest", "", "an unlinked file stays readable while open",

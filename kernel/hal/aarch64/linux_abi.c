@@ -97,7 +97,10 @@ void linux_syscall_dispatch(struct trapframe* tf) {
             __asm__ volatile ("mrs %0, sp_el0" : "=r"(r.user_sp));
             r.pc     = tf->elr;
             r.pstate = tf->spsr;
-            tf->x[0] = (uint64_t)proc_fork(&r);
+            /* §M90 — every flag honoured or refused (proc_clone_fork);
+             * arm64: (flags, stack, ptid, tls, ctid). */
+            tf->x[0] = (uint64_t)proc_clone_fork(&r, flags, (uintptr_t)tf->x[1],
+                                                 (uintptr_t)tf->x[2], (uintptr_t)tf->x[4]);
         } else {
             /* §M89 rung 3 — a THREAD: (flags, stack, ptid, tls, ctid). */
             if (!tf->x[1]) { tf->x[0] = (uint64_t)-22; if (me) me->in_user_syscall = prev; return; }

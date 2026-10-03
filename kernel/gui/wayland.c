@@ -472,9 +472,11 @@ static void wl_surface_commit(struct wl_conn* c) {
     for (uint32_t y = 0; y < c->buf_h; y++) {
         for (uint32_t x = 0; x < c->buf_w; x++) {
             uint32_t bo = c->buf_off + y * c->buf_stride + x * 4;
-            uint32_t fi = bo / 4096, fo = bo % 4096;
-            if ((int)fi >= s->nframes) continue;
-            uint32_t px = *(volatile uint32_t*)(uintptr_t)(s->frames[fi] + fo);
+            /* §M90 — through shm_kptr: frames are PHYSICAL addresses, reachable
+             * only through the direct map (aarch64 has no RAM identity map). */
+            volatile uint32_t* pp = (volatile uint32_t*)shm_kptr(s, bo);
+            if (!pp) continue;
+            uint32_t px = *pp;
             if (x == 0 && y == 0) topleft = px;
             sum += px;
             /* Bridge: paint the client's pixel onto the target (framebuffer /
@@ -504,11 +506,21 @@ static void wl_surface_commit(struct wl_conn* c) {
     }
 
     /* WM-managed window target: the buffer becomes the window's contents.
-     * (Single-frame buffers: the pixels are contiguous in frames[0].) */
+     * §M90 — gathered into one contiguous copy first: the pool's frames are
+     * NOT contiguous, and blitting from frames[0] as if they were read the
+     * neighbouring physical memory for every buffer larger than a page (it
+     * looked right only while the allocator happened to hand out consecutive
+     * frames). */
     if (c->window && s->nframes >= 1) {
-        gui_window_blit(c->window, 0, 0,
-                        (const uint32_t*)(uintptr_t)s->frames[0] + c->buf_off / 4,
-                        (int)c->buf_w, (int)c->buf_h, (int)(c->buf_stride / 4));
+        size_t row = (size_t)c->buf_w * 4, total = row * c->buf_h;
+        uint32_t* tmp = (uint32_t*)kmalloc(total);
+        if (tmp) {
+            for (uint32_t y = 0; y < c->buf_h; y++)
+                shm_read(s, (uint64_t)c->buf_off + (uint64_t)y * c->buf_stride,
+                         (uint8_t*)tmp + y * row, row);
+            gui_window_blit(c->window, 0, 0, tmp, (int)c->buf_w, (int)c->buf_h, (int)c->buf_w);
+            kfree(tmp);
+        }
     }
 
     kprintf("wayland: COMMIT surface %u: %ux%u buffer, top-left=%x checksum=%x%s\n",
@@ -1159,9 +1171,8 @@ void wl_selftest(void) {
      * create_buffer → attach → commit; the server reads the pixels back. */
     const uint32_t W = 4, H = 4, STRIDE = W * 4, COLOR = 0x3366CCFFu;
     struct shm* buf = shm_create((size_t)STRIDE * H);
-    if (buf) {
-        volatile uint32_t* px = (volatile uint32_t*)(uintptr_t)buf->frames[0];
-        for (uint32_t i = 0; i < W * H; i++) px[i] = COLOR;
+    if (buf) {                                   /* §M90 — through shm_write */
+        for (uint32_t i = 0; i < W * H; i++) shm_write(buf, (uint64_t)i * 4, &COLOR, 4);
     }
     struct ofile* buf_of = buf ? ofile_from_shm(buf) : NULL;
 
@@ -1229,11 +1240,14 @@ void wl_visible_demo(void) {
 
     struct shm* buf = shm_create((size_t)STRIDE * H);
     if (!buf) { kprintf("waydemo: shm alloc failed\n"); return; }
-    volatile uint32_t* px = (volatile uint32_t*)(uintptr_t)buf->frames[0];
+    /* §M90 — written through shm_write (frames are physical, not contiguous) */
+    uint32_t topleft = 0;
     for (uint32_t y = 0; y < H; y++)             /* a little gradient */
-        for (uint32_t x = 0; x < W; x++)
-            px[y * W + x] = 0xFF000000u | ((x * 8u) << 16) | ((y * 8u) << 8) | 0x40u;
-    uint32_t topleft = px[0];
+        for (uint32_t x = 0; x < W; x++) {
+            uint32_t v = 0xFF000000u | ((x * 8u) << 16) | ((y * 8u) << 8) | 0x40u;
+            shm_write(buf, ((uint64_t)y * W + x) * 4, &v, 4);
+            if (!x && !y) topleft = v;
+        }
     struct ofile* buf_of = ofile_from_shm(buf);
 
     struct usock *cli, *srv;
@@ -1289,11 +1303,14 @@ void wl_window_demo(void) {
     const uint32_t W = 32, H = 32, STRIDE = W * 4;
     struct shm* buf = shm_create((size_t)STRIDE * H);
     if (!buf) { kprintf("waywin: shm alloc failed\n"); return; }
-    volatile uint32_t* px = (volatile uint32_t*)(uintptr_t)buf->frames[0];
+    /* §M90 — written through shm_write (frames are physical, not contiguous) */
+    uint32_t topleft = 0;
     for (uint32_t y = 0; y < H; y++)
-        for (uint32_t x = 0; x < W; x++)
-            px[y * W + x] = 0xFF000000u | ((x * 8u) << 16) | ((y * 8u) << 8) | 0x40u;
-    uint32_t topleft = px[0];
+        for (uint32_t x = 0; x < W; x++) {
+            uint32_t v = 0xFF000000u | ((x * 8u) << 16) | ((y * 8u) << 8) | 0x40u;
+            shm_write(buf, ((uint64_t)y * W + x) * 4, &v, 4);
+            if (!x && !y) topleft = v;
+        }
     struct ofile* buf_of = ofile_from_shm(buf);
 
     struct usock *cli, *srv;
@@ -1378,11 +1395,14 @@ void wl_compositor_demo(void) {
     const uint32_t W = 32, H = 32, STRIDE = W * 4;
     struct shm* buf = shm_create((size_t)STRIDE * H);
     if (!buf) { kprintf("waycomp: shm failed\n"); return; }
-    volatile uint32_t* px = (volatile uint32_t*)(uintptr_t)buf->frames[0];
+    /* §M90 — written through shm_write (frames are physical, not contiguous) */
+    uint32_t topleft = 0;
     for (uint32_t y = 0; y < H; y++)
-        for (uint32_t x = 0; x < W; x++)
-            px[y * W + x] = 0xFF000000u | ((x * 8u) << 16) | ((y * 8u) << 8) | 0x40u;
-    uint32_t topleft = px[0];
+        for (uint32_t x = 0; x < W; x++) {
+            uint32_t v = 0xFF000000u | ((x * 8u) << 16) | ((y * 8u) << 8) | 0x40u;
+            shm_write(buf, ((uint64_t)y * W + x) * 4, &v, 4);
+            if (!x && !y) topleft = v;
+        }
     struct ofile* buf_of = ofile_from_shm(buf);
 
     kprintf("waycomp: a Wayland client's surface becomes a desktop window\n");
