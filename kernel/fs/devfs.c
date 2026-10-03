@@ -126,6 +126,38 @@ static struct devfs_node node_zero = {
     ._next = NULL,
 };
 
+/* §M90 — /dev/full: reads zeros, every write fails ENOSPC ("the device is
+ * full") — what a program tests its out-of-space handling against.  runc puts
+ * it, with null/zero/random/urandom/tty, into every container's /dev. */
+static ssize_t full_write(void* ctx, const void* buf, size_t n, uint64_t off) {
+    (void)ctx; (void)buf; (void)n; (void)off;
+    return -28;                                  /* ENOSPC */
+}
+static struct devfs_node node_full = {
+    .name = "full", .kind = DEVFS_CHAR,
+    .read = zero_read, .write = full_write, .ioctl = NULL, .ctx = NULL,
+    ._next = NULL,
+};
+
+/* §M90 — /dev/tty: the CONTROLLING terminal of the caller.  There is no
+ * controlling-terminal concept here yet (no ptys, no sessions bound to a
+ * terminal), so reading or writing it answers ENXIO — what Linux answers a
+ * process that has none.  The node exists because a container's /dev is
+ * expected to carry it. */
+static ssize_t tty_read(void* ctx, void* buf, size_t n, uint64_t off) {
+    (void)ctx; (void)buf; (void)n; (void)off;
+    return -6;                                   /* ENXIO */
+}
+static ssize_t tty_write(void* ctx, const void* buf, size_t n, uint64_t off) {
+    (void)ctx; (void)buf; (void)n; (void)off;
+    return -6;
+}
+static struct devfs_node node_tty = {
+    .name = "tty", .kind = DEVFS_CHAR,
+    .read = tty_read, .write = tty_write, .ioctl = NULL, .ctx = NULL,
+    ._next = NULL,
+};
+
 /* ---------------------------------------------------------------------- */
 /* Public API.                                                            */
 /* ---------------------------------------------------------------------- */
@@ -181,6 +213,8 @@ void devfs_init(void) {
     /* Built-ins first so their registration order is deterministic. */
     attach_node(&node_null);
     attach_node(&node_zero);
+    attach_node(&node_full);                     /* §M90 */
+    attach_node(&node_tty);                      /* §M90 */
 
     /* Flush any driver registrations queued before init. */
     int flushed = 0;

@@ -641,6 +641,22 @@ int proc_execve_env_k(const char* kpath, char* const uargv[], char* const uenvp[
     for (int i = 0; i < NSIG; i++) me->sig_handler[i] = SIG_DFL;
     me->sig_pending = 0;
     for (unsigned i = 0; i < sizeof me->cred.exe; i++) me->cred.exe[i] = new_exe[i];
+    /* §M90 — the task's NAME is the program's file name after an exec (Linux's
+     * comm): it stayed "forked" for every forked and re-executed program, so
+     * `ps` could not tell dockerd's shim from runc and `strace name` matched
+     * nothing.  A memfd has no path; it keeps its name (runc renames its init). */
+    {
+        const char* src = new_exe[0] ? new_exe : kpath;
+        const char* b = src;
+        for (const char* q = src; *q; q++) if (*q == '/') b = q + 1;
+        int digits = 1;
+        for (const char* q = b; *q; q++) if (*q < '0' || *q > '9') { digits = 0; break; }
+        if (*b && !(digits && !new_exe[0])) {        /* not "/proc/self/fd/N" */
+            int i = 0;
+            for (; b[i] && i < TASK_NAME_MAX; i++) me->name[i] = b[i];
+            me->name[i] = 0;
+        }
+    }
     lnx_sig_exec(me);                         /* §M89 — handlers pointed into the old image */
     struct vmm_space* old = task_swap_mm(me, ns);   /* under the walkers' lock */
     vmm_space_switch(ns);

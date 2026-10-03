@@ -512,9 +512,54 @@ int sys_open_k(const char* kpath, int flags) {
  * becomes an FD_FIFO end (fifo.c) and may block until its other end opens.
  * The fd, or a NEGATIVE Linux errno (-2 when the VFS refused: not found / not
  * permitted, as before; -6/-4/-12 from the FIFO). */
+const char* task_proc_exe(void);
+struct task* procfs_target(void);
 long sys_open_ex_k(const char* kpath, int flags, int nonblock, int opath) {
-    struct file* f = vfs_open(kpath, flags ? flags : VFS_RDONLY);
-    if (!f) return -2;
+    /* §M90 — O_PATH|O_NOFOLLOW (VFS_NOFOLLOW) on a /proc MAGIC link opens the
+     * link itself: a handle on procfs whose readlink names the target —
+     * filepath-securejoin (runc) verifies a container's paths this way. */
+    if (opath && (flags & VFS_NOFOLLOW)) {
+        char m[256];
+        if (vfs_canonical_link(kpath, m, sizeof m) == 0) {
+            static const char* const fdp = "/proc/self/fd/";
+            int i = 0;
+            while (fdp[i] && m[i] == fdp[i]) i++;
+            struct file* lh = NULL;
+            if (!fdp[i] && m[i] >= '0' && m[i] <= '9') {
+                int fd = 0, j = i;
+                while (m[j] >= '0' && m[j] <= '9') fd = fd * 10 + (m[j++] - '0');
+                char tgt[256];
+                struct task* tg = procfs_target();
+                if (!m[j] && sys_fd_link_of(tg ? tg : task_current(), fd, tgt, sizeof tgt) == 0)
+                    lh = vfs_open_linkhandle("/proc/self/fd", tgt);
+                else if (!m[j]) return -2;
+            } else {
+                const char* ex = "/proc/self/exe";
+                int k = 0;
+                while (ex[k] && m[k] == ex[k]) k++;
+                if (!ex[k] && !m[k]) {
+                    const char* x = task_proc_exe();
+                    if (!x || !x[0]) return -2;
+                    lh = vfs_open_linkhandle("/proc/self", x);
+                }
+            }
+            if (lh) {
+                struct ofile* o = ofile_from_file(lh);
+                if (!o) { vfs_close(lh); return -12; }
+                int fd = fd_install(o);
+                if (fd < 0) { ofile_unref(o); return -24; }
+                return fd;
+            }
+        }
+    }
+    int oerr = -2;
+    struct file* f = vfs_open_ex(kpath, (flags ? flags : VFS_RDONLY) & (opath ? ~0 : ~VFS_NOFOLLOW), &oerr);
+    if (!f) return oerr;                                  /* -2, or -30 EROFS */
+    /* O_NOFOLLOW without O_PATH on a symbolic link: ELOOP, as on Linux. */
+    if ((flags & VFS_NOFOLLOW) && !opath) {
+        struct dentry* ld = vfs_resolve_nofollow(kpath);
+        if (ld && ld->inode && ld->inode->type == INODE_SYMLINK) { vfs_close(f); return -40; }
+    }
     struct ofile* o = ofile_from_file(f);
     if (!o) { vfs_close(f); return -12; }
     o->nonblock = nonblock ? 1 : 0;
@@ -2514,7 +2559,10 @@ int sys_fd_dirpath(int fd, char* out, size_t cap) {
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind != FD_VFS || !o->file || !o->file->dentry) return -9;
     if (!o->file->inode || o->file->inode->type != INODE_DIR) return -20;
-    return vfs_dentry_path(o->file->dentry, out, cap) == 0 ? 0 : -2;
+    /* §M90 — the path the directory was OPENED by (through a bind it is the
+     * mount's, not the source's): a name relative to it then resolves through
+     * the same bind, and stays inside a container's root. */
+    return vfs_file_path(o->file, out, cap) == 0 ? 0 : -2;
 }
 
 /* §M90 — fsync / fdatasync / syncfs on a descriptor (see vfs_fsync_file).
@@ -2605,7 +2653,7 @@ int sys_fd_path(int fd, char* out, size_t cap) {
     struct ofile* o = fd_lookup(fd);
     if (!o || (o->kind != FD_VFS && o->kind != FD_FIFO) || !o->file || !o->file->dentry) return -1;
     if (o->file->inode && o->file->inode->unlink_dir) return -1;   /* deleted */
-    return vfs_dentry_path(o->file->dentry, out, cap) == 0 ? 0 : -1;
+    return vfs_file_path(o->file, out, cap) == 0 ? 0 : -1;
 }
 
 /* §M90 — slot `fd` of ANOTHER task's table (or the caller's), with a
@@ -2644,7 +2692,7 @@ int sys_fd_link_of(struct task* t, int fd, char* out, size_t cap) {
     switch (f->kind) {
     case FD_VFS: case FD_FIFO:
         if (f->file && f->file->dentry && !(f->file->inode && f->file->inode->unlink_dir) &&
-            vfs_dentry_path(f->file->dentry, out, cap) == 0) { ofile_unref(f); return 0; }
+            vfs_file_path(f->file, out, cap) == 0) { ofile_unref(f); return 0; }
         tag = "anon_inode:[file]"; break;
     case FD_SOCK:
         /* a pipe is ONE object to Linux (both ends name it); each end of a
@@ -2677,6 +2725,20 @@ struct file* sys_fd_vfs_file(int fd) {
 
 /* §M90 — see vfs.c (fd_vfs_dentry): the dentry of the caller's descriptor. */
 struct task* procfs_target(void);
+/* §M90 — the path descriptor `fd` was opened by through a bind (vfs.c). */
+const char* fd_vfs_vpath(int fd) {
+    struct task* tg = procfs_target();
+    struct task* me = task_current();
+    struct ofile* o;
+    if (tg && me && tg != me && task_tgid(tg) != task_tgid(me)) {
+        o = fd_ref_in(tg, fd);
+        const char* v = (o && o->file) ? o->file->vpath : NULL;
+        if (o) ofile_unref(o);                /* the table still holds it */
+        return v;
+    }
+    o = fd_lookup(fd);
+    return (o && (o->kind == FD_VFS || o->kind == FD_FIFO) && o->file) ? o->file->vpath : NULL;
+}
 struct dentry* fd_vfs_dentry(int fd) {
     /* §M90 — /proc/<another pid>/fd/N names THAT process's descriptor (the
      * path lookup recorded it as the /proc target), never the caller's. */

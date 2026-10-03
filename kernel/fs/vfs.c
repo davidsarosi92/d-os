@@ -235,8 +235,26 @@ static int bind_visible(const struct dentry* d) {
 /* Where a walk arriving at `d` really continues.  Bounded: a bind of a bind
  * of a bind is followed, a cycle is not (and cannot be built — vfs_bind
  * resolves its source through the binds first). */
+/* §M90 — set (under ns_lock) whenever a walk is redirected by a bind, so an
+ * open knows it reached its file through one (and must remember the path it
+ * was opened by: vfs_file_path). */
+static int g_bind_crossed;
+/* §M90 — set (under ns_lock) whenever a walk passes a read-only mount. */
+static int g_walk_ro;
+static int ro_visible(const struct dentry* d) {
+    if (!d || !d->ro) return 0;
+    int me = task_mntns_current();
+    if (d->ro_ns == me) return 1;
+    for (int n = me; n > 0 && n < g_ns_n; n = g_ns[n].parent)
+        if (g_ns[n].parent == d->ro_ns) return d->ro_seq < g_ns[n].born;
+    return 0;
+}
 static struct dentry* follow_bind(struct dentry* d) {
-    for (int i = 0; d && d->bound && i < 8 && bind_visible(d); i++) d = d->bound;
+    if (ro_visible(d)) g_walk_ro = 1;
+    for (int i = 0; d && d->bound && i < 8 && bind_visible(d); i++) {
+        d = d->bound; g_bind_crossed = 1;
+        if (ro_visible(d)) g_walk_ro = 1;
+    }
     return d;
 }
 
@@ -308,6 +326,10 @@ static const char* vfs_canon_plain(const char* path, char* buf, size_t cap) {
  * path; "" when unknown.  task.c; weak so a build without tasks links. */
 const char* task_proc_exe(void) __attribute__((weak));
 const char* task_proc_exe(void) { return ""; }
+/* §M90 — the vpath of descriptor `fd` (of the /proc target process), or NULL
+ * (usyscall.c; weak so a build without descriptors links). */
+const char* fd_vfs_vpath(int fd) __attribute__((weak));
+const char* fd_vfs_vpath(int fd) { (void)fd; return NULL; }
 static int vfs_fd_magic(const char* path, char* out, size_t cap) {
     /* §M90 — /proc/self/exe OPENS the running program, as on Linux (readlink
      * of it was answered since §M89, opening it was ENOENT).  runc re-executes
@@ -336,7 +358,14 @@ static int vfs_fd_magic(const char* path, char* out, size_t cap) {
         struct dentry* d = fd_vfs_dentry(fd);
         if (!d) return 0;
         char m[256];
-        if (vfs_dentry_path_unlocked(d, m, sizeof m) != 0) return 0;
+        /* §M90 — the path the file was OPENED by, when that was through a
+         * bind (fd_vfs_vpath); else its dentry's. */
+        const char* vp = fd_vfs_vpath(fd);
+        if (vp) {
+            size_t q = 0;
+            for (; vp[q] && q + 1 < sizeof m; q++) m[q] = vp[q];
+            m[q] = 0;
+        } else if (vfs_dentry_path_unlocked(d, m, sizeof m) != 0) return 0;
         size_t o = 0;
         for (; m[o] && o + 1 < cap; o++) out[o] = m[o];
         if (o == 0 && o + 1 < cap) out[o++] = '/';
@@ -531,7 +560,7 @@ static int link_target(struct dentry* d, char* out, size_t cap) {
     if (!d || !d->inode || d->inode->type != INODE_SYMLINK || !d->inode->ops ||
         !d->inode->ops->read || cap < 2)
         return -1;
-    struct file tmp = { d->inode, d, 0, 0, 0, 0 };   /* never closed: no magic */
+    struct file tmp = { d->inode, d, 0, 0, 0, 0, NULL };   /* never closed: no magic */
     ssize_t n = d->inode->ops->read(&tmp, out, cap - 1, 0);
     if (n <= 0) return -1;
     out[n] = 0;
@@ -846,10 +875,20 @@ int vfs_mount(const char* fs_name, const char* path, const char* dev_name) {
 /* Open / read / write / close / readdir / mkdir / create.              */
 /* ------------------------------------------------------------------- */
 
+static int vfs_realpath_unlocked(const char* path, char* out, size_t cap);
+static int ro_path(const char* path);
+static int g_open_err;                        /* §M90 — why vfs_open_unlocked said NULL */
 static struct file* vfs_open_unlocked(const char* path, int flags) {
     struct dentry*  parent;
     const char*     last;
-    struct dentry*  d = resolve_path(path, &parent, &last);
+    g_open_err = -2;
+    if ((flags & (VFS_WRONLY | VFS_CREATE | VFS_TRUNC)) && ro_path(path)) {
+        g_open_err = -30;                         /* EROFS: below a read-only mount */
+        return NULL;
+    }
+    g_bind_crossed = 0;
+    struct dentry*  d = resolve_path_ex(path, &parent, &last, !(flags & VFS_NOFOLLOW));
+    int crossed = g_bind_crossed;
 
     if (!d) {
         if ((flags & VFS_CREATE) == 0) return NULL;
@@ -908,9 +947,40 @@ static struct file* vfs_open_unlocked(const char* path, int flags) {
     f->flags  = flags;
     f->pos    = 0;
     f->magic  = VFS_FILE_MAGIC;
+    /* §M90 — reached through a bind: remember the path it was opened BY (the
+     * resolved one, links expanded) — where it is in this mount namespace;
+     * the dentry's own path is the bind's SOURCE. */
+    if (crossed) {
+        char seen[256];
+        if (vfs_realpath_unlocked(path, seen, sizeof seen) == 0) {
+            size_t n = 0;
+            while (seen[n]) n++;
+            f->vpath = (char*)kmalloc(n + 1);
+            if (f->vpath) for (size_t i = 0; i <= n; i++) f->vpath[i] = seen[i];
+        }
+    }
     d->inode->opens++;                       /* §M90 — see vfs_close / unlink */
     struct vfs_mount* m = mount_of_dentry(d);
     if (m) m->open_files++;
+    return f;
+}
+int vfs_file_path(struct file* f, char* out, size_t cap) {
+    if (!f || !out || cap < 2) return -1;
+    if (f->vpath) {
+        size_t i = 0;
+        for (; f->vpath[i] && i + 1 < cap; i++) out[i] = f->vpath[i];
+        out[i] = 0;
+        return 0;
+    }
+    return f->dentry ? vfs_dentry_path(f->dentry, out, cap) : -1;
+}
+struct file* vfs_open_ex(const char* path, int flags, int* err) {
+    kmutex_lock(&ns_lock);
+    struct file* f = vfs_open_unlocked(path, flags);
+    int e = g_open_err;
+    kmutex_unlock(&ns_lock);
+    if (f && f->inode && f->inode->ops && f->inode->ops->open) f->inode->ops->open(f);
+    if (!f && err) *err = e;
     return f;
 }
 struct file* vfs_open(const char* path, int flags) {
@@ -952,9 +1022,53 @@ int vfs_close(struct file* f) {
         if (dir->dir_ops && dir->dir_ops->unlink) dir->dir_ops->unlink(dir, nm ? nm : "", ino);
         if (nm) kfree(nm);
     }
+    /* §M90 — a magic-link handle's inode is this file's own. */
+    if (ino && (ino->vflags & VFS_IF_LINKHANDLE)) { kfree(ino->private); kfree(ino); }
     kmutex_unlock(&ns_lock);
+    kfree(f->vpath);
     kfree(f);
     return 0;
+}
+
+static ssize_t lh_read(struct file* f, void* buf, size_t n, uint64_t off) {
+    const char* s = f && f->inode ? (const char*)f->inode->private : NULL;
+    if (!s) return -1;
+    size_t len = 0;
+    while (s[len]) len++;
+    if (off >= len) return 0;
+    size_t k = len - (size_t)off < n ? len - (size_t)off : n;
+    for (size_t i = 0; i < k; i++) ((char*)buf)[i] = s[off + i];
+    return (ssize_t)k;
+}
+static const struct file_ops lh_ops = { .read = lh_read };
+struct file* vfs_open_linkhandle(const char* where, const char* target) {
+    if (!where || !target) return NULL;
+    size_t tl = 0;
+    while (target[tl]) tl++;
+    char* t = (char*)kmalloc(tl + 1);
+    struct inode* in = (struct inode*)kcalloc(1, sizeof *in);
+    struct file* f = (struct file*)kcalloc(1, sizeof *f);
+    if (!t || !in || !f) { kfree(t); kfree(in); kfree(f); return NULL; }
+    for (size_t i = 0; i <= tl; i++) t[i] = target[i];
+    vfs_inode_defaults(in);
+    in->type = INODE_SYMLINK;
+    in->mode = 0777;
+    in->size = tl;
+    in->ops = &lh_ops;
+    in->private = t;
+    in->vflags = VFS_IF_LINKHANDLE;
+    kmutex_lock(&ns_lock);
+    struct dentry* d = resolve_path(where, NULL, NULL);
+    if (!d) { kmutex_unlock(&ns_lock); kfree(t); kfree(in); kfree(f); return NULL; }
+    f->inode = in;
+    f->dentry = d;
+    f->flags = VFS_RDONLY;
+    f->magic = VFS_FILE_MAGIC;
+    in->opens = 1;
+    struct vfs_mount* m = mount_of_dentry(d);
+    if (m) m->open_files++;
+    kmutex_unlock(&ns_lock);
+    return f;
 }
 
 ssize_t vfs_read(struct file* f, void* buf, size_t n) {
@@ -1031,6 +1145,40 @@ static int split_parent(const char* path, char* parent_buf, size_t cap,
 /* Dispatch a namespace mutator to the parent inode's dir_ops.  Returns
  * 0 on success.  Walks the path, attaches the freshly-created child
  * inode (returned by the fs) under the parent dentry. */
+/* §M90 — would a change at `path` happen below a read-only mount?  Walks it
+ * (links not followed in the last component) and reports what the walk
+ * passed.  Caller holds ns_lock. */
+static int ro_path(const char* path) {
+    g_walk_ro = 0;
+    struct dentry* parent = NULL;
+    const char* last = NULL;
+    (void)resolve_path_ex(path, &parent, &last, 0);
+    if (parent && ro_visible(parent)) g_walk_ro = 1;
+    return g_walk_ro;
+}
+
+int vfs_set_readonly(const char* path, int ro) {
+    kmutex_lock(&ns_lock);
+    int r = -1;
+    char buf[256];
+    const char* last;
+    struct dentry* T = NULL;
+    if (path && path[0] == '/' && path[1] == 0) T = cred_fs_root() ? cred_fs_root() : root;
+    else if (split_parent(path, buf, sizeof buf, &last) == 0 && *last) {
+        struct dentry* parent = resolve_path(buf, NULL, NULL);
+        if (parent && parent->inode && parent->inode->type == INODE_DIR)
+            T = lookup_child(parent, last, strlen_(last));
+    }
+    if (T) {
+        T->ro = ro ? 1 : 0;
+        T->ro_ns = task_mntns_current();
+        T->ro_seq = ++g_bind_seq;
+        r = 0;
+    }
+    kmutex_unlock(&ns_lock);
+    return r;
+}
+
 /* `kind`: 0 a regular file, 1 a directory, 2 a FIFO (§M90 — made by the fs's
  * `create` and turned into INODE_FIFO here: the fs stores nothing for it). */
 static int vfs_mutator_unlocked(const char* path, int kind);
@@ -1039,6 +1187,7 @@ static int vfs_mutator(const char* path, int kind) {
 }
 static int vfs_mutator_unlocked(const char* path, int kind) {
     int is_dir = kind == 1;
+    if (ro_path(path)) return -30;                 /* §M90 — EROFS */
     char buf[256];
     const char* last;
     if (split_parent(path, buf, sizeof buf, &last) != 0) return -1;
@@ -1114,6 +1263,7 @@ int vfs_mkfifo(const char* path) { return vfs_mutator(path, 2); }
  * their parent belongs to a different fs (dir_ops mismatch would
  * corrupt the foreign inode's accounting). */
 static int vfs_unlink_unlocked(const char* path) {
+    if (ro_path(path)) return -30;                 /* §M90 — EROFS */
     char buf[256];
     const char* last;
     if (split_parent(path, buf, sizeof buf, &last) != 0) return -1;
@@ -1190,6 +1340,7 @@ int vfs_unlink(const char* path) {
  * SAME filesystem (a link cannot cross one: it is the same inode).  -2 if the
  * new name exists, -5 if the directory may not be written. */
 static int vfs_link_unlocked(const char* oldpath, const char* newpath) {
+    if (ro_path(newpath)) return -30;              /* §M90 — EROFS */
     struct dentry* src = resolve_path(oldpath, NULL, NULL);
     if (!src || !src->inode || src->inode->type != INODE_FILE) return -1;
     char buf[256];
@@ -1258,6 +1409,7 @@ static int vfs_move_unlocked(struct dentry* op, const char* olast,
 }
 
 static int vfs_rename_unlocked(const char* oldpath, const char* newpath) {
+    if (ro_path(oldpath) || ro_path(newpath)) return -30;   /* §M90 — EROFS */
     char obuf[256], nbuf[256];
     const char *olast, *nlast;
     if (split_parent(oldpath, obuf, sizeof obuf, &olast) != 0) return -1;
@@ -1304,6 +1456,7 @@ int vfs_rename(const char* oldpath, const char* newpath) {
  * move (§M90); -3 says it cannot (another mount, or no `move` op) so the
  * caller can decide what crossing means for it. */
 static int vfs_rename_replace_unlocked(const char* oldpath, const char* newpath) {
+    if (ro_path(oldpath) || ro_path(newpath)) return -30;   /* §M90 — EROFS */
     char obuf[256], nbuf[256];
     const char *olast, *nlast;
     if (split_parent(oldpath, obuf, sizeof obuf, &olast) != 0) return -1;
@@ -1439,6 +1592,7 @@ static int unlink_rec(char* path, size_t cap, int depth) {
 }
 
 static int vfs_unlink_recursive_unlocked(const char* path) {
+    if (ro_path(path)) return -30;                 /* §M90 — EROFS */
     char buf[256];
     size_t len = strlen_(path);
     if (len == 0 || len >= sizeof buf) return -1;
@@ -1520,6 +1674,7 @@ static int persist_attr(struct dentry* d) {
 }
 
 static int vfs_chmod_unlocked(const char* path, uint32_t mode) {
+    if (ro_path(path)) return -30;                 /* §M90 — EROFS */
     struct dentry* d = resolve_path(path, NULL, NULL);
     if (!d || !d->inode) return -1;
     const struct cred* c = cred_current();
@@ -1538,6 +1693,7 @@ int vfs_chmod(const char* path, uint32_t mode) {
 }
 
 static int vfs_chown_unlocked(const char* path, int uid, int gid) {
+    if (ro_path(path)) return -30;                 /* §M90 — EROFS */
     struct dentry* d = resolve_path(path, NULL, NULL);
     if (!d || !d->inode) return -1;
     const struct cred* c = cred_current();
@@ -1609,6 +1765,7 @@ int vfs_realpath(const char* path, char* out, size_t cap) {
 }
 
 static int vfs_symlink_unlocked(const char* target, const char* linkpath) {
+    if (ro_path(linkpath)) return -30;             /* §M90 — EROFS */
     if (!target || !*target || strlen_(target) >= 255) return -1;
     char buf[256];
     const char* last;
@@ -1893,15 +2050,50 @@ int vfs_bind(const char* src, const char* tgt) {
 int vfs_unbind(const char* tgt) {
     kmutex_lock(&ns_lock);
     int r = -1;
+    char anon[256];
+    anon[0] = 0;
     struct dentry* T = bind_target_unlocked(tgt);
     if (T && T->bound && bind_visible(T)) {
+        /* an anonymous filesystem's directory goes with its only mount */
+        if (vfs_dentry_path_unlocked(T->bound, anon, sizeof anon) != 0) anon[0] = 0;
         T->bound = NULL;
         for (int i = 0; i < g_nbinds; i++)
             if (g_binds[i].tgt == T) { g_binds[i] = g_binds[--g_nbinds]; break; }
         r = 0;
     }
     kmutex_unlock(&ns_lock);
+    const char* pre = "/.mounts/";
+    int i = 0;
+    while (pre[i] && anon[i] == pre[i]) i++;
+    if (r == 0 && !pre[i] && anon[i]) vfs_unlink_recursive(anon);
     return r;
+}
+
+/* §M90 — a FRESH, EMPTY filesystem for a tmpfs / devpts / mqueue mount: a new
+ * directory under /.mounts (memory-backed, like everything on "/"), which the
+ * caller binds at its target — so it is private to the caller's mount
+ * namespace, as the real mount would be — and which vfs_unbind removes with
+ * its contents.  0 and the path in `out`, or -1. */
+int vfs_anon_fs(const char* kind, char* out, size_t cap) {
+    static unsigned next;
+    vfs_mkdir("/.mounts");
+    for (int tries = 0; tries < 1000; tries++) {
+        unsigned n = __atomic_add_fetch(&next, 1, __ATOMIC_RELAXED);
+        size_t o = 0;
+        const char* pre = "/.mounts/";
+        for (; *pre && o + 1 < cap; pre++) out[o++] = *pre;
+        for (; *kind && o + 1 < cap; kind++) out[o++] = *kind;
+        if (o + 1 < cap) out[o++] = '-';
+        char d[12]; int k = 0;
+        do { d[k++] = (char)('0' + n % 10); n /= 10; } while (n);
+        while (k && o + 1 < cap) out[o++] = d[--k];
+        out[o] = 0;
+        int r = vfs_mkdir(out);
+        if (r == 0) return 0;
+        if (r != -2) return -1;                      /* -2: exists, take the next */
+        kind = out + 9;                              /* (unreachable in practice) */
+    }
+    return -1;
 }
 
 int vfs_bind_count(void) { return g_nbinds; }

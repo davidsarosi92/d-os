@@ -1375,9 +1375,34 @@ static void sy_fdlinktest(const char* args) {
     int same = 1;
     for (int i = 0; a[i] || b[i]; i++) if (a[i] != b[i]) { same = 0; break; }
     kprintf("fdlink: pipe '%s' '%s' socket '%s' eventfd '%s' memfd '%s' file '%s'\n", a, b, c, d, e, f);
+    /* O_PATH|O_NOFOLLOW of a magic link: the LINK, on procfs, naming the pipe */
+    char mp[32]; bt_path(mp, "/proc/self/fd/", p[0], "", -1, "");
+    long lh = sys_open_ex_k(mp, VFS_RDONLY | VFS_NOFOLLOW, 0, 1);
+    struct ofile* lo = lh >= 0 ? fd_lookup((int)lh) : NULL;
+    char lt[64] = { 0 }, ld[64] = { 0 };
+    int lok = 0;
+    if (lo && lo->file && lo->file->inode && lo->file->inode->type == INODE_SYMLINK) {
+        lo->file->inode->ops->read(lo->file, lt, sizeof lt - 1, 0);
+        vfs_dentry_path(lo->file->dentry, ld, sizeof ld);
+        int eq = 1;
+        for (int i = 0; a[i] || lt[i]; i++) if (a[i] != lt[i]) { eq = 0; break; }
+        lok = eq && fl_starts(ld, "/proc");
+    }
+    if (lh >= 0) sys_close((int)lh);
+    /* ...and of a real symbolic link: the link; without O_PATH: ELOOP */
+    vfs_symlink("/fdlinktest.f", "/fdlinktest.l");
+    long sl = sys_open_ex_k("/fdlinktest.l", VFS_RDONLY | VFS_NOFOLLOW, 0, 1);
+    struct ofile* so = sl >= 0 ? fd_lookup((int)sl) : NULL;
+    int sok = so && so->file && so->file->inode && so->file->inode->type == INODE_SYMLINK;
+    if (sl >= 0) sys_close((int)sl);
+    long eloop = sys_open_ex_k("/fdlinktest.l", VFS_RDONLY | VFS_NOFOLLOW, 0, 0);
+    if (eloop >= 0) sys_close((int)eloop);
+    vfs_unlink("/fdlinktest.l");
+    kprintf("fdlink: magic-link handle '%s' on '%s' (%d); symlink handle %d; nofollow open %d (want -40)\n",
+            lt, ld, lok, sok, (int)eloop);
     int ok = fl_starts(a, "pipe:[") && same && fl_starts(c, "socket:[") &&
              fl_starts(d, "anon_inode:[eventfd]") && fl_starts(e, "/memfd:") &&
-             fl_starts(f, "/fdlinktest.f") && con;
+             fl_starts(f, "/fdlinktest.f") && con && lok && sok && eloop == -40;
     sys_close(p[0]); sys_close(p[1]); sys_close(sp[0]); sys_close(sp[1]);
     sys_close(ef); sys_close(mf); sys_close(ff);
     vfs_unlink("/fdlinktest.f");
@@ -1443,12 +1468,45 @@ static void sy_bindtest(const char* args) {
     vfs_create("/bt/file");
     int b1 = vfs_bind("/bt/src", "/bt/tgt");
     int see1 = vfs_stat("/bt/tgt/f", &st) == 0;
+    /* a file reached THROUGH the bind is known by the bind's path, and so is
+     * one opened relative to a directory opened through it (runc checks this:
+     * "mountpoint … is outside of rootfs") */
+    int vp = 0;
+    {
+        int dfd = sys_open_k("/bt/tgt", VFS_RDONLY);
+        int ffd = sys_open_k("/bt/tgt/f", VFS_RDONLY);
+        char dp[64] = { 0 }, fp[64] = { 0 };
+        if (dfd >= 0) sys_fd_path(dfd, dp, sizeof dp);
+        if (ffd >= 0) sys_fd_path(ffd, fp, sizeof fp);
+        const char* wd = "/bt/tgt"; const char* wf = "/bt/tgt/f";
+        int a = 1, b = 1;
+        for (int i = 0; wd[i] || dp[i]; i++) if (wd[i] != dp[i]) { a = 0; break; }
+        for (int i = 0; wf[i] || fp[i]; i++) if (wf[i] != fp[i]) { b = 0; break; }
+        vp = a && b;
+        if (!vp) kprintf("bindtest: through the bind: dir '%s' file '%s'\n", dp, fp);
+        if (dfd >= 0) sys_close(dfd);
+        if (ffd >= 0) sys_close(ffd);
+    }
     int b2 = vfs_bind("/proc/self/ns/net", "/bt/file");
     char buf[32] = { 0 };
     struct file* f = vfs_open("/bt/file", VFS_RDONLY);
     if (f) { vfs_read(f, buf, sizeof buf - 1); vfs_close(f); }
     int fileok = buf[0] == 'n' && buf[1] == 'e' && buf[2] == 't' && buf[3] == ':';
     int busy = vfs_unlink("/bt/tgt");
+    /* read-only: below a read-only mount nothing changes (EROFS), the same
+     * tree through its SOURCE stays writable, and remounting rw undoes it */
+    int ro_set = vfs_set_readonly("/bt/tgt", 1);
+    int ro_create = vfs_create("/bt/tgt/new");
+    int ro_eopen = 0;
+    struct file* rof = vfs_open_ex("/bt/tgt/f", VFS_WRONLY, &ro_eopen);
+    if (rof) { vfs_close(rof); ro_eopen = 0; }
+    int ro_unlink = vfs_unlink("/bt/tgt/f");
+    int src_ok = vfs_create("/bt/src/new2") == 0;
+    vfs_set_readonly("/bt/tgt", 0);
+    int rw_again = vfs_create("/bt/tgt/new3") == 0;
+    int rook = ro_set == 0 && ro_create == -30 && ro_eopen == -30 && ro_unlink == -30 && src_ok && rw_again;
+    if (!rook) kprintf("bindtest: read-only: set %d create %d open %d unlink %d src %d rw %d\n",
+                       ro_set, ro_create, ro_eopen, ro_unlink, src_ok, rw_again);
     int ns = vfs_mntns_new(home);
     me->mntns = ns;
     int child_sees = vfs_stat("/bt/tgt/f", &st) == 0;          /* made before: visible */
@@ -1473,7 +1531,7 @@ static void sy_bindtest(const char* args) {
              vfs_stat("/proc/thread-self/ns/net", &st) == 0 && vfs_stat(pc, &st) != 0;
     kprintf("bindtest: proc aliases %s\n", al ? "ok" : "WRONG");
     vfs_unlink_recursive("/bt");
-    int ok = al && b1 == 0 && see1 && b2 == 0 && fileok && busy == -6 && ns > 0 && child_sees &&
+    int ok = al && vp && rook && b1 == 0 && see1 && b2 == 0 && fileok && busy == -6 && ns > 0 && child_sees &&
              b3 == 0 && child_own && parent_blind && u_wrong == -1 && u1 == 0 && u2 == 0 &&
              u3 == 0 && gone;
     console_write(ok ? "bindtest: ok\n" : "bindtest: FAIL\n");

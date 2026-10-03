@@ -98,6 +98,7 @@ static void abi_at_end(struct abi_at* a) {
 static int abi_path(unsigned long up, char* k, unsigned cap);
 static long lnx_err(int r) {
     if (r >= 0) return r;
+    if (r == -30) return -30;            /* EROFS: below a read-only mount (§M90) */
     if (r == -2) return -17;             /* EEXIST */
     if (r == -5) return -13;             /* EACCES */
     return -2;                           /* ENOENT */
@@ -252,6 +253,7 @@ static long h_fchmodat2(struct abi_ctx* c) {
  * this VFS has no directory descriptors (the *at rule of §M73). */
 static long chown_err(int r) {
     if (r >= 0) return 0;
+    if (r == -30) return -30;            /* EROFS */
     if (r == -2) return -1;              /* EPERM  */
     if (r == -3) return -5;              /* EIO    */
     return -2;                           /* ENOENT */
@@ -289,6 +291,7 @@ static long h_fchmod(struct abi_ctx* c) {
         return abi_fd_pathless((int)c->a[0]) ? 0 : -9;              /* EBADF (see fchown) */
     int r = vfs_chmod(kp[0] ? kp : "/", (uint32_t)c->a[1] & 07777u);
     if (r == 0)  return 0;
+    if (r == -30) return -30;                /* EROFS                     */
     if (r == -2) return -1;                  /* EPERM: not the owner      */
     if (r == -3) return -5;                  /* EIO: the volume refused   */
     return -2;                               /* ENOENT */
@@ -436,6 +439,7 @@ static long abi_unlink_kind(unsigned long upath, int want_dir) {
     if (r == -2) return -39;                             /* ENOTEMPTY */
     if (r == -5) return -13;                             /* EACCES */
     if (r == -6) return -16;                             /* EBUSY: a bind's target */
+    if (r == -30) return -30;                            /* EROFS */
     return -ABI_ENOENT;
 }
 static long h_unlink(struct abi_ctx* c)  { return abi_unlink_kind(c->a[0], 0); }
@@ -467,6 +471,7 @@ static int abi_open_flags(unsigned long lf) {
     }
     if (lf & 0100u)  vf |= VFS_CREATE;
     if (lf & 01000u) vf |= VFS_TRUNC;
+    if (lf & 0100000u) vf |= VFS_NOFOLLOW;                /* §M90 — O_NOFOLLOW */
     return vf;
 }
 static long abi_open_common(struct abi_ctx* c, unsigned long upath, unsigned long flags) {
@@ -703,6 +708,22 @@ static long abi_readlink_path(unsigned long upath, unsigned long ubuf, unsigned 
 }
 static long h_readlink(struct abi_ctx* c)   { return abi_readlink_path(c->a[0], c->a[1], c->a[2]); }
 static long h_readlinkat(struct abi_ctx* c) {
+    /* §M90 — readlinkat(fd, "", …): the link the DESCRIPTOR is (an
+     * O_PATH|O_NOFOLLOW open of a symbolic link or a /proc magic link). */
+    char k1[2];
+    if (c->a[1] && copy_str_from_user(k1, (uintptr_t)c->a[1], sizeof k1) >= 0 && k1[0] == 0) {
+        struct file* f = sys_fd_vfs_file((int)c->a[0]);
+        if (!f || !f->inode) return -ABI_ENOENT;
+        if (f->inode->type != INODE_SYMLINK || !f->inode->ops || !f->inode->ops->read)
+            return -ABI_EINVAL;
+        char t[256];
+        ssize_t n = f->inode->ops->read(f, t, sizeof t, 0);
+        if (n < 0) return -ABI_EINVAL;
+        if ((unsigned long)n > c->a[3]) n = (ssize_t)c->a[3];
+        if (!abi_w_ok(c->a[2], (unsigned long)n)) return -ABI_EFAULT;
+        for (ssize_t i = 0; i < n; i++) ((char*)(uintptr_t)c->a[2])[i] = t[i];
+        return n;
+    }
     return AT_WRAP(c->a[0], abi_readlink_path(c->a[1], c->a[2], c->a[3]));
 }
 
@@ -724,6 +745,7 @@ static long abi_rename(unsigned long uold, unsigned long unew, int noreplace) {
     if (r == -2) return -21;                             /* EISDIR: target is a directory */
     if (r == -4) return -39;                             /* ENOTEMPTY */
     if (r == -5) return -13;                             /* EACCES */
+    if (r == -30) return -30;                            /* EROFS */
     if (r != -3) return -ABI_ENOENT;
     if ((k.mode & KS_IFMT) == KS_IFDIR) return -18;      /* EXDEV */
     if (exists && (kt.mode & KS_IFMT) == KS_IFDIR) return -21;
@@ -805,6 +827,17 @@ static long h_unshare(struct abi_ctx* c) {
  * private.  Anything that would ATTACH something (bind mounts, proc, tmpfs,
  * sysfs, …) is refused and NAMED on the console, so the next step of a
  * container runtime's setup is visible instead of guessed. */
+/* §M90 — tiny string helpers for the mount table below. */
+static int mnt_eq(const char* a, const char* b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+static void mnt_cpy(char* d, size_t cap, const char* a, const char* b) {
+    size_t o = 0;
+    for (; *a && o + 1 < cap; a++) d[o++] = *a;
+    for (; *b && o + 1 < cap; b++) d[o++] = *b;
+    d[o] = 0;
+}
 #define MS_REMOUNT_     0x20ul
 #define MS_BIND_        0x1000ul
 #define MS_REC_         0x4000ul
@@ -840,6 +873,61 @@ static long h_mount(struct abi_ctx* c) {
         if (r == -2) return -16;                         /* EBUSY  */
         if (r == -3) return -ABI_ENOTDIR;
         return -12;                                      /* ENOMEM */
+    }
+    /* §M90 — a REMOUNT changes only flags.  MS_RDONLY, MS_NOSUID, MS_NODEV and
+     * MS_NOEXEC: RDONLY is enforced; NOSUID and NODEV hold by construction
+     * (there are no set-uid programs or device-number nodes here); NOEXEC is
+     * accepted and NOT enforced yet — said on the console. */
+    if (fl & MS_REMOUNT_) {
+        struct kstat_full k;
+        if (sys_stat_full_k(tgt, &k) != 0) return -ABI_ENOENT;
+        /* MS_RDONLY is ENFORCED (vfs_set_readonly: everything below answers
+         * EROFS); dropping it makes the mount writable again. */
+        if (vfs_set_readonly(tgt, (fl & 0x1ul) ? 1 : 0) != 0) return -ABI_ENOENT;
+        if (fl & 0x8ul) {                                 /* NOEXEC */
+            static int said;
+            if (!said++) kprintf("mount: noexec is accepted but not enforced yet (first: '%s')\n", tgt);
+        }
+        return 0;
+    }
+    /* §M90 — a FILESYSTEM mount (no MS_BIND), as runc builds a container's
+     * root.  Each is made a bind in the caller's mount namespace, of what that
+     * filesystem shows:
+     *   proc          the procfs (/proc) — its contents answer per process;
+     *   sysfs         /sys (the cgroup tree under it);
+     *   cgroup2       the cgroup tree, from the caller's cgroup namespace root;
+     *   tmpfs, devpts, mqueue, ramfs
+     *                 a fresh empty directory (vfs_anon_fs): devpts with no
+     *                 terminals allocated, mqueue with no queues — both true,
+     *                 as neither exists here yet.
+     * Anything else (overlay, ext4, …) is refused and named. */
+    if (fst[0] && !(fl & MS_BIND_)) {
+        char from[256];
+        int anon = 0;
+        if (mnt_eq(fst, "proc"))            mnt_cpy(from, sizeof from, "/proc", "");
+        else if (mnt_eq(fst, "sysfs"))      mnt_cpy(from, sizeof from, "/sys", "");
+        else if (mnt_eq(fst, "cgroup2")) {
+            /* "/" inside is the cgroup namespace's root (nsproxy.c) */
+            struct task* me = task_current();
+            struct nsobj* cg = me ? me->ns[NSK_CGROUP] : NULL;
+            const char* root = (cg && cg->cg_root[0] && cg->cg_root[1]) ? cg->cg_root : "";
+            mnt_cpy(from, sizeof from, "/sys/fs/cgroup", root);
+        } else if (mnt_eq(fst, "tmpfs") || mnt_eq(fst, "devpts") || mnt_eq(fst, "mqueue") ||
+                   mnt_eq(fst, "ramfs")) {
+            if (vfs_anon_fs(fst, from, sizeof from) != 0) return -12;
+            anon = 1;
+        } else {
+            kprintf("mount: '%s' on '%s' type '%s' flags %lx - not supported yet\n", src, tgt, fst, fl);
+            return -19;                                   /* ENODEV: unknown fs type */
+        }
+        int r = vfs_bind(from, tgt);
+        if (r != 0 && anon) vfs_unlink_recursive(from);
+        if (r == 0 && (fl & 0x1ul)) vfs_set_readonly(tgt, 1);   /* mounted read-only */
+        if (r == 0) return 0;
+        if (r == -1) return -ABI_ENOENT;
+        if (r == -2) return -16;                          /* EBUSY  */
+        if (r == -3) return -ABI_ENOTDIR;
+        return -12;
     }
     kprintf("mount: '%s' on '%s' type '%s' flags %lx - not supported yet\n", src, tgt, fst, fl);
     return -ABI_EPERM;
@@ -1962,10 +2050,12 @@ static long h_statfs(struct abi_ctx* c) {
 /* i386's statfs64(path, size, buf) / fstatfs64(fd, size, buf): the counts are
  * 64-bit, f_type/f_bsize and the tail 32-bit, and the caller passes the size
  * it was compiled with (84). */
-static long put_statfs64_i386(uintptr_t p) {
+static long put_statfs64_i386(uintptr_t p, uint32_t magic) {
     if (!abi_w_ok(p, 84)) return -ABI_EFAULT;
     for (unsigned i = 0; i < 84; i++) ((uint8_t*)p)[i] = 0;
-    *(uint32_t*)(p + 0) = 0x858458f6u;
+    /* §M90 — the filesystem's own magic (it was always ramfs's, so an i386
+     * program could not tell /proc or a cgroup2 mount from a plain directory). */
+    *(uint32_t*)(p + 0) = magic;
     *(uint32_t*)(p + 4) = 4096;
     uint64_t v[5] = { pmm_managed_frames(), pmm_free_frames(), pmm_free_frames(), 65536, 65536 };
     for (int i = 0; i < 5; i++) *(uint64_t*)(p + 8 + 8 * (uintptr_t)i) = v[i];
@@ -1979,23 +2069,25 @@ static long h_statfs64(struct abi_ctx* c) {
     struct kstat_full st;
     if (sys_stat_full_k(kp, &st) != 0) return -ABI_ENOENT;
     if (c->a[1] < 84) return -ABI_EINVAL;
-    return put_statfs64_i386((uintptr_t)c->a[2]);
+    return put_statfs64_i386((uintptr_t)c->a[2], abi_fs_magic(kp));
+}
+static uint32_t abi_fd_fs_magic(int fd) {
+    char kp[256];
+    struct ofile* o = fd_lookup(fd);
+    if (o && (o->kind == FD_VFS || o->kind == FD_FIFO) && o->file && o->file->dentry &&
+        vfs_dentry_path(o->file->dentry, kp, sizeof kp) == 0)
+        return abi_fs_magic(kp[0] ? kp : "/");
+    return 0x858458f6u;
 }
 static long h_fstatfs64(struct abi_ctx* c) {
     if (!fd_lookup((int)c->a[0]) && ((int)c->a[0] < 0 || (int)c->a[0] > 2)) return -ABI_EBADF;
     if (c->a[1] < 84) return -ABI_EINVAL;
-    return put_statfs64_i386((uintptr_t)c->a[2]);
+    return put_statfs64_i386((uintptr_t)c->a[2], abi_fd_fs_magic((int)c->a[0]));
 }
 static long h_fstatfs(struct abi_ctx* c) {
     if (!fd_lookup((int)c->a[0]) && ((int)c->a[0] < 0 || (int)c->a[0] > 2)) return -ABI_EBADF;
     /* §M90 — the descriptor's own filesystem: its path from its dentry. */
-    char kp[256];
-    uint32_t magic = 0x858458f6u;
-    struct ofile* o = fd_lookup((int)c->a[0]);
-    if (o && o->kind == FD_VFS && o->file && o->file->dentry &&
-        vfs_dentry_path(o->file->dentry, kp, sizeof kp) == 0)
-        magic = abi_fs_magic(kp[0] ? kp : "/");
-    return put_statfs(c, (uintptr_t)c->a[1], 0, magic);
+    return put_statfs(c, (uintptr_t)c->a[1], 0, abi_fd_fs_magic((int)c->a[0]));
 }
 
 /* prctl: the thread name (PR_SET_NAME 15 / PR_GET_NAME 16 — a JVM names

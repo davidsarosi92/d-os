@@ -71,6 +71,9 @@ enum inode_type {
 #define VFS_RDWR    (VFS_RDONLY | VFS_WRONLY)
 #define VFS_CREATE  0x04
 #define VFS_TRUNC   0x08
+/* §M90 — do not follow a symbolic link in the LAST component (O_PATH|O_NOFOLLOW:
+ * the link itself is opened). */
+#define VFS_NOFOLLOW 0x10
 
 /* Forward decls — full layouts in vfs.c. */
 struct inode;
@@ -223,6 +226,10 @@ struct inode {
  * cgroup's control files), so "the directory is not empty" is not the test —
  * the fs's unlink op is, and the VFS frees the child dentries after it agrees. */
 #define VFS_IF_OWN_CHILDREN 0x1u
+/* §M90 — an inode that belongs to ONE open file (a magic-link handle,
+ * vfs_open_linkhandle): vfs_close frees it, with its private data, after the
+ * close bookkeeping that still reads it. */
+#define VFS_IF_LINKHANDLE   0x2u
 
 /* Directory entry — name + inode pointer + tree links.  We keep an
  * intrusive tree so vfs.c can walk the namespace without per-fs hooks
@@ -241,6 +248,13 @@ struct dentry {
     struct dentry*  bound;
     int             bound_ns;
     unsigned        bound_seq;
+    /* §M90 — APPENDED.  A READ-ONLY mount at this dentry (remount ro of a
+     * bind, or of a directory bound onto itself), made in mount namespace
+     * `ro_ns` as the `ro_seq`-th mount change — visible by the same rule as a
+     * bind.  Anything that would change the tree below it answers EROFS. */
+    int             ro;
+    int             ro_ns;
+    unsigned        ro_seq;
 };
 
 /* Open file handle — per-call-to-open instance state. */
@@ -254,6 +268,12 @@ struct file {
      * a second close, or a close of memory something overwrote, is caught in
      * vfs_close with its caller instead of freeing garbage. */
     uint32_t       magic;
+    /* §M90 — APPENDED.  The path the file was opened BY when that differs from
+     * its dentry's own path: reached through a bind mount (a container's
+     * /proc is the host's procfs, but the process opened rootfs/proc).  What
+     * /proc/self/fd/N names, as Linux's d_path names the mount, not the
+     * source.  NULL = the dentry's path is the answer.  Freed by vfs_close. */
+    char*          vpath;
 };
 #define VFS_FILE_MAGIC 0xF11E0B3Eu
 #define VFS_FILE_DEAD  0xDEADF11Eu
@@ -354,6 +374,21 @@ int  vfs_symlink(const char* target, const char* linkpath);
  * back after a reboot as an empty regular file, so it is refused (-3).
  * 0; -1 no parent, -2 exists, -3 unsupported here, -5 not permitted. */
 int  vfs_mkfifo(const char* path);
+/* §M90 — open(O_PATH|O_NOFOLLOW) of a /proc MAGIC link (/proc/self/fd/N,
+ * /proc/self/exe): a handle to the LINK itself — a symlink inode whose content
+ * is `target`, attached to the dentry at `where` (a /proc directory) so the
+ * handle is "on procfs" (fstatfs) as Linux's is.  NULL on failure. */
+struct file* vfs_open_linkhandle(const char* where, const char* target);
+/* §M90 — a fresh empty directory standing in for a new tmpfs/devpts/mqueue
+ * (bound at its target by the caller, removed by vfs_unbind). */
+int vfs_anon_fs(const char* kind, char* out, size_t cap);
+/* §M90 — make the mount at `path` read-only (ro=1) or writable again (0), in
+ * the caller's mount namespace.  0, or -1 when there is no such path.  VFS
+ * mutators below a read-only mount answer -30 (EROFS). */
+int vfs_set_readonly(const char* path, int ro);
+/* §M90 — open, with the reason when it fails: *err = -30 EROFS (a write below
+ * a read-only mount), else -2 (not found / refused). */
+struct file* vfs_open_ex(const char* path, int flags, int* err);
 int  vfs_readlink(const char* path, char* out, size_t cap);   /* bytes, or <0 */
 int  vfs_realpath(const char* path, char* out, size_t cap);
 int  vfs_create(const char* path);          /* zero-byte regular file */
@@ -378,6 +413,8 @@ int  vfs_rename_replace(const char* oldpath, const char* newpath);
 int  vfs_fsync_file(struct file* f);
 /* §M90 — a dentry's path as the calling task sees it ("" = its root). */
 int  vfs_dentry_path(struct dentry* d, char* out, size_t cap);
+/* §M90 — the path an open file is known by (vpath, else its dentry's). */
+int  vfs_file_path(struct file* f, char* out, size_t cap);
 
 /* M22.5 — copy a regular file (read/write loop through the fs ops;
  * dst is created/truncated).  Returns 0 / -1. */
