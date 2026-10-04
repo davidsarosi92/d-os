@@ -6059,8 +6059,7 @@ not i386.
 
 ## §M90 — Docker itself on d-os (no Docker Desktop)
 
-**Status: IN PROGRESS.  Asked for 2026-09-28: "teljes docker
-futtatása, nem kell desktop, ha kihagyható, de minden más igen".**
+**Status: IN PROGRESS.  Asked for 2026-09-28: "Running full Docker—no need for Desktop if it can be skipped, but everything else is required.".**
 
 **Progress (aarch64; x86_64 waits for the higher-half kernel move — the
 fixed-address Go binaries load at 0x200000, inside the low identity map):**
