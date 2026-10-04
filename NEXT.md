@@ -11,7 +11,9 @@ test recipe in PLAN.md §M90 "RESUME HERE":
 5. x86_64 after the higher-half kernel move
 
 Recorded beside it, not scheduled: §M91 (the ABI as its own project, ReactOS
-pattern) and §M92 (driver engine, open question).  Open defects: #14, #16 below.
+pattern), §M92 (driver engine, open question) and §M93 (a user guide for
+installing downloaded software — Docker, Java — and the `.tar.gz` install,
+manifest and service registration it needs).  Open defects: #14, #16 below.
 
 # Where things stand (2026-09-28)
 

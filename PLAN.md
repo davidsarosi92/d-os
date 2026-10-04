@@ -235,6 +235,7 @@ fixed first, whatever it touches.
 | §M90 | ◐ ~55-60 % (2026-10-04) | Docker itself on d-os (dockerd + containerd + runc + the CLI), no Docker Desktop — rungs 1-2 ✅ (`docker run … echo hi` prints `hi`, aarch64); next: cgroup limits + inotify, overlayfs, networking, `-it`/build, x86_64 — resume order in §M90 |
 | §M91 | — | the ABI as its own project: d-os, Linux and NT personalities over one common language (ReactOS's pattern) — designed, not started |
 | §M92 | — | a driver engine for d-os, Linux and Windows drivers — an OPEN QUESTION, recorded, not decided |
+| §M93 | — | installing software as a user — a guide (download → one command → run), and the unpacker / manifest / service registration it needs — recorded, not started |
 | §M68 | — | investigation, not started |
 | §M83, §M84 | — | designed, not started |
 
@@ -327,6 +328,7 @@ what); a session can pick a theme and push on it.
 | M90 | **Docker itself on d-os** — asked for directly (2026-09-28): "full Docker, not the desktop if it can be left out, but everything else".  The real `docker` CLI, `dockerd`, `containerd` and `runc` (static Go binaries) running on d-os and managing containers.  Needs Linux namespaces, cgroup v2, overlayfs, netlink + veth + bridge networking, mount/pivot_root, capabilities/seccomp, and the Go runtime's own demands | Userland | §M90 — IN PROGRESS: rung 1 done (CLI), rung 2 under way (dockerd) |
 | M91 | **The ABI becomes its own project — three personalities (d-os, Linux, NT) over one common language** — asked for directly (2026-10-04): *any compatibility layer must be easy to add at any time, and developable as a separate project.*  §M50's engine already translates a guest trap into canonical operations; this finishes it (every handler behind a versioned HOST INTERFACE, the native d-os ABI as a table too), lifts it into its own repository as packages (§M83), and adds an **NT personality** on ReactOS's pattern: the d-os kernel stays, ReactOS's UNMODIFIED user-mode layer (ntdll, the Wine-synced kernel32/user32/gdi32, its applications and its tests) runs on top, because our NT guest map IS ReactOS's system-call table | Architecture / Compatibility | §M91 — designed, not started |
 | M92 | **A driver engine — d-os, Linux and Windows drivers? (OPEN QUESTION)** — raised 2026-10-04, deliberately not decided: the same shape as §M91 one layer down (§M33's `drvrt.h` as the common language, a personality per driver world).  Recorded with its asymmetries, its prerequisites and the condition that would trigger the decision | Architecture / Drivers | §M92 — open question |
+| M93 | **Installing software as a user — the guide and what it needs** — asked for directly (2026-10-04): *I download a package from the internet; what do I do so that it installs?*  Today Java installs only through a host-prepared disk and Docker's binaries were copied onto the test disk by hand.  The milestone is a user-facing guide (download with `wget` → `app install <file>` → run, update, remove) plus what makes every sentence of it true: `app install` for plain `.tar.gz` releases with an architecture check, a minimal manifest, service registration on install (Docker's daemons start without typing) | Packaging / Docs | §M93 — recorded, not started |
 
 ### Cross-cutting constraints
 
@@ -6410,6 +6412,73 @@ real hardware in an ISOLATED domain; a deliberate fault in that driver is
 contained (the §M33 supervisor restarts or quarantines it, the machine stays
 up); and the personality lives in its own repository on §M91's package
 pattern.
+
+## §M93 — Installing software as a user: the guide, and what it needs
+
+Asked for directly (2026-10-04): *a description of how I will install Docker,
+Java and the like — I go to the internet, download a package, and what do I
+have to do so that it installs.*  The deliverable is a USER-FACING GUIDE;
+the milestone is the guide plus whatever has to exist for every sentence in
+it to be true.
+
+**Status: recorded, not started.**  Relates to §M83 (packages from outside
+the image) and §M89 (`app install`).
+
+### What exists today, said plainly
+
+| software | how it gets onto the machine today | a user can do it? |
+|---|---|---|
+| Java (Temurin JDK) | an OCI image: `docker save eclipse-temurin:21-jdk-alpine -o java.tar` ON A HOST, the archive placed in `/mnt/incoming/` (by `scripts/deliver-apps.sh` from `build/apps/`), the `apps` boot service runs `app install`: `/mnt/apps/<name>/<version>/`, `/bin` links, `app use` / `app remove` | only with a host and our scripts |
+| Docker (CLI, dockerd, containerd, runc) | the static binaries were copied onto the test disk (`build/aarch64/dk.img`) by hand | **no** |
+| an image for Docker | `docker load -i /mnt/busybox.tar`, or `docker pull` once dockerd runs | yes, once Docker is installed |
+
+What the machine itself can do: download (`wget`, TLS with CA verification),
+unpack an OCI IMAGE (`ociunpack`: gzip layers, verified).  What it cannot:
+unpack a plain `.tar.gz` / `.tgz` (the form Docker's static release and most
+Linux binary releases ship in), or install anything it downloaded without a
+host preparing the disk.
+
+### What the guide must be able to say
+
+1. **Get the package** — inside d-os with `wget <url>` (or copy it onto the
+   disk from another machine), into the user's home or `/mnt/incoming/`.
+2. **Install it** — ONE command, whatever the package's form:
+   `app install <file>` for an OCI image archive, a `.tar.gz`/`.tgz` binary
+   release (Docker's `docker-<ver>.tgz`, a JDK tarball), and later a §M83
+   package; dropping the file into `/mnt/incoming/` does the same at boot.
+3. **Use it** — the programs are on PATH (`/bin` links); what the package
+   needs to start (Docker: start `containerd` and `dockerd`, ideally as a
+   §M29 SERVICE the installer registers) is done for the user or stated.
+4. **Update, switch, remove** — `app list`, `app use <name> <version>`,
+   `app remove`; a new version installs beside the old one.
+5. **When it fails** — every refusal names its reason (no space, wrong
+   architecture, an unknown format); where the log is.
+
+### What has to be built for that
+
+- `app install` accepting a plain `.tar.gz`/`.tgz` (a generic tar + gzip
+  unpacker in ring 3 — `ociunpack` already has both halves), with the
+  ARCHITECTURE checked from the binaries' ELF headers before anything is
+  linked (an x86_64 Docker on aarch64 must be refused by name).
+- A package MANIFEST for archives that carry none (which programs, which
+  services to start, which version) — minimal, and optional when the layout
+  is obvious (`docker/` with its binaries).
+- Service registration on install: Docker's `containerd` + `dockerd` start at
+  boot (or on first use) without typing; the dk.img hand-copy retired.
+- Room on the disk: `deliver-apps.sh` grows the image on the host today; on
+  the machine itself the user needs a disk big enough, and the guide must say
+  how big (Docker ≈ 200 MB, a JDK ≈ 350 MB, plus images).
+
+### Completion
+
+The guide exists (user-facing, in the repository's docs, and in Hungarian as
+well as English), and on a FRESH disk with network, following it word for
+word, a user installs and runs: the JDK (`java -version`), Docker from its
+official static release (`docker run busybox echo hi` after a `docker pull`),
+updates one of them to a newer version and switches back — with no host-side
+script involved.
+
+---
 
 ## §M74 — Swap and demand paging: reclaim as a policy, not a favour
 
