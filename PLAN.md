@@ -233,6 +233,8 @@ fixed first, whatever it touches.
 | §M88 | ✅ (§4.118) | open: a taskbar per monitor |
 | §M89 | ◐ → core ✅ | Java: `java Hello.java` from the unmodified JDK on x86_64 + aarch64 (DOCS §4.119); open: `app install` end to end, host-side delivery, rung 5 measurements |
 | §M90 | — | Docker itself on d-os (dockerd + containerd + runc + the CLI), no Docker Desktop — asked for 2026-09-28, scoped below; AFTER §M89 and the open items (decided), planned for Thursday evening |
+| §M91 | — | the ABI as its own project: d-os, Linux and NT personalities over one common language (ReactOS's pattern) — designed, not started |
+| §M92 | — | a driver engine for d-os, Linux and Windows drivers — an OPEN QUESTION, recorded, not decided |
 | §M68 | — | investigation, not started |
 | §M83, §M84 | — | designed, not started |
 
@@ -323,6 +325,8 @@ what); a session can pick a theme and push on it.
 | M87 | **Network and storage in the Control Panel** — asked for directly (2026-09-27): a Network page, a taskbar network indicator with a Wi-Fi chooser, disk management with its functions, and the missing translations | UX / Network / Storage | §M87 — ✅ SHIPPED (DOCS §4.103): six-state network status, link state, admin down, static config keys, a simulated Wi-Fi adapter (QEMU has no Wi-Fi), `vfs_umount` + holds, an exFAT formatter (fsck-clean), RAM disks, `locale missing`; open: a real Wi-Fi driver, partition tables, a second virtio disk |
 | M89 | **Java — a JRE, and the JDK with it** — asked for directly (2026-09-28): Alpine's musl-built OpenJDK as a §M73 image on x86_64 + aarch64 (i386: no current JDK exists).  Needs a real address-space layer (reservations, demand-zero, PROT_NONE, lazy file maps), Linux signal delivery with siginfo/ucontext, arm64 threads, and a bulk of small calls | Userland | §M89 — core done: the JDK runs Hello.java on both 64-bit arches (DOCS §4.119); installer + measurements open |
 | M90 | **Docker itself on d-os** — asked for directly (2026-09-28): "full Docker, not the desktop if it can be left out, but everything else".  The real `docker` CLI, `dockerd`, `containerd` and `runc` (static Go binaries) running on d-os and managing containers.  Needs Linux namespaces, cgroup v2, overlayfs, netlink + veth + bridge networking, mount/pivot_root, capabilities/seccomp, and the Go runtime's own demands | Userland | §M90 — IN PROGRESS: rung 1 done (CLI), rung 2 under way (dockerd) |
+| M91 | **The ABI becomes its own project — three personalities (d-os, Linux, NT) over one common language** — asked for directly (2026-10-04): *any compatibility layer must be easy to add at any time, and developable as a separate project.*  §M50's engine already translates a guest trap into canonical operations; this finishes it (every handler behind a versioned HOST INTERFACE, the native d-os ABI as a table too), lifts it into its own repository as packages (§M83), and adds an **NT personality** on ReactOS's pattern: the d-os kernel stays, ReactOS's UNMODIFIED user-mode layer (ntdll, the Wine-synced kernel32/user32/gdi32, its applications and its tests) runs on top, because our NT guest map IS ReactOS's system-call table | Architecture / Compatibility | §M91 — designed, not started |
+| M92 | **A driver engine — d-os, Linux and Windows drivers? (OPEN QUESTION)** — raised 2026-10-04, deliberately not decided: the same shape as §M91 one layer down (§M33's `drvrt.h` as the common language, a personality per driver world).  Recorded with its asymmetries, its prerequisites and the condition that would trigger the decision | Architecture / Drivers | §M92 — open question |
 
 ### Cross-cutting constraints
 
@@ -6182,6 +6186,208 @@ Docker's — the natural home of the native Engine API route — while the real
 dockerd/containerd/runc run beside it under the Linux personality.  Neither
 replaces the other: `ctr` is d-os's own, always-available container path;
 upstream Docker is the compatible one.
+
+## §M91 — The ABI becomes its own project: d-os, Linux and NT over one common language
+
+Asked for directly (2026-10-04): *when the packages are split out (§M83),
+the ABI goes with them — any new compatibility layer must be easy to add at
+any time, so that the d-os, Linux and Win32 layers can each be developed as
+a separate project and used here.  The ABI project is an abstraction
+between the different traps, bridging them into one common language.*
+
+**Status: designed, not started.**  Depends on §M50 (the engine — shipped)
+and §M83 (packages from outside the image — designed, not started).
+
+### The shape (decided in conversation, 2026-10-04)
+
+```
+ program  ──trap──►  arch shim  ──►  PERSONALITY  ──►  canonical op  ──►  host interface  ──►  d-os kernel
+                    (kernel, hal/*)  (ABI project:     (the common      (versioned,           (unchanged:
+                     regs → args)     number map +     language)         the ONLY way          knows no
+                                      adapters)                          into the kernel)      guest)
+```
+
+Three personalities, equal in kind:
+
+| personality | what it receives | today |
+|---|---|---|
+| **d-os** | the native system calls | runs mostly on the OLD native dispatcher (`syscall.c`), not through the engine |
+| **Linux** | Linux system calls (i386 / amd64 / arm64 maps) | in the engine; Docker and the JDK run on it |
+| **NT** | the NT NATIVE API — what `ntdll` calls — numbered as ReactOS numbers it | new |
+
+**Win32 is NOT part of the translator.**  A Windows program calls
+kernel32/user32/gdi32…, those call `ntdll`, and only `ntdll` traps.  The
+personality serves the native API; the Win32 DLLs above it are user-mode
+code we take, not write.
+
+### Why ReactOS's pattern, and what exactly is taken from it
+
+ReactOS is an NT clone (0.4.16, 2026-08-29: Wine 10 sync, moving from the
+NT 5.2 target towards NT6, IA-32 and x86-64).  Its user-mode layer is the
+environment-subsystem model of NT: `ntdll` over the native API, the Win32
+DLLs (largely Wine's, kept in sync by the project) over `ntdll`.
+
+**Our NT guest map IS ReactOS's system-call table**, pinned to a ReactOS
+release.  NT system-call numbers are not a public contract — but they do not
+have to be: whoever ships `ntdll` defines them, and ReactOS ships its own.
+Matching its table means the ReactOS user mode runs on d-os UNMODIFIED, and
+a new ReactOS release is a table update plus a package update — the
+continuous take-over asked for.
+
+| taken from ReactOS, unmodified (as packages) | written here |
+|---|---|
+| `ntdll`, kernel32/user32/gdi32/advapi32/msvcrt… (Wine-synced), applications | the NT personality: the number map + the ADAPTERS |
+| `rostests` (ntdll_apitest, kernel32_apitest, …) — the reference the NT personality is measured against, as unmodified musl programs are for Linux | the PE/COFF loader |
+| the system-call table (data) | win32k's role, on our compositor |
+
+**Not taken:** ReactOS's kernel side (`ntoskrnl`, `win32k`) — it is built on
+its own kernel's internals, and the d-os kernel stays.  Its driver model is
+§M92's question.
+
+### Licence (recommended; to be confirmed)
+
+d-os is MIT, ReactOS mostly GPL, Wine LGPL.  **Recommended: the kernel stays
+MIT.**  ReactOS user-mode code arrives only as SEPARATE packages in their
+own repository (dynamically linked, its own licence).  ReactOS kernel code is
+READ for reference, never copied into the kernel or into an MIT module.  The
+alternative — the NT personality as a GPL module, copying freely — makes
+every d-os distribution that includes it GPL in effect, and is a decision,
+not a default.
+
+### The adapters (where a table is not enough)
+
+§M50's rule 2 applies: a semantic mismatch is a NAMED adapter with its own
+state, and it may refuse rather than approximate.
+
+- **Object manager + HANDLE table** — typed, named, referenced objects
+  (files, sections, events, mutants, semaphores, keys, threads, processes)
+  and the `\` object namespace; not fds wearing a different number.
+- **Paths** — `\??\C:\…`, drive letters, case-insensitive lookup with case
+  preservation, mapped onto d-os paths through a declared table of drives.
+- **Memory** — `NtAllocateVirtualMemory`'s reserve/commit over vma.c (§M89),
+  sections and views.
+- **Processes and threads** — `NtCreateUserProcess` builds a process from
+  scratch (the easy direction: fork/exec here, CreateProcess there), TEB/PEB.
+- **Exceptions and APCs** — SEH dispatch into `KiUserExceptionDispatcher`,
+  APC delivery at alertable waits; not signals in disguise.
+- **The subsystem server** — CSRSS / LPC (ALPC) where `ntdll` asks for it.
+- **Registry** — the NT configuration database as an object; §M63's store
+  is NOT pretended to be one (PLAN §M-registry declines it for d-os itself).
+
+### Stages, each with its completion condition
+
+1. **Host interface.**  Every handler reaches the kernel only through one
+   versioned `abi_host` operations table — no `sys_*`/`vfs_*`/task call from
+   engine code.
+   *Done when:* the engine compiles with only `abi.h` + `abi_host.h`; a
+   script reports 0 direct kernel references; a host-side harness runs the
+   engine against a fake host on the build machine.
+2. **The d-os ABI as a table.**  `syscall.c`'s native dispatcher migrated
+   into the engine as `abi_map_dos`; the old switch deleted in the SAME
+   change (§M56.1's rule).
+   *Done when:* every native test (libctest, forktest, pipetest, sigtest,
+   threadtest, waittest, procspawn, …) passes through the engine on all three
+   arches and the switch is gone.
+3. **The Linux personality finished.**  The remaining per-arch cases
+   (clone/fork paths, sendmsg/recvmsg, signal frames' entry) behind the
+   engine; `hal/*/linux_abi.c` keeps only the shim.
+   *Done when:* those files hold only register ↔ argument code plus named,
+   documented arch-only exceptions; musltest, the coreutils, the JDK and the
+   §M90 Docker chain pass.
+4. **The ABI lifted out.**  The engine, the common language and each
+   personality become packages in their own repository (§M83), each
+   versioned; the kernel pins them.  The host-interface version and §M67's
+   structural fingerprint are checked at load and a mismatch is refused BY
+   NAME.
+   *Done when:* d-os builds against the external repository at a pinned
+   version; a personality package is updated or swapped without rebuilding
+   the kernel; an incompatible one is refused with the reason.
+5. **(optional) Wine on the Linux personality** — the cheap early proof
+   that Win32 binaries can run at all; skippable.
+   *Done when:* a console Win32 program runs under unmodified Wine.
+6. **PE/COFF loader.**  PE32 and PE32+ images and `ntdll` mapped, the
+   process entered through `ntdll`'s loader the way NT enters it.
+   *Done when:* ReactOS's `ntdll` starts and reaches its loader on d-os.
+7. **The NT personality, console.**  The ReactOS table as `abi_map_nt`
+   (pinned release), the adapters above, i386 and x86_64 (ReactOS's arches;
+   no NT on aarch64 is planned).
+   *Done when:* a console `hello.exe` and ReactOS's `cmd.exe` run
+   UNMODIFIED on ReactOS's ntdll + kernel32 + msvcrt; a ReactOS release
+   update is a table bump plus a package update.
+8. **The reference.**  `rostests` (ntdll_apitest, kernel32_apitest first)
+   run on d-os.
+   *Done when:* a declared subset passes, the pass rate is MEASURED and
+   tracked per release, and every failure is a listed, named item.
+9. **GUI.**  win32k's role served by the d-os compositor (windows, input,
+   GDI surfaces), user32/gdi32 drawing through it.
+   *Done when:* a ReactOS GUI application (notepad, a game) runs in a d-os
+   window with mouse and keyboard.
+
+**The milestone is complete when:** all three personalities run through one
+engine and one versioned host interface; the ABI lives in its own repository
+as packages; ReactOS's user mode runs a console and a GUI program unmodified
+on the NT personality; adding a fourth personality is a new repository with
+a table and its adapters, and touches no kernel file.
+
+---
+
+## §M92 — A driver engine: d-os, Linux and Windows drivers? (OPEN QUESTION)
+
+Raised 2026-10-04 alongside §M91, **deliberately not decided**: *a driver
+engine that can work with d-os, Linux and Windows drivers, on the same
+pattern — it may stay an undecided question, but it is raised.*
+
+**Status: open question, recorded.  Not scheduled.**
+
+### The shape it would have
+
+| | §M91 ABI engine | driver engine |
+|---|---|---|
+| common language | canonical system-call operations | §M33's `drvrt.h`: MMIO, port I/O, DMA, IRQ, device window, power |
+| personalities | d-os, Linux, NT | d-os, Linux, Windows |
+| translates onto | the d-os kernel | the same |
+
+### Why it is not the same decision as §M91
+
+- **The three worlds are not alike.**  A d-os driver is native.  A Windows
+  driver (WDM / KMDF, NDIS) is a fairly stable BINARY interface — what
+  ReactOS runs and what NDISwrapper once ran on Linux — so a translating
+  layer fits it in principle.  A Linux driver is not: the Linux in-kernel
+  API is unstable by design, so it can only be served at SOURCE level against
+  a moving target (FreeBSD's LinuxKPI does this for DRM and Wi-Fi, and pays
+  for it continuously), and it is GPL.
+- **The NT side is bigger than the NT personality.**  IRPs, the PnP and
+  power managers, IRQL/DPC semantics, the HAL — a large part of ntoskrnl's
+  internal world.
+- **Trust.**  A foreign driver programs hardware and does DMA.  §M33's
+  placement (ring 3) and IOMMU confinement are a PRECONDITION here, not a
+  convenience: a foreign driver runs isolated or not at all.
+
+### Prerequisites, before it can even be decided
+
+1. §M33's open item closed: a REAL DMA driver ported onto `drvrt.h` (today
+   only the synthetic `edu` proves it), so the common language is known to
+   carry a complicated driver.
+2. Per-driver IOMMU domains wired by default (today confinement works but
+   nothing assigns it automatically), and the virtio transport behind the
+   IOMMU (modern virtio, feature bit 33).
+3. §M91 stages 1 and 4 done — the host-interface and package experience
+   this would reuse.
+
+### The trigger
+
+The first REAL hardware need that d-os has no driver for and for which
+writing one does not pay — Wi-Fi (QEMU emulates none) or §M84's phone.  The
+decision is then made PER DEVICE CLASS: a native driver, or one foreign
+driver world for that class only.
+
+### If it is ever pursued, it is complete when
+
+One device class runs a foreign driver (e.g. a Windows NDIS Wi-Fi driver) on
+real hardware in an ISOLATED domain; a deliberate fault in that driver is
+contained (the §M33 supervisor restarts or quarantines it, the machine stays
+up); and the personality lives in its own repository on §M91's package
+pattern.
 
 ## §M74 — Swap and demand paging: reclaim as a policy, not a favour
 
