@@ -6278,6 +6278,30 @@ alternative — the NT personality as a GPL module, copying freely — makes
 every d-os distribution that includes it GPL in effect, and is a decision,
 not a default.
 
+### The recognizer: who says what can run (decided 2026-10-04)
+
+Each personality ships a RECOGNIZER beside its table and adapters — the
+`binfmt` pattern.  Given a file, it answers one of: *mine* (and how to start
+it), *not mine*, or *mine, but something is missing* — with the missing thing
+named.  It reads what is in the file: the format (ELF, PE), the machine, the
+loader (PT_INTERP: musl, glibc), the libraries / DLLs it needs, for NT the
+subsystem and target version.  The recognizers sit in one registry, so a new
+personality brings its own and `app install` (§M93) and exec learn about it
+without a change.
+
+Two lines of defence, stated so neither is mistaken for the other:
+1. **Can it START** — the recognizer, before install and at exec.  A refusal
+   names its reason; a missing dependency that is itself a package (the glibc
+   package, ReactOS's user mode for the NT personality) is named so the
+   installer can offer it.
+2. **Will every part WORK** — not knowable from the file: which calls a
+   program makes appears only when it runs.  An unhandled call is reported at
+   run time by name (today's "unhandled syscall" line, per personality).
+
+Completion condition added to stage 4: the recognizer registry exists and is
+the only place exec and `app install` ask; each personality package carries
+its recognizer.
+
 ### The adapters (where a table is not enough)
 
 §M50's rule 2 applies: a semantic mismatch is a NAMED adapter with its own
@@ -6438,6 +6462,19 @@ binaries do); a musl build runs (Adoptium publishes Alpine/musl JDK
 tarballs); a glibc-linked one needs a glibc package — an open decision of
 this milestone (ship one as a package, or refuse by name: "this program
 needs glibc").  The installer must tell the three apart before installing.
+**Decided 2026-10-04: a glibc PACKAGE beside musl**, not a refusal — the libc
+is per program (a static binary carries its own; a dynamic one names its
+loader, `ld-musl-*` or `ld-linux-*`), the kernel serves both through the same
+Linux personality, and the package declares its ABI as data (`pkg_recipe.abi`,
+the swappable-layers rule).  The work it brings is ABI breadth: glibc uses
+calls musl does not (`clone3`, `rseq`, `statx`, … ENOSYS today).
+
+**Who answers "can this run?" — the PERSONALITY, through a recognizer
+(decided 2026-10-04; shared with §M91).**  The installer and exec do not
+know formats or libcs: they ask the recognizer registry, and the answer
+names the personality or the reason — "runs on Linux", "needs the glibc
+package", "an NT program, the NT personality is not installed", "wrong
+architecture".  See §M91 "The recognizer".
 
 ### What exists today, said plainly
 
@@ -6471,9 +6508,10 @@ host preparing the disk.
 
 ### What has to be built for that
 
-- **The glibc question decided**: detect the interpreter / libc a release
-  needs (PT_INTERP, DT_NEEDED) and either satisfy it from a glibc package or
-  refuse by name — never install something that cannot start.
+- **A glibc package beside musl** (its loader and libraries, versioned), and
+  the Linux personality's breadth for what glibc calls; the recognizer
+  (§M91) reports a glibc program as "needs the glibc package" until it is
+  installed — never install something that cannot start.
 - `app install` accepting a plain `.tar.gz`/`.tgz` (a generic tar + gzip
   unpacker in ring 3 — `ociunpack` already has both halves), with the
   ARCHITECTURE checked from the binaries' ELF headers before anything is
