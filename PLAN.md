@@ -235,7 +235,7 @@ fixed first, whatever it touches.
 | §M90 | ◐ ~55-60 % (2026-10-04) | Docker itself on d-os (dockerd + containerd + runc + the CLI), no Docker Desktop — rungs 1-2 ✅ (`docker run … echo hi` prints `hi`, aarch64); next: cgroup limits + inotify, overlayfs, networking, `-it`/build, x86_64 — resume order in §M90 |
 | §M91 | — | the ABI as its own project: d-os, Linux and NT personalities over one common language (ReactOS's pattern) — designed, not started |
 | §M92 | — | a driver engine for d-os, Linux and Windows drivers — an OPEN QUESTION, recorded, not decided |
-| §M93 | — | installing software as a user — a guide (download → one command → run), and the unpacker / manifest / service registration it needs — recorded, not started |
+| §M93 | — | installing software as a user: DOWNLOAD from the vendor (`wget`) → `app install` → run, no OCI image required — the guide plus the `.tar.gz` install, glibc decision, manifest, service registration; **next after §M90**, before §M91/§M92 |
 | §M68 | — | investigation, not started |
 | §M83, §M84 | — | designed, not started |
 
@@ -6421,8 +6421,23 @@ have to do so that it installs.*  The deliverable is a USER-FACING GUIDE;
 the milestone is the guide plus whatever has to exist for every sentence in
 it to be true.
 
-**Status: recorded, not started.**  Relates to §M83 (packages from outside
-the image) and §M89 (`app install`).
+**Status: recorded, not started.  ORDER (decided 2026-10-04): right AFTER
+§M90 Docker; §M91 (ABI project) and §M92 (driver engine) come later.**
+Relates to §M83 (packages from outside the image) and §M89 (`app install`).
+
+**THE PRIMARY ROUTE IS A DIRECT DOWNLOAD, NOT AN OCI IMAGE — stated by the
+user as extremely important.**  The user goes to the vendor's site, downloads
+the official release (Docker's `docker-<ver>.tgz` static binaries, a JDK
+`.tar.gz` from Adoptium), and installs it: `wget <url>` → `app install
+<file>`.  No `docker save` on a host, no image registry in between.  OCI
+images stay accepted by `app install`, as a secondary form.
+
+**What a download can be, honestly:** most Linux binary releases are linked
+against GLIBC, and d-os ships musl.  A STATIC release runs (Docker's static
+binaries do); a musl build runs (Adoptium publishes Alpine/musl JDK
+tarballs); a glibc-linked one needs a glibc package — an open decision of
+this milestone (ship one as a package, or refuse by name: "this program
+needs glibc").  The installer must tell the three apart before installing.
 
 ### What exists today, said plainly
 
@@ -6456,6 +6471,9 @@ host preparing the disk.
 
 ### What has to be built for that
 
+- **The glibc question decided**: detect the interpreter / libc a release
+  needs (PT_INTERP, DT_NEEDED) and either satisfy it from a glibc package or
+  refuse by name — never install something that cannot start.
 - `app install` accepting a plain `.tar.gz`/`.tgz` (a generic tar + gzip
   unpacker in ring 3 — `ociunpack` already has both halves), with the
   ARCHITECTURE checked from the binaries' ELF headers before anything is
@@ -6473,8 +6491,9 @@ host preparing the disk.
 
 The guide exists (user-facing, in the repository's docs, and in Hungarian as
 well as English), and on a FRESH disk with network, following it word for
-word, a user installs and runs: the JDK (`java -version`), Docker from its
-official static release (`docker run busybox echo hi` after a `docker pull`),
+word, a user installs and runs — each DOWNLOADED from its vendor with
+`wget`, no OCI image: the JDK from Adoptium's tarball (`java -version`),
+Docker from its official static release (`docker run busybox echo hi` after a `docker pull`),
 updates one of them to a newer version and switches back — with no host-side
 script involved.
 

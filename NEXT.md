@@ -10,6 +10,11 @@ test recipe in PLAN.md §M90 "RESUME HERE":
 4. `docker run -it` (pty), `docker build`, volumes
 5. x86_64 after the higher-half kernel move
 
+**After §M90: §M93** — installing downloaded software: the user downloads the
+vendor's release with `wget` (NOT an OCI image — stated as extremely
+important) and runs `app install <file>`.  §M91 (ABI project) and §M92 (driver
+engine) come later.
+
 Recorded beside it, not scheduled: §M91 (the ABI as its own project, ReactOS
 pattern), §M92 (driver engine, open question) and §M93 (a user guide for
 installing downloaded software — Docker, Java — and the `.tar.gz` install,
