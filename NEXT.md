@@ -1,3 +1,18 @@
+# RESUME HERE (paused 2026-10-04, work continues next week)
+
+**§M90 Docker, ~55-60 %.**  `docker run --network host busybox:musl echo hi`
+prints `hi` on aarch64 (rungs 1-2 done).  Next, in order — details and the
+test recipe in PLAN.md §M90 "RESUME HERE":
+
+1. cgroup v2 limits enforced (`memory.max`, `cpu.max`, `pids.max`) + `inotify`
+2. overlayfs
+3. networking (net namespace, veth, bridge, NAT, `-p`)
+4. `docker run -it` (pty), `docker build`, volumes
+5. x86_64 after the higher-half kernel move
+
+Recorded beside it, not scheduled: §M91 (the ABI as its own project, ReactOS
+pattern) and §M92 (driver engine, open question).  Open defects: #14, #16 below.
+
 # Where things stand (2026-09-28)
 
 ## §M73 shipped — containers (DOCS §4.115)

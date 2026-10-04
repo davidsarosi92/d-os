@@ -232,7 +232,7 @@ fixed first, whatever it touches.
 | queued UI | ✅ done (§4.116) — Memory page, System information, translations 73 → 0 | — |
 | §M88 | ✅ (§4.118) | open: a taskbar per monitor |
 | §M89 | ◐ → core ✅ | Java: `java Hello.java` from the unmodified JDK on x86_64 + aarch64 (DOCS §4.119); open: `app install` end to end, host-side delivery, rung 5 measurements |
-| §M90 | — | Docker itself on d-os (dockerd + containerd + runc + the CLI), no Docker Desktop — asked for 2026-09-28, scoped below; AFTER §M89 and the open items (decided), planned for Thursday evening |
+| §M90 | ◐ ~55-60 % (2026-10-04) | Docker itself on d-os (dockerd + containerd + runc + the CLI), no Docker Desktop — rungs 1-2 ✅ (`docker run … echo hi` prints `hi`, aarch64); next: cgroup limits + inotify, overlayfs, networking, `-it`/build, x86_64 — resume order in §M90 |
 | §M91 | — | the ABI as its own project: d-os, Linux and NT personalities over one common language (ReactOS's pattern) — designed, not started |
 | §M92 | — | a driver engine for d-os, Linux and Windows drivers — an OPEN QUESTION, recorded, not decided |
 | §M68 | — | investigation, not started |
@@ -6105,10 +6105,32 @@ fixed-address Go binaries load at 0x200000, inside the low identity map):**
   Go looks (/etc/ssl/certs/ca-certificates.crt); /proc/self/status; and
   containerd's 40 MB exec from exFAT can exceed dockerd's 15 s start window
   (start containerd first and pass --containerd until exec is faster).
-- NEXT (rung 2's last step): `docker run --network host busybox echo hi` — an
-  image (pull through SLIRP or `docker load` of §M73's busybox tarball), then
-  runc's container setup: mount namespaces, bind mounts, pivot_root, /proc in
-  the container, `mknod`/`umount2`, the seccomp filter, capabilities.
+- Rung 2 DONE (2026-10-04): `docker run --network host busybox:musl echo hi`
+  prints `hi` on aarch64 — PID/UTS/IPC/cgroup/time/mount namespaces, binds and
+  filesystem mounts, pivot_root, runc's memfd exec, cgroup-device eBPF, Linux
+  capabilities, set*id, /proc/<pid>/stat, execve de_thread, half-close poll
+  (DOCS change log 2026-10-03/04).  Rung 3 is partly done with it: every
+  namespace runc asks for exists.
+- **STATE 2026-10-04, estimated ~55-60 % of the milestone** (by effort: rungs
+  1-2, the larger half, are done).  Work pauses until next week.
+- **RESUME HERE — in this order:**
+  1. Rung 3's rest: cgroup v2 LIMITS ENFORCED (`memory.max`, `cpu.max`,
+     `pids.max` — stored today, not enforced), and `inotify` (containerd's
+     OOM-event watch and dockerd's CDI watcher fail without it — warnings
+     today, needed with memory limits).
+  2. Rung 4: overlayfs (today `--storage-driver=vfs`).
+  3. Rung 5: networking — network namespace, veth, bridge, NAT; `-p 8080:80`.
+  4. Rung 6: `docker run -it` (pty/devpts), `docker build`, volumes.
+  5. x86_64: waits for the higher-half kernel move.
+  Open beside it: NEXT.md #14 (rare pthread_join hang) and #16 (a non-leader
+  thread's execve keeps its pid); `noexec` accepted, not enforced.
+- Test recipe (aarch64, ~15 min a run): `scripts/dos-shell-test.py --arch
+  aarch64 --smp 2 --mem 3G --disk build/aarch64/dk.img --via serial
+  --boot-timeout 240 --between 45` with `mkdir /run`, `containerd &`,
+  `dockerd --containerd=/run/containerd/containerd.sock --storage-driver=vfs
+  --iptables=false --bridge=none --ip6tables=false &`, `docker version`,
+  `docker load -i /mnt/busybox.tar`, `docker run --network host busybox:musl
+  echo hi`; `strace err name <task>` to see a failing step.
 - Open, noted for later: containerd-shim daemonizes (fork, parent exits) — a
   Linux-personality child must then outlive its parent (today the kill-tree
   rule ends it); TASK_MAX_FDS is 32; dockerd allows containerd 15 s to start
