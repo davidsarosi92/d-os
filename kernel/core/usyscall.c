@@ -1403,9 +1403,18 @@ uint32_t fd_readiness_of(int fd, struct ofile* o) {
          * HUP made it look ready forever, and Go's netpoller — woken by every
          * readiness event — retried accept() in a loop that never slept
          * (dockerd serving its API socket at full CPU). */
-        if (!usock_peer_open(o->sock) && !usock_is_listener(o->sock)) {
-            r |= POLLRDHUP;
-            if (!usock_can_read(o->sock)) r |= POLLHUP;
+        /* §M90 — a HALF-closed connection (shutdown: the peer shut its write
+         * half) is RDHUP and readable (a read returns EOF), never HUP: HUP
+         * says the connection is gone, and Go's netpoller then fails the
+         * writes too — dockerd closed `docker run`'s attach stream the moment
+         * the client shut its stdin half, before the container's output. */
+        if (!usock_is_listener(o->sock)) {
+            int h = usock_hangup(o->sock);
+            if (h == 1) r |= POLLRDHUP | POLLIN;
+            if (h == 2) {
+                r |= POLLRDHUP;
+                if (!usock_can_read(o->sock)) r |= POLLHUP;
+            }
         }
         break;
     /* §M53 stage 3 — a timerfd is readable exactly while it has uncollected

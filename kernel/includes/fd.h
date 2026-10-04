@@ -205,6 +205,7 @@ int  usock_can_read (struct usock* s);   /* bytes buffered? (poll POLLIN)  */
 int  usock_can_write(struct usock* s);   /* peer open + space? (POLLOUT)   */
 int  usock_peer_open (struct usock* s);  /* other end still there? (§M56.1)  */
 int  usock_shutdown  (struct usock* s, int how);   /* §M90 — 0 / -107 ENOTCONN */
+int  usock_hangup    (struct usock* s);            /* §M90 — 0 open, 1 read half, 2 hung up */
 /* §M90 — SO_PEERCRED: the peer recorded at connect; -1 if never connected. */
 int  usock_peercred(struct usock* s, int* pid, int* uid, int* gid);
 /* §M90 — SOCK_SEQPACKET (message boundaries kept) on a fresh pair. */

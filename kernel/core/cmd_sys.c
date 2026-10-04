@@ -1259,6 +1259,34 @@ static void sy_seqpackettest(const char* args) {
     int ok = s1 == 2 && s2 == 3 && m1 && m2 && s3 == 5 && m3 && r4 == 0;
     console_write(ok ? "seqpacket: ok\n" : "seqpacket: FAIL\n");
 }
+/* §M90 — `shutdowntest`: shutdown(2) on a unix socket pair.  After a's
+ * SHUT_WR: b reads what was already sent, then EOF; b's hangup state is the
+ * HALF one (RDHUP, never HUP — `docker run` lost its output when poll said
+ * HUP here); b can still send and a still reads it; a's own send is refused.
+ * Then b closes, and a is fully hung up. */
+static void sy_shutdowntest(const char* args) {
+    (void)args;
+    struct usock *a = NULL, *b = NULL;
+    if (usock_pair(&a, &b) != 0) { console_write("shutdown: FAIL (pair)\n"); return; }
+    char r[16];
+    long s1 = usock_send(a, "xy", 2, NULL);
+    int e1 = usock_shutdown(a, 1);
+    int h1 = usock_hangup(b), ha = usock_hangup(a);
+    long r1 = usock_recv(b, r, sizeof r, 0, NULL);          /* the data first   */
+    long r2 = usock_recv(b, r, sizeof r, 0, NULL);          /* then EOF (0)     */
+    long s2 = usock_send(b, "z", 1, NULL);                   /* other half works */
+    long r3 = usock_recv(a, r, sizeof r, 0, NULL);
+    long s3 = usock_send(a, "q", 1, NULL);                   /* refused: -1      */
+    usock_close(b);
+    int h2 = usock_hangup(a);
+    usock_close(a);
+    kprintf("shutdown: send %d shut %d, hangup b=%d a=%d, recv %d then %d; back %d/%d; "
+            "after-shut send %d; after close %d (want 2 0, 1 0, 2 0; 1/1; -1; 2)\n",
+            (int)s1, e1, h1, ha, (int)r1, (int)r2, (int)s2, (int)r3, (int)s3, h2);
+    int ok = s1 == 2 && e1 == 0 && h1 == 1 && ha == 0 && r1 == 2 && r2 == 0 &&
+             s2 == 1 && r3 == 1 && s3 == -1 && h2 == 2;
+    console_write(ok ? "shutdown: ok\n" : "shutdown: FAIL\n");
+}
 /* §M90 — `memfdtest`: a memfd behaves as a FILE.  Write 10 000 bytes (three
  * pages, so a frame boundary is crossed twice), seek back and read them
  * whole, fstat reports the size, a shrink moves the end and zeroes what it
@@ -1579,6 +1607,8 @@ SHELL_CMD(nstest) = { "nstest", "", "UTS/IPC/cgroup/time namespaces, handles, se
                        SHELL_G_TEST, sy_nstest, SHELL_P_ANY };
 SHELL_CMD(seqpackettest) = { "seqpackettest", "", "SOCK_SEQPACKET keeps message boundaries",
                               SHELL_G_TEST, sy_seqpackettest, SHELL_P_ANY };
+SHELL_CMD(shutdowntest) = { "shutdowntest", "", "shutdown(2) halves on a unix socket pair",
+                             SHELL_G_TEST, sy_shutdowntest, SHELL_P_ANY };
 SHELL_CMD(memfdtest) = { "memfdtest", "", "a memfd as a file: read/write/seek/truncate/seals",
                           SHELL_G_TEST, sy_memfdtest, SHELL_P_ANY };
 SHELL_CMD(pidnstest) = { "pidnstest", "", "pid namespaces: numbers, visibility, init, orphans",

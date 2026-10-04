@@ -286,6 +286,15 @@ int usock_can_write(struct usock* s) {
  * the close — collapsing the two would discard the tail of every conversation
  * whose writer closed promptly, which is most of them. */
 int usock_peer_open(struct usock* s) { return s && s->peer != NULL && !s->eof; }
+/* §M90 — the hangup state for poll, as Linux's unix_poll reports it: 0 =
+ * open; 1 = nothing more will ARRIVE (the peer shut its write half, or this
+ * end its read half) while the connection still exists — RDHUP, not HUP; 2 =
+ * fully hung up (the peer closed, or both halves are shut) — HUP. */
+int usock_hangup(struct usock* s) {
+    if (!s) return 2;
+    if (!s->peer || (s->eof && s->wr_shut)) return 2;
+    return s->eof ? 1 : 0;
+}
 
 /* §M90 — shutdown(2) on a connected endpoint: how 0 = SHUT_RD, 1 = SHUT_WR,
  * 2 = both.  0, or -107 ENOTCONN when there is no connection to shut. */
