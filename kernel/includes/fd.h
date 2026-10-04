@@ -28,13 +28,15 @@ struct usock;                   /* unix socket endpoint (stage 5)          */
  * dup of an empty std slot yields an FD_CONSOLE ofile, which reads and writes
  * exactly as the empty slot would. */
 enum fd_kind { FD_VFS, FD_SHM, FD_SOCK, FD_NETSOCK, FD_TIMER, FD_EPOLL, FD_CONSOLE, FD_EVENT,
-               FD_NETLINK /* §M90 */, FD_FIFO /* §M90 — a named pipe end, fifo.c */ };
+               FD_NETLINK /* §M90 */, FD_FIFO /* §M90 — a named pipe end, fifo.c */,
+               FD_BPF /* §M90 — an eBPF program, bpf.c */ };
 
 struct netsock;                 /* network (AF_INET) socket — usyscall.c        */
 struct timerfd;                 /* §M53 stage 3 — a deadline behind a descriptor */
 struct epoll;                   /* §M56 — a readiness set behind a descriptor   */
 struct eventfd;                 /* §M90 — a counter behind a descriptor         */
 struct nlsock;                  /* §M90 — a netlink socket (netlink.c)          */
+struct bpf_prog;                /* §M90 — an eBPF program (bpf.c)               */
 struct ofile;
 /* §M73 — the ofile to duplicate for `fd`: its table entry, or for an empty
  * std slot a NEW console ofile (*fresh set: the caller owns that reference). */
@@ -70,7 +72,12 @@ struct ofile {
     /* §M90 — APPENDED.  FD_SHM: the file position for read/write/lseek (a
      * memfd is read and written like a file — runc copies its binary into one). */
     uint64_t       shm_pos;
+    /* §M90 — APPENDED.  FD_BPF: the loaded program (bpf.c), one reference. */
+    struct bpf_prog* bpf;
 };
+struct ofile* ofile_from_bpf(struct bpf_prog* p);   /* §M90 — takes a reference */
+/* §M90 — install `o` in the caller's lowest free slot (>= 3); the fd or -1. */
+int fd_install_k(struct ofile* o);
 
 /* Wrap a resource in a fresh ofile (refcount 1), or NULL on OOM. */
 struct ofile* ofile_from_file(struct file* f);
@@ -197,6 +204,7 @@ void usock_set_owner(struct usock* s, struct ofile* o);
 int  usock_can_read (struct usock* s);   /* bytes buffered? (poll POLLIN)  */
 int  usock_can_write(struct usock* s);   /* peer open + space? (POLLOUT)   */
 int  usock_peer_open (struct usock* s);  /* other end still there? (§M56.1)  */
+int  usock_shutdown  (struct usock* s, int how);   /* §M90 — 0 / -107 ENOTCONN */
 /* §M90 — SO_PEERCRED: the peer recorded at connect; -1 if never connected. */
 int  usock_peercred(struct usock* s, int* pid, int* uid, int* gid);
 /* §M90 — SOCK_SEQPACKET (message boundaries kept) on a fresh pair. */

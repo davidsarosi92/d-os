@@ -27,6 +27,7 @@
 
 #include "lnx_signal.h"   /* §M89 */
 #include "proc.h"
+#include "nsproxy.h"   /* §M90 */
 #include "task.h"
 #include "vmm.h"
 #include "usermode.h"
@@ -174,6 +175,7 @@ int proc_clone_thread(struct user_regs* parent_regs, uintptr_t child_stack,
                       uintptr_t tls, int* ctid_kaddr) {
     struct task* parent = task_current();
     if (!parent || !parent->mm || !child_stack) return -1;
+    if (!ns_pid_thread_ok(parent)) return -1;   /* §M90 — after unshare(NEWPID) */
     struct thread_boot* b = (struct thread_boot*)kmalloc(sizeof *b);
     if (!b) return -1;
     b->space   = parent->mm;
@@ -200,6 +202,10 @@ int proc_clone_thread(struct user_regs* parent_regs, uintptr_t child_stack,
      * reap_owned, and every JVM thread stayed a DEAD zombie).  A native
      * in-tree-libc thread is joined with waitpid and stays owned. */
     task_set_reap_owned(child, parent->linux_abi ? 0 : 1);
+    int vtid = ns_vnr(parent, child);
     task_release(child);
-    return child->pid;
+    /* §M90 — the tid AS THE CALLER SEES IT (its pid namespace): what clone
+     * returns and what PARENT_/CHILD_SETTID store — a C library keeps that
+     * number and later aims tgkill at it (glibc's set*id broadcast). */
+    return vtid;
 }

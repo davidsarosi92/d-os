@@ -70,6 +70,10 @@ struct devfs_node {
     struct devfs_node* _next;
 };
 
+/* §M90 — Linux major:minor of a devfs inode (devfs.c); 1 char, 0 block, -1 not ours. */
+struct inode;
+int devfs_devnum(struct inode* in, uint32_t* major, uint32_t* minor);
+
 /* Register a node.  If devfs_init has already cached the /dev dentry, the
  * node is attached immediately; otherwise it queues until devfs_init
  * flushes the queue. */

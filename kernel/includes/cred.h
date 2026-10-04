@@ -180,7 +180,48 @@ struct cred {
      * kcalloc'd kernel tasks) means the conventional 022 rather than 000.
      * Inherited with the rest of the identity; read via umask(2). */
     int umask_plus1;
+    /* §M90 — APPENDED.  LINUX CAPABILITIES, as a privileged identity's SUBSET.
+     *
+     * Privilege here is the identity (cred_is_admin: root, the admin group, or
+     * a system task); capabilities are what such an identity has GIVEN UP —
+     * which is how a container runtime uses them (runc drops everything but a
+     * short list before it runs the container's program).  So the sets are
+     * stored as what was DROPPED, and a zeroed cred (kcalloc, every positional
+     * initialiser) is the full set: nothing that predates this changes.
+     *   cap_eff_drop / cap_prm_drop   effective / permitted, dropped bits
+     *   cap_bnd_drop                  the bounding set, dropped bits
+     *   cap_inh / cap_amb             inheritable / ambient, as HELD (empty by
+     *                                 default, as on Linux)
+     * A non-privileged identity has no capabilities at all (cred_cap_*).
+     * ENFORCED where a call's Linux capability is named (cred_capable); every
+     * other privileged path still asks cred_is_admin — said in DOCS §M90. */
+    uint64_t cap_eff_drop, cap_prm_drop, cap_bnd_drop, cap_inh, cap_amb;
+    int      cap_keep;                 /* PR_SET_KEEPCAPS                       */
+    int      no_new_privs;             /* PR_SET_NO_NEW_PRIVS: one way, inherited */
+    /* §M90 — APPENDED.  setgroups(2) has set groups[] (possibly to nothing):
+     * getgroups answers that list exactly instead of the primary group. */
+    int      groups_explicit;
 };
+
+/* §M90 — Linux capability numbers used by name, and the last one this kernel
+ * reports (/proc/sys/kernel/cap_last_cap): CAP_CHECKPOINT_RESTORE = 40. */
+#define CAP_CHOWN_         0
+#define CAP_SETGID_        6
+#define CAP_SETUID_        7
+#define CAP_SETPCAP_       8
+#define CAP_SYS_CHROOT_    18
+#define CAP_SYS_ADMIN_     21
+#define CAP_MKNOD_         27
+#define CAP_LAST_CAP_      40
+#define CAP_FULL_SET_      ((1ull << (CAP_LAST_CAP_ + 1)) - 1)
+uint64_t cred_cap_effective(const struct cred* c);
+uint64_t cred_cap_permitted(const struct cred* c);
+uint64_t cred_cap_bounding(const struct cred* c);
+/* Privileged AND the capability not dropped from the effective set. */
+int  cred_capable(const struct cred* c, int cap);
+/* execve's capability transformation (Linux's, for a privileged identity:
+ * permitted = inheritable | bounding, effective = permitted, ambient kept). */
+void cred_exec_caps(struct cred* c);
 
 /* The uid this identity really has: CRED_UID_NONE for anything that is not a
  * USER, whatever the raw field holds.  Every reader uses this. */

@@ -193,6 +193,12 @@ enum abi_op {
     ABI_SETHOSTNAME, ABI_SETDOMAINNAME,                /* §M90 — UTS namespaces */
     ABI_SOCKETPAIR,                                    /* §M90 */
     ABI_EXECVEAT,                                      /* §M90 */
+    ABI_BPF,                                           /* §M90 — cgroup device programs */
+    ABI_FCHDIR,                                        /* §M90 */
+    ABI_CAPGET,                                        /* §M90 — capabilities */
+    ABI_CAPSET,                                        /* §M90 */
+    ABI_SETGROUPS, ABI_SETRESUID, ABI_SETRESGID,       /* §M90 */
+    ABI_GETRESUID, ABI_GETRESGID, ABI_SETREUID, ABI_SETREGID,
     ABI_RMDIR,              /* §M90 */  /* §M90 — lchown maps to ABI_CHOWN: no per-call
                                * link handling, see h_fchownat */
     /* §M73 — identity.  The answer is the task's §M32 credential: a container
@@ -294,6 +300,7 @@ struct abi_stat_layout {
     uint8_t mode, nlink, nlink_w, uid, gid;
     uint8_t size, blksize, blksize_w, blocks;
     uint8_t atime, mtime, ctime, time_w;    /* seconds fields                   */
+    uint8_t rdev;                           /* §M90 — APPENDED: st_rdev, 8 bytes */
 };
 
 struct abi_map {

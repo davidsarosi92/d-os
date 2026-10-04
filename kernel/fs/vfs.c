@@ -410,7 +410,7 @@ int  task_proc_resolve(long nr) { return (int)nr; }
  * under a foreign pid — better ENOENT than the caller's data under another
  * process's name. */
 static int proc_foreign_ok(const char* rest) {
-    static const char* const ok[] = { "oom_score_adj", "oom_score", "status", "cgroup", "exe", "fd" };
+    static const char* const ok[] = { "oom_score_adj", "oom_score", "status", "stat", "cgroup", "exe", "fd" };
     for (unsigned i = 0; i < sizeof ok / sizeof ok[0]; i++) {
         const char* a = ok[i]; const char* b = rest;
         while (*a && *a == *b) { a++; b++; }
@@ -445,7 +445,23 @@ static int vfs_proc_alias(const char* c, char* out, size_t cap) {
         else {
             long pid = 0; size_t d = 0;
             while (c[k] >= '0' && c[k] <= '9') { pid = pid * 10 + (c[k] - '0'); k++; d++; }
-            if (!d || c[k] != '/') return 0;
+            if (!d) return 0;
+            /* §M90 — /proc/<pid> ITSELF: the process's directory, answered
+             * by /proc/self (for another process, with it as the target —
+             * vfs_open keeps "/proc/<pid>" as the file's path, so a name
+             * opened relative to that descriptor targets the same process). */
+            if (c[k] == 0) {
+                int g = task_proc_resolve(pid);
+                if (g <= 0 || !task_tgid_alive(g)) return 0;
+                if (g == task_tgid_current()) task_set_proc_target(0);
+                else task_set_proc_target(g);
+                const char* sp = "/proc/self";
+                size_t o = 0;
+                for (; sp[o] && o + 1 < cap; o++) out[o] = sp[o];
+                out[o] = 0;
+                return 1;
+            }
+            if (c[k] != '/') return 0;
             k++;
             int g = task_proc_resolve(pid);       /* §M90 — in the caller's pid namespace */
             if (g <= 0) return 0;                  /* nobody by that number here: ENOENT */
@@ -878,6 +894,31 @@ int vfs_mount(const char* fs_name, const char* path, const char* dev_name) {
 static int vfs_realpath_unlocked(const char* path, char* out, size_t cap);
 static int ro_path(const char* path);
 static int g_open_err;                        /* §M90 — why vfs_open_unlocked said NULL */
+/* §M90 — /proc/self/fd/N (or /proc/thread-self/fd/N, or /proc/<pid>/fd/N)
+ * EXACTLY — no component after N: the descriptor's own dentry.  The magic
+ * link is normally resolved by rewriting it to the file's PATH (vfs_fd_magic),
+ * but a file outside the caller's root has no path the caller can name — and
+ * on Linux the link names the OBJECT, not a path, so it opens anyway.  runc's
+ * container init reopens its exec fifo this way from inside the container
+ * while the fifo lives in runc's state directory on the host.  NULL if the
+ * path is not such a link or the descriptor is not a file. */
+static struct dentry* magic_fd_dentry(const char* path) {
+    char b[256], a[256];
+    const char* c = vfs_canon_plain(path, b, sizeof b);
+    if (!c) return NULL;
+    if (vfs_proc_alias(c, a, sizeof a)) c = a;
+    static const char* const pre[2] = { "/proc/self/fd/", "/proc/thread-self/fd/" };
+    for (int w = 0; w < 2; w++) {
+        size_t i = 0;
+        while (pre[w][i] && c[i] == pre[w][i]) i++;
+        if (pre[w][i]) continue;
+        int fd = 0, digits = 0;
+        while (c[i] >= '0' && c[i] <= '9') { fd = fd * 10 + (c[i++] - '0'); digits++; }
+        if (!digits || c[i]) return NULL;
+        return fd_vfs_dentry(fd);
+    }
+    return NULL;
+}
 static struct file* vfs_open_unlocked(const char* path, int flags) {
     struct dentry*  parent;
     const char*     last;
@@ -889,6 +930,11 @@ static struct file* vfs_open_unlocked(const char* path, int flags) {
     g_bind_crossed = 0;
     struct dentry*  d = resolve_path_ex(path, &parent, &last, !(flags & VFS_NOFOLLOW));
     int crossed = g_bind_crossed;
+    /* §M90 — a magic link to a file the caller cannot name (magic_fd_dentry) */
+    if (!d && !(flags & VFS_NOFOLLOW)) {
+        d = magic_fd_dentry(path);
+        if (d) crossed = 0;
+    }
 
     if (!d) {
         if ((flags & VFS_CREATE) == 0) return NULL;
@@ -947,6 +993,25 @@ static struct file* vfs_open_unlocked(const char* path, int flags) {
     f->flags  = flags;
     f->pos    = 0;
     f->magic  = VFS_FILE_MAGIC;
+    /* §M90 — /proc/<pid>: the directory is /proc/self answering for that
+     * process; the file keeps the NUMBERED path, so *at calls relative to it
+     * (runc reads "stat" through a /proc/<pid> handle) name the same process. */
+    {
+        char pb[256];
+        const char* pc = vfs_canon_plain(path, pb, sizeof pb);
+        size_t q = 0;
+        const char* pp = "/proc/";
+        while (pc && pp[q] && pc[q] == pp[q]) q++;
+        if (pc && !pp[q] && pc[q] >= '0' && pc[q] <= '9') {
+            size_t r = q;
+            while (pc[r] >= '0' && pc[r] <= '9') r++;
+            if (!pc[r]) {
+                f->vpath = (char*)kmalloc(r + 1);
+                if (f->vpath) for (size_t i = 0; i <= r; i++) f->vpath[i] = pc[i];
+                crossed = 0;
+            }
+        }
+    }
     /* §M90 — reached through a bind: remember the path it was opened BY (the
      * resolved one, links expanded) — where it is in this mount namespace;
      * the dentry's own path is the bind's SOURCE. */
@@ -1487,9 +1552,13 @@ int vfs_rename_replace(const char* oldpath, const char* newpath) {
  * cred.cwd spells it.  -1 when it does not fit, or when the dentry is outside
  * the task's root (a descriptor carried into a container must not name what
  * lies above the container's "/"). */
+static int dentry_path_from(struct dentry* d, struct dentry* top, char* out, size_t cap);
 static int vfs_dentry_path_unlocked(struct dentry* d, char* out, size_t cap) {
     struct dentry* top = cred_fs_root();
     if (!top) top = root;
+    return dentry_path_from(d, top, out, cap);
+}
+static int dentry_path_from(struct dentry* d, struct dentry* top, char* out, size_t cap) {
     const char* parts[48];
     int np = 0;
     while (d && d != top) {
@@ -1511,6 +1580,14 @@ static int vfs_dentry_path_unlocked(struct dentry* d, char* out, size_t cap) {
 int vfs_dentry_path(struct dentry* d, char* out, size_t cap) {
     if (!d || !out || cap < 2) return -1;
     return NS_LOCKED(int, vfs_dentry_path_unlocked(d, out, cap));
+}
+/* §M90 — the dentry's path from the GLOBAL root, whatever the calling task's
+ * root is: for questions about WHAT a node is (which filesystem it lives on),
+ * never for naming it to the task — inside a container that would leak the
+ * host's layout.  "" for the global root. */
+int vfs_dentry_path_global(struct dentry* d, char* out, size_t cap) {
+    if (!d || !out || cap < 2) return -1;
+    return NS_LOCKED(int, dentry_path_from(d, root, out, cap));
 }
 
 int vfs_copy(const char* src, const char* dst) {

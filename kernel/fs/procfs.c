@@ -77,6 +77,11 @@ void pw_put_uint(struct procfs_writer* w, unsigned int v) {
     while (n--) pw_putc(w, buf[n]);
 }
 
+/* §M90 — 16 hex digits, as /proc/<pid>/status prints a capability set. */
+static void pw_put_hex64(struct procfs_writer* w, uint64_t v) {
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 15; i >= 0; i--) pw_putc(w, hex[(v >> (4 * i)) & 0xF]);
+}
 void pw_put_hex(struct procfs_writer* w, unsigned int v, int min_digits) {
     static const char hex[] = "0123456789abcdef";
     char buf[16];
@@ -239,8 +244,15 @@ static struct dentry*      proc_dir     = NULL;
  * would have taught a reader a private convention for no reason.  One level is
  * all that is offered — anything deeper wants a real tree, and there is
  * nothing yet that needs one. */
+/* §M90 — a directory `name` (n bytes) under `under` (any depth: /proc/sys/
+ * kernel needs two levels), made on first use. */
+static struct dentry* proc_subdir_in(struct dentry* under, const char* name, size_t n);
 static struct dentry* proc_subdir(const char* name, size_t n) {
-    for (struct dentry* d = proc_dir ? proc_dir->children : NULL; d; d = d->sibling) {
+    return proc_subdir_in(proc_dir, name, n);
+}
+static struct dentry* proc_subdir_in(struct dentry* under, const char* name, size_t n) {
+    if (!under) return NULL;
+    for (struct dentry* d = under->children; d; d = d->sibling) {
         size_t i = 0;
         while (i < n && d->name[i] && d->name[i] == name[i]) i++;
         if (i == n && d->name[i] == '\0') return d;
@@ -259,7 +271,7 @@ static struct dentry* proc_subdir(const char* name, size_t n) {
     size_t i = 0;
     for (; i < n && i < sizeof buf - 1; i++) buf[i] = name[i];
     buf[i] = '\0';
-    struct dentry* d = vfs_attach_child(proc_dir, buf, ino);
+    struct dentry* d = vfs_attach_child(under, buf, ino);
     if (!d) { kfree(ino); return NULL; }
     return d;
 }
@@ -267,11 +279,11 @@ static struct dentry* proc_subdir(const char* name, size_t n) {
 static int attach_node(struct procfs_node* node) {
     struct dentry* parent = proc_dir;
     const char* leaf = node->name;
-    for (const char* p = node->name; *p; p++) {
+    /* every "a/" before the leaf is a directory, made on first use */
+    for (const char* p = node->name; *p && parent; p++) {
         if (*p == '/') {
-            parent = proc_subdir(node->name, (size_t)(p - node->name));
+            parent = proc_subdir_in(parent, leaf, (size_t)(p - leaf));
             leaf   = p + 1;
-            break;
         }
     }
     if (!parent || !*leaf) return -3;
@@ -567,6 +579,13 @@ static void gen_kmsg(struct procfs_writer* w) {
 /* ---------------------------------------------------------------------- */
 
 static struct procfs_node nd_version = { .name = "version", .gen = gen_version };
+/* §M90 — /proc/sys: the few kernel parameters Linux programs read.  Values
+ * that are FACTS here, not tunables (writes are refused by procfs as for any
+ * node without a write hook):
+ *   kernel/cap_last_cap   the highest capability number this kernel knows
+ *                         (cred.h) — runc and libcap size their sets by it */
+static void gen_cap_last_cap(struct procfs_writer* w) { pw_put_uint(w, CAP_LAST_CAP_); pw_putc(w, '\n'); }
+static struct procfs_node nd_cap_last_cap = { .name = "sys/kernel/cap_last_cap", .gen = gen_cap_last_cap };
 static struct procfs_node nd_uptime  = { .name = "uptime",  .gen = gen_uptime  };
 static struct procfs_node nd_meminfo = { .name = "meminfo", .gen = gen_meminfo };
 
@@ -683,16 +702,66 @@ static void gen_selfstatus(struct procfs_writer* w) {
     pw_puts(w, "\nPid:\t"); pw_put_uint(w, (unsigned)ns_vnr(rd, t));
     pw_puts(w, "\nPPid:\t"); pw_put_uint(w, (unsigned)(par ? ns_vnr(rd, par) : 0));
     pw_puts(w, "\nUid:\t"); for (int i = 0; i < 4; i++) { pw_put_uint(w, (unsigned)uid); pw_putc(w, i < 3 ? '\t' : '\n'); }
-    pw_puts(w, "Gid:\t"); for (int i = 0; i < 4; i++) { pw_put_uint(w, (unsigned)uid); pw_putc(w, i < 3 ? '\t' : '\n'); }
+    int gid = cred_gid(&t->cred);            /* §M90 — it printed the uid here */
+    if (gid < 0) gid = 0;
+    pw_puts(w, "Gid:\t"); for (int i = 0; i < 4; i++) { pw_put_uint(w, (unsigned)gid); pw_putc(w, i < 3 ? '\t' : '\n'); }
     pw_puts(w, "Groups:\t\nVmRSS:\t"); pw_put_uint(w, (unsigned)(priv / 1024)); pw_puts(w, " kB\n");
     pw_puts(w, "Threads:\t"); pw_put_uint(w, (unsigned)c.threads);
-    const char* caps = admin ? "000001ffffffffff" : "0000000000000000";
-    pw_puts(w, "\nCapInh:\t0000000000000000\nCapPrm:\t"); pw_puts(w, caps);
-    pw_puts(w, "\nCapEff:\t"); pw_puts(w, caps);
-    pw_puts(w, "\nCapBnd:\t"); pw_puts(w, caps);
-    pw_puts(w, "\nCapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\nSeccomp_filters:\t0\n");
+    /* §M90 — the capability sets as the credential holds them (cred.h) */
+    (void)admin;
+    pw_puts(w, "\nCapInh:\t"); pw_put_hex64(w, t->cred.cap_inh);
+    pw_puts(w, "\nCapPrm:\t"); pw_put_hex64(w, cred_cap_permitted(&t->cred));
+    pw_puts(w, "\nCapEff:\t"); pw_put_hex64(w, cred_cap_effective(&t->cred));
+    pw_puts(w, "\nCapBnd:\t"); pw_put_hex64(w, cred_cap_bounding(&t->cred));
+    pw_puts(w, "\nCapAmb:\t"); pw_put_hex64(w, t->cred.cap_amb);
+    pw_puts(w, "\nNoNewPrivs:\t"); pw_put_uint(w, t->cred.no_new_privs ? 1u : 0u);
+    pw_puts(w, "\nSeccomp:\t0\nSeccomp_filters:\t0\n");
 }
 static struct procfs_node nd_selfstatus = { .name = "self/status", .gen = gen_selfstatus };
+
+/* §M90 — /proc/<pid>/stat, Linux's one-line format: pid (comm) state, then
+ * fifty numbers.  What a reader acts on is real — state, the parent, group
+ * and session (in the READER's pid namespace), user time, the thread count,
+ * and starttime (clock ticks of 1/100 s since boot), which runc compares
+ * against what it recorded at create to know the pid is still its process.
+ * Fields this kernel does not keep (fault counts, signal masks, addresses)
+ * are 0, as Linux shows them to a reader without access. */
+static int st_vnr_of(struct task* rd, int gpid) {
+    struct task* x = gpid > 0 ? task_find(gpid) : NULL;
+    return x ? ns_vnr(rd, x) : 0;
+}
+static void gen_selfstat(struct procfs_writer* w) {
+    struct task* t = procfs_target();
+    if (!t) return;
+    struct task* rd = task_current();
+    struct task* lead = (t->tgid && t->tgid != t->pid) ? task_find(t->tgid) : t;
+    if (!lead) lead = t;
+    struct st_count c = { task_tgid(t), 0 };
+    task_for_each(st_count_fn, &c);
+    char st = lead->state == TASK_DEAD ? 'Z' : lead->state == TASK_STOPPED ? 'T'
+            : lead->state == TASK_SLEEPING ? 'S' : 'R';
+    pw_put_uint(w, (unsigned)ns_vnr(rd, lead));
+    pw_puts(w, " ("); pw_puts(w, lead->name); pw_puts(w, ") ");
+    pw_putc(w, st);
+    unsigned long long v[50];
+    for (int i = 0; i < 50; i++) v[i] = 0;
+    v[0]  = (unsigned)st_vnr_of(rd, lead->ppid);       /* ppid      */
+    v[1]  = (unsigned)st_vnr_of(rd, lead->pgid);       /* pgrp      */
+    v[2]  = (unsigned)st_vnr_of(rd, lead->sid);        /* session   */
+    v[11] = lead->cpu_ms / 10;                         /* utime     */
+    v[15] = 20;                                        /* priority  */
+    v[17] = (unsigned)c.threads;                       /* threads   */
+    v[19] = lead->start_ms / 10;                       /* starttime */
+    for (int i = 0; i < 50; i++) {
+        pw_putc(w, ' ');
+        unsigned long long x = v[i];
+        char b[24]; int n = 0;
+        do { b[n++] = (char)('0' + (int)(x % 10)); x /= 10; } while (x);
+        while (n) pw_putc(w, b[--n]);
+    }
+    pw_putc(w, '\n');
+}
+static struct procfs_node nd_selfstat = { .name = "self/stat", .gen = gen_selfstat };
 
 /* §M90 — /proc/<pid>/oom_score_adj (-1000..1000, read and written by
  * containerd, its shim and runc) and oom_score (what an OOM killer would rank
@@ -874,11 +943,13 @@ void procfs_init(void) {
 
     attach_node(&nd_version);
     attach_node(&nd_uptime);
+    attach_node(&nd_cap_last_cap);                 /* §M90 */
     attach_node(&nd_meminfo);
     attach_node(&nd_cpuinfo);
     attach_node(&nd_mountinfo);
     attach_node(&nd_selfcgroup);
     attach_node(&nd_selfstatus);
+    attach_node(&nd_selfstat);                     /* §M90 */
     attach_node(&nd_oomadj);
     attach_node(&nd_oomscore);
     attach_node(&nd_timens);

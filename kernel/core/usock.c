@@ -83,6 +83,13 @@ struct usock {
     int           seqpacket;
     int           is_pipe;           /* §M90 — made by pipe(): reads as "pipe:[n]" */
     uint32_t      pipe_id;           /* §M90 — one number for both ends of a pipe */
+    /* §M90 — shutdown(2).  `eof`: no more data will ARRIVE in this endpoint's
+     * ring (its own SHUT_RD, or the peer's SHUT_WR) — a reader drains what is
+     * there and then sees end of file, as after a close.  `wr_shut`: this
+     * end will not SEND any more (EPIPE).  runc closes the write half of its
+     * sync socket to tell the other side that nothing more is coming. */
+    int           eof;
+    int           wr_shut;
 };
 #define SEQ_HDR 4
 
@@ -127,7 +134,7 @@ int usock_pair(struct usock** a, struct usock** b) {
  * the PEER's read wait-queue lock so a blocked recv(peer) sees the data and
  * cannot miss the wakeup. */
 long usock_send(struct usock* s, const void* buf, size_t n, struct ofile* passfile) {
-    if (!s || !s->peer) return -1;
+    if (!s || !s->peer || s->wr_shut || s->peer->eof) return -1;
     struct usock* p = s->peer;
 
     uint32_t f = waitq_lock(&p->readers);
@@ -174,7 +181,7 @@ long usock_send(struct usock* s, const void* buf, size_t n, struct ofile* passfi
  * socket, and "check the space, then write" as two steps lets the other fill
  * the gap in between. */
 long usock_send_whole(struct usock* s, const void* buf, size_t n, struct ofile* passfile) {
-    if (!s || !s->peer) return -1;
+    if (!s || !s->peer || s->wr_shut || s->peer->eof) return -1;
     struct usock* p = s->peer;
     uint32_t f = waitq_lock(&p->readers);
     if ((size_t)(USOCK_BUF - p->count) < n || (passfile && p->fdq_count >= USOCK_FDQ)) {
@@ -206,7 +213,7 @@ long usock_recv(struct usock* s, void* buf, size_t n, int block,
 
     /* Wait until there is something to receive — bytes or a passed fd — or the
      * peer has closed (then we return EOF/0), or the caller is non-blocking. */
-    while (block && s->count == 0 && s->fdq_count == 0 && s->peer != NULL) {
+    while (block && s->count == 0 && s->fdq_count == 0 && s->peer != NULL && !s->eof) {
         if (task_should_stop()) {                 /* §M90 — killed while waiting */
             waitq_unlock(&s->readers, f);
             if (passfile_out) *passfile_out = NULL;
@@ -278,7 +285,36 @@ int usock_can_write(struct usock* s) {
  * can_read so a reader can drain what is already buffered before it acts on
  * the close — collapsing the two would discard the tail of every conversation
  * whose writer closed promptly, which is most of them. */
-int usock_peer_open(struct usock* s) { return s && s->peer != NULL; }
+int usock_peer_open(struct usock* s) { return s && s->peer != NULL && !s->eof; }
+
+/* §M90 — shutdown(2) on a connected endpoint: how 0 = SHUT_RD, 1 = SHUT_WR,
+ * 2 = both.  0, or -107 ENOTCONN when there is no connection to shut. */
+int usock_shutdown(struct usock* s, int how) {
+    if (!s) return -9;
+    struct usock* p = s->peer;
+    if (!p && !s->ever_connected) return -107;
+    if (how == 0 || how == 2) {
+        uint32_t f = waitq_lock(&s->readers);
+        s->eof = 1;
+        waitq_wake_all(&s->readers);
+        waitq_unlock(&s->readers, f);
+        fd_readiness_changed(s->owner);
+    }
+    if (how == 1 || how == 2) {
+        s->wr_shut = 1;
+        if (p) {
+            uint32_t f = waitq_lock(&p->readers);
+            p->eof = 1;                          /* the peer reads the rest, then EOF */
+            waitq_wake_all(&p->readers);
+            waitq_unlock(&p->readers, f);
+            fd_readiness_changed(p->owner);
+        }
+        uint32_t wf = waitq_lock(&s->writers);
+        waitq_wake_all(&s->writers);
+        waitq_unlock(&s->writers, wf);
+    }
+    return 0;
+}
 
 /* Close one endpoint: disconnect the peer, drop any still-queued passed fds
  * (their travelling references), and free.  Called by ofile_unref(FD_SOCK)
@@ -501,12 +537,12 @@ long usock_recv_flags(struct usock* s, void* buf, size_t n, int block, int flags
     int peek = flags & 0x02, trunc = flags & 0x20;
     if (flags & 0x40) block = 0;
     uint32_t f = waitq_lock(&s->readers);
-    while (block && s->count == 0 && s->peer != NULL) {
+    while (block && s->count == 0 && s->peer != NULL && !s->eof) {
         if (task_should_stop()) { waitq_unlock(&s->readers, f); return -4; }   /* §M90 */
         waitq_block(&s->readers);
     }
     if (s->count == 0) {
-        int open = s->peer != NULL;
+        int open = s->peer != NULL && !s->eof;
         waitq_unlock(&s->readers, f);
         return open ? -11 : 0;
     }

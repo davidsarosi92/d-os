@@ -413,6 +413,7 @@ int  vfs_rename_replace(const char* oldpath, const char* newpath);
 int  vfs_fsync_file(struct file* f);
 /* §M90 — a dentry's path as the calling task sees it ("" = its root). */
 int  vfs_dentry_path(struct dentry* d, char* out, size_t cap);
+int  vfs_dentry_path_global(struct dentry* d, char* out, size_t cap);   /* §M90 */
 /* §M90 — the path an open file is known by (vpath, else its dentry's). */
 int  vfs_file_path(struct file* f, char* out, size_t cap);
 

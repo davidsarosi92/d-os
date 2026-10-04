@@ -935,6 +935,7 @@ static struct task* spawn_common_ex(const char* name, void (*entry)(void),
     t->oom_score_adj = cur ? cur->oom_score_adj : 0;   /* §M90 — inherited */
     ns_inherit(cur, t);                      /* §M90 — namespaces, with references */
     ns_pid_assign(t);                        /* §M90 — its number in each pid namespace */
+    t->start_ms = timer_ticks_ms();          /* §M90 — /proc/<pid>/stat starttime */
     t->state       = TASK_RUNNABLE;
     /* §M32 — identity, inherited HERE and nowhere else.  Assigning creds from
      * a call site after spawn returns would be assigning them to a task another
@@ -2418,6 +2419,54 @@ int task_space_handoff(struct task* owner, struct vmm_space* s) {
     }
     spin_unlock_irqrestore(&master_lock, fl);
     return handed;
+}
+
+/* §M90 — execve's de_thread.  `me` has just swapped in its new space; `old`
+ * is what it ran on, shared with the other threads of its process.  Linux
+ * kills every other thread before the new program runs: left alone they kept
+ * executing the OLD program's code in a space the exec then freed — a Go
+ * runtime thread of runc's container init faulted on garbage page tables the
+ * moment the init exec'd the container's program.
+ *
+ * Every other user of `old` is told to die (the ordinary kill — woken if
+ * asleep, honoured at its next safe point).  The space is NOT freed under
+ * them: if `me` owned it, ownership passes to one of them and its reap
+ * destroys it (task_space_handoff's rule); if `me` was a thread, the owner
+ * (the leader) is among the killed and its reap destroys it.  Returns 1 only
+ * when nobody else uses `old` and `me` owned it — the caller frees it then.
+ *
+ * NOT done: Linux also gives a non-leader exec'ing thread the LEADER's pid,
+ * so the process keeps its number; here that thread keeps its own and the
+ * leader's exit is what its parent sees.  Said on the console when it
+ * happens, so it is not mistaken for a working path. */
+int task_exec_detach(struct task* me, struct vmm_space* old, int me_owned) {
+    if (!me || !old) return 0;
+    int pids[64], n = 0;
+    uint32_t fl = spin_lock_irqsave(&master_lock);
+    if (master_head) {
+        struct task* c = master_head;
+        do {
+            if (c != me && c->mm == old && c->state != TASK_DEAD && n < 64) pids[n++] = c->pid;
+            c = c->next;
+        } while (c != master_head);
+    }
+    spin_unlock_irqrestore(&master_lock, fl);
+    if (me->tgid && me->tgid != me->pid)
+        kprintf("exec: pid %d is a thread of %d; it keeps its own pid (no leader takeover yet)\n",
+                me->pid, me->tgid);
+    for (int i = 0; i < n; i++) task_kill(pids[i]);
+    if (!me_owned) return 0;
+    int handed = 0;
+    fl = spin_lock_irqsave(&master_lock);
+    if (master_head) {
+        struct task* c = master_head;
+        do {
+            if (c != me && c->mm == old && c->user_task) { c->mm_shared = 0; handed = 1; break; }
+            c = c->next;
+        } while (c != master_head);
+    }
+    spin_unlock_irqrestore(&master_lock, fl);
+    return handed ? 0 : 1;
 }
 
 /* ------------------------------------------------------------------- */

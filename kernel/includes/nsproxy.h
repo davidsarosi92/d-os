@@ -89,6 +89,11 @@ int  ns_vnr(const struct task* viewer, const struct task* t);
 /* The GLOBAL pid of the task `viewer` calls `nr`, or -1.  Takes the task list
  * lock: never call with it held. */
 int  ns_pid_resolve(const struct task* viewer, int nr);
+/* §M90 — may `t` make a THREAD?  Not after unshare(CLONE_NEWPID) has moved
+ * where its children are born: a thread lives in its process's namespace, and
+ * Linux answers that clone with EINVAL rather than split a process across
+ * two.  1 = yes. */
+int  ns_pid_thread_ok(const struct task* t);
 /* Is `t` the init (number 1) of its own pid namespace? */
 int  ns_pid_is_init(const struct task* t);
 /* `t` (an init) has died: kill every task in its namespace and below. */

@@ -114,6 +114,12 @@ static const struct abi_nument linux_i386_ents[] = {
     {  74, ABI_SETHOSTNAME }, { 121, ABI_SETDOMAINNAME },  /* §M90 */
     { 360, ABI_SOCKETPAIR },  /* §M90 */
     { 358, ABI_EXECVEAT },  /* §M90 */
+    { 357, ABI_BPF },  /* §M90 */
+    { 133, ABI_FCHDIR },  /* §M90 */
+    { 184, ABI_CAPGET },  /* §M90 */
+    { 185, ABI_CAPSET },  /* §M90 */
+    { 206, ABI_SETGROUPS }, { 208, ABI_SETRESUID }, { 210, ABI_SETRESGID },  /* §M90 */
+    { 209, ABI_GETRESUID }, { 211, ABI_GETRESGID }, { 203, ABI_SETREUID }, { 204, ABI_SETREGID },
     /* §M90 — the extended-attribute family: set/lset/fset, get/lget/fget,
      * list/llist/flist, remove/lremove/fremove, consecutive on every guest. */
     { 226, ABI_XATTR_SET },
@@ -245,6 +251,12 @@ static const struct abi_nument linux_amd64_ents[] = {
     { 170, ABI_SETHOSTNAME }, { 171, ABI_SETDOMAINNAME },  /* §M90 */
     {  53, ABI_SOCKETPAIR },  /* §M90 */
     { 322, ABI_EXECVEAT },  /* §M90 */
+    { 321, ABI_BPF },  /* §M90 */
+    {  81, ABI_FCHDIR },  /* §M90 */
+    { 125, ABI_CAPGET },  /* §M90 */
+    { 126, ABI_CAPSET },  /* §M90 */
+    { 116, ABI_SETGROUPS }, { 117, ABI_SETRESUID }, { 119, ABI_SETRESGID },  /* §M90 */
+    { 118, ABI_GETRESUID }, { 120, ABI_GETRESGID }, { 113, ABI_SETREUID }, { 114, ABI_SETREGID },
     /* §M90 — the extended-attribute family: set/lset/fset, get/lget/fget,
      * list/llist/flist, remove/lremove/fremove, consecutive on every guest. */
     { 188, ABI_XATTR_SET },
@@ -360,6 +372,12 @@ static const struct abi_nument linux_arm64_ents[] = {
     { 161, ABI_SETHOSTNAME }, { 162, ABI_SETDOMAINNAME },  /* §M90 */
     { 199, ABI_SOCKETPAIR },  /* §M90 */
     { 281, ABI_EXECVEAT },  /* §M90 */
+    { 280, ABI_BPF },  /* §M90 */
+    {  50, ABI_FCHDIR },  /* §M90 */
+    {  90, ABI_CAPGET },  /* §M90 */
+    {  91, ABI_CAPSET },  /* §M90 */
+    { 159, ABI_SETGROUPS }, { 147, ABI_SETRESUID }, { 149, ABI_SETRESGID },  /* §M90 */
+    { 148, ABI_GETRESUID }, { 150, ABI_GETRESGID }, { 145, ABI_SETREUID }, { 143, ABI_SETREGID },
     /* §M90 — the extended-attribute family: set/lset/fset, get/lget/fget,
      * list/llist/flist, remove/lremove/fremove, consecutive on every guest. */
     { 5, ABI_XATTR_SET },
@@ -414,13 +432,13 @@ static const struct abi_nument linux_arm64_ents[] = {
  * struct size from the word size would therefore be correct on exactly one of
  * these three. */
 /* §M73 — the three `struct stat` layouts, as data (see abi_stat_layout).
- *               bytes dev ino w  ino32 mode nlink w  uid gid size blksz w blocks atime mtime ctime w */
+ *               bytes dev ino w  ino32 mode nlink w  uid gid size blksz w blocks atime mtime ctime w rdev */
 static const struct abi_stat_layout stat_i386_stat64 =   /* packed, asm/stat.h */
-               {  96,   0, 88, 8, 12,  16,  20,  4,  24, 28,  44,  52,  4,  56,   64,   72,   80, 4 };
+               {  96,   0, 88, 8, 12,  16,  20,  4,  24, 28,  44,  52,  4,  56,   64,   72,   80, 4, 32 };
 static const struct abi_stat_layout stat_amd64 =
-               { 144,   0,  8, 8, 0xFF, 24, 16,  8,  28, 32,  48,  56,  8,  64,   72,   88,  104, 8 };
+               { 144,   0,  8, 8, 0xFF, 24, 16,  8,  28, 32,  48,  56,  8,  64,   72,   88,  104, 8, 40 };
 static const struct abi_stat_layout stat_generic64 =     /* asm-generic: arm64 */
-               { 128,   0,  8, 8, 0xFF, 16, 20,  4,  24, 28,  48,  56,  4,  64,   72,   88,  104, 8 };
+               { 128,   0,  8, 8, 0xFF, 16, 20,  4,  24, 28,  48,  56,  4,  64,   72,   88,  104, 8, 32 };
 
 const struct abi_map abi_map_linux_i386 = {
     "linux/i386",  linux_i386_ents,  ARRAY_N(linux_i386_ents),  4, 12, &stat_i386_stat64, 0200000

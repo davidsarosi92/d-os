@@ -252,7 +252,9 @@ const struct cred* cred_current(void) {
         { CRED_UID_NONE, CRED_UID_NONE, CRED_UID_NONE, CRED_UID_NONE,
           CRED_UID_NONE, CRED_UID_NONE, CRED_UID_NONE, CRED_UID_NONE },
         CRED_SESSION_NONE,
-        NULL, 0, "", "", 0               /* §M73 — the machine's root, no container, cwd "/"; §M89 no exe; §M90 umask 022 */
+        NULL, 0, "", "", 0,              /* §M73 — the machine's root, no container, cwd "/"; §M89 no exe; §M90 umask 022 */
+        0, 0, 0, 0, 0, 0, 0,             /* §M90 — every capability (none dropped), no keepcaps, no no_new_privs */
+        0                                /* §M90 — groups as the user database gave them */
     };
     struct task* t = task_current();
     /* Before task_init, or on a CPU that has not taken a task yet.  "There is
@@ -396,3 +398,33 @@ static void cmd_credtest(const char* args) {
 SHELL_CMD(credtest) = { "credtest", "",
                         NULL,              /* hidden, like hardlock */
                         SHELL_G_TEST, cmd_credtest, SHELL_P_ADMIN };
+
+/* ---------------------------------------------------------------------------
+ * §M90 — Linux capabilities (see cred.h: stored as what was DROPPED).
+ * ------------------------------------------------------------------------- */
+uint64_t cred_cap_bounding(const struct cred* c) {
+    return c ? (CAP_FULL_SET_ & ~c->cap_bnd_drop) : 0;
+}
+uint64_t cred_cap_permitted(const struct cred* c) {
+    if (!c || !cred_is_admin(c)) return 0;
+    return CAP_FULL_SET_ & ~c->cap_prm_drop;
+}
+uint64_t cred_cap_effective(const struct cred* c) {
+    if (!c || !cred_is_admin(c)) return 0;
+    return CAP_FULL_SET_ & ~c->cap_eff_drop & ~c->cap_prm_drop;
+}
+int cred_capable(const struct cred* c, int cap) {
+    if (cap < 0 || cap > CAP_LAST_CAP_) return 0;
+    return (cred_cap_effective(c) >> cap) & 1;
+}
+void cred_exec_caps(struct cred* c) {
+    if (!c || !cred_is_admin(c)) return;
+    /* Linux, for uid 0 (whose every program counts as carrying all file
+     * capabilities): P' = (P(inh) & fI) | (fP & bounding) = inh | bounding;
+     * the effective bit is set, so E' = P'.  Ambient is cleared for such a
+     * "privileged" program, and P' already covers what it held. */
+    uint64_t p = (c->cap_inh | cred_cap_bounding(c)) & CAP_FULL_SET_;
+    c->cap_prm_drop = CAP_FULL_SET_ & ~p;
+    c->cap_eff_drop = 0;
+    c->cap_amb = 0;
+}

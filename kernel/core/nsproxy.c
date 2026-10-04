@@ -306,6 +306,10 @@ int ns_pid_resolve(const struct task* viewer, int nr) {
     return f.found;
 }
 
+int ns_pid_thread_ok(const struct task* t) {
+    return !t || !t->ns_pid_children || t->ns_pid_children == t->ns[NSK_PID];
+}
+
 int ns_pid_is_init(const struct task* t) {
     struct nsobj* o = obj_of(t, NSK_PID);
     return o && o->init_pid == t->pid;

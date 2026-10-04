@@ -13,6 +13,7 @@
 #include "abi.h"
 #include "nsproxy.h"
 #include "procfs.h"
+#include "bpf.h"
 #include "dosgui.h"     /* §M65 — the toolkit build op */
 #include "printf.h"
 #include "epoll.h"        /* EPOLL_CTL_* — the guest's own numbers */
@@ -368,6 +369,61 @@ static long h_getuid(struct abi_ctx* c) { (void)c; return guest_uid(); }
 static long h_getgid(struct abi_ctx* c) { (void)c; return guest_gid(); }
 static long h_setuid(struct abi_ctx* c) { return (int)c->a[0] == guest_uid() ? 0 : -ABI_EPERM; }
 static long h_setgid(struct abi_ctx* c) { return (int)c->a[0] == guest_gid() ? 0 : -ABI_EPERM; }
+/* §M90 — the set*id family.  An identity here has ONE uid and ONE gid (no
+ * separate real / effective / saved ids), so these succeed exactly when every
+ * id named is that one (or -1, "unchanged") — the same rule setuid has, and
+ * the case of every container whose user is root.  Becoming ANOTHER user is
+ * cred_become_user's (§M32), which these do not reach: EPERM, as before. */
+static int same_or_keep(unsigned long v, int cur) {
+    return (uint32_t)v == 0xFFFFFFFFu || (int)(uint32_t)v == cur;
+}
+static long h_setresuid(struct abi_ctx* c) {
+    int u = guest_uid();
+    return same_or_keep(c->a[0], u) && same_or_keep(c->a[1], u) && same_or_keep(c->a[2], u)
+           ? 0 : -ABI_EPERM;
+}
+static long h_setresgid(struct abi_ctx* c) {
+    int g = guest_gid();
+    return same_or_keep(c->a[0], g) && same_or_keep(c->a[1], g) && same_or_keep(c->a[2], g)
+           ? 0 : -ABI_EPERM;
+}
+static long h_setreuid(struct abi_ctx* c) {
+    int u = guest_uid();
+    return same_or_keep(c->a[0], u) && same_or_keep(c->a[1], u) ? 0 : -ABI_EPERM;
+}
+static long h_setregid(struct abi_ctx* c) {
+    int g = guest_gid();
+    return same_or_keep(c->a[0], g) && same_or_keep(c->a[1], g) ? 0 : -ABI_EPERM;
+}
+static int abi_w_ok(unsigned long p, unsigned long n);
+static long abi_put_three(unsigned long a, unsigned long b, unsigned long c3, int v) {
+    if (!abi_w_ok(a, 4) || !abi_w_ok(b, 4) || !abi_w_ok(c3, 4)) return -14;     /* EFAULT */
+    *(uint32_t*)(uintptr_t)a = (uint32_t)v;
+    *(uint32_t*)(uintptr_t)b = (uint32_t)v;
+    *(uint32_t*)(uintptr_t)c3 = (uint32_t)v;
+    return 0;
+}
+static long h_getresuid(struct abi_ctx* c) { return abi_put_three(c->a[0], c->a[1], c->a[2], guest_uid()); }
+static long h_getresgid(struct abi_ctx* c) { return abi_put_three(c->a[0], c->a[1], c->a[2], guest_gid()); }
+/* setgroups(n, list): the supplementary groups, CAP_SETGID's.  The list
+ * replaces the identity's (cred.groups — what cred_is_admin consults for a
+ * user identity, so dropping the admin group drops the privilege). */
+static long h_setgroups(struct abi_ctx* c) {
+    struct task* t = task_current();
+    if (!t) return -ABI_EINVAL;
+    long n = (long)c->a[0];
+    if (n < 0 || n > CRED_MAX_GROUPS) return -ABI_EINVAL;
+    if (!cred_capable(&t->cred, CAP_SETGID_)) return -ABI_EPERM;
+    int g[CRED_MAX_GROUPS];
+    if (n) {
+        if (!vmm_user_access_ok((uintptr_t)c->a[1], (uintptr_t)(4 * n), 0)) return -14;
+        for (long i = 0; i < n; i++) g[i] = (int)((const uint32_t*)(uintptr_t)c->a[1])[i];
+    }
+    for (long i = 0; i < n; i++) t->cred.groups[i] = g[i];
+    t->cred.ngroups = (int)n;
+    t->cred.groups_explicit = 1;
+    return 0;
+}
 
 static unsigned long abi_get_word(const struct abi_ctx* c, unsigned long p, int i);
 
@@ -513,6 +569,15 @@ static long abi_put_stat(struct abi_ctx* c, unsigned long up, const struct kstat
     st_put(b, L->nlink, L->nlink_w, k->nlink);
     st_put(b, L->uid, 4, (uint32_t)k->uid);
     st_put(b, L->gid, 4, (uint32_t)k->gid);
+    /* §M90 — st_rdev in the encoding the C libraries' makedev() uses (the
+     * same 64-bit dev_t on all three guests): minor's low byte, major's low
+     * 12 bits at 8, minor's rest at 20, major's rest at 32. */
+    if (L->rdev) {
+        uint64_t ma = k->rdev_major, mi = k->rdev_minor;
+        uint64_t rd = ((ma & 0xfffff000ull) << 32) | ((ma & 0xfffull) << 8) |
+                      ((mi & 0xffffff00ull) << 12) | (mi & 0xffull);
+        st_put(b, L->rdev, 8, rd);
+    }
     st_put(b, L->size, 8, k->size);
     st_put(b, L->blksize, L->blksize_w, 4096);
     st_put(b, L->blocks, 8, (k->size + 511) / 512);
@@ -764,7 +829,7 @@ static long h_chroot(struct abi_ctx* c) {
     if (abi_path(c->a[0], kp, sizeof kp) != 0) return -ABI_EFAULT;
     struct task* t = task_current();
     if (!t) return -ABI_EINVAL;
-    if (cred_uid(&t->cred) != 0 && !cred_is_admin(&t->cred)) return -ABI_EPERM;
+    if (!cred_capable(&t->cred, CAP_SYS_CHROOT_)) return -ABI_EPERM;
     struct dentry* d = vfs_resolve(kp);
     if (!d || !d->inode) return -ABI_ENOENT;
     if (d->inode->type != INODE_DIR) return -ABI_ENOTDIR;
@@ -806,7 +871,7 @@ static long h_unshare(struct abi_ctx* c) {
     struct task* t = task_current();
     if (!t) return -ABI_EINVAL;
     if ((fl & (CLONE_NEWNS_ | CLONE_NSOBJ_)) &&
-        cred_uid(&t->cred) != 0 && !cred_is_admin(&t->cred)) return -ABI_EPERM;
+        !cred_capable(&t->cred, CAP_SYS_ADMIN_)) return -ABI_EPERM;
     if (fl & CLONE_NSOBJ_) {
         int e = ns_unshare(t, fl & CLONE_NSOBJ_);
         if (e != 0) return e;                                     /* ENOMEM / ENOSPC */
@@ -849,6 +914,9 @@ static long h_mount(struct abi_ctx* c) {
     if (c->a[2]) abi_path(c->a[2], fst, sizeof fst);
     if (c->a[0]) abi_path(c->a[0], src, sizeof src);
     unsigned long fl = c->a[3];
+    /* §M90 — mount(2) is CAP_SYS_ADMIN's (it was not checked at all) */
+    { struct task* me = task_current();
+      if (!me || !cred_capable(&me->cred, CAP_SYS_ADMIN_)) return -ABI_EPERM; }
     if ((fl & MS_PROPAGATION_) && !(fl & ~(MS_PROPAGATION_ | MS_REC_))) {
         struct kstat_full k;
         return sys_stat_full_k(tgt, &k) == 0 ? 0 : -ABI_ENOENT;
@@ -957,7 +1025,7 @@ static long h_setns(struct abi_ctx* c) {
     if (c->a[1] && c->a[1] != flag_of[kind]) return -ABI_EINVAL;
     struct task* t = task_current();
     if (!t) return -ABI_EINVAL;
-    if (cred_uid(&t->cred) != 0 && !cred_is_admin(&t->cred)) return -ABI_EPERM;
+    if (!cred_capable(&t->cred, CAP_SYS_ADMIN_)) return -ABI_EPERM;
     if (kind == NSK_MNT) { t->mntns = mnt; return 0; }
     if (kind == NSK_NET || kind == NSK_USER) return 0;
     /* Linux: joining a PID namespace changes where CHILDREN are born; the
@@ -976,7 +1044,7 @@ static long h_pivot_root(struct abi_ctx* c) {
         return -ABI_EFAULT;
     struct task* t = task_current();
     if (!t) return -ABI_EINVAL;
-    if (cred_uid(&t->cred) != 0 && !cred_is_admin(&t->cred)) return -ABI_EPERM;
+    if (!cred_capable(&t->cred, CAP_SYS_ADMIN_)) return -ABI_EPERM;
     struct dentry* d = vfs_resolve(nr);
     struct dentry* o = vfs_resolve(po);
     if (!d || !d->inode || !o || !o->inode) return -ABI_ENOENT;
@@ -997,6 +1065,10 @@ static long h_pivot_root(struct abi_ctx* c) {
         }
         rel[k] = 0;
     }
+    /* pivot_root(".", ".") — put_old IS new_root (runc's form): the old root
+     * is "stacked" on "/" and the umount2 that follows names "/" (as ".", from
+     * the old root's directory, which fchdir leaves at the new "/" here). */
+    if (!rel[0]) { rel[0] = '/'; rel[1] = 0; }
     t->cred.root = d;
     t->cred.cwd[0] = 0;
     for (unsigned i = 0; i < sizeof t->pivot_old; i++) { t->pivot_old[i] = rel[i]; if (!rel[i]) break; }
@@ -1006,15 +1078,18 @@ static long h_umount2(struct abi_ctx* c) {
     char tgt[256];
     if (abi_path(c->a[0], tgt, sizeof tgt) != 0) return -ABI_EFAULT;
     struct task* t = task_current();
-    /* the old root of a pivot_root (see above): "/.pivot_root…", or the same
-     * path relative ("oldroot", "./oldroot") */
+    if (!t || !cred_capable(&t->cred, CAP_SYS_ADMIN_)) return -ABI_EPERM;   /* §M90 */
+    /* the old root of a pivot_root (see above): compared as CANONICAL paths in
+     * the task's (new) root, so "/oldroot", "oldroot", "./oldroot" and — for
+     * pivot_root(".", ".") — "." from "/" all name it */
     if (t && t->pivot_old[0]) {
-        const char* a = tgt; const char* b = t->pivot_old;
-        while (a[0] == '.' && a[1] == '/') a += 2;
-        if (*a != '/') b++;                         /* compare without the leading '/' */
-        int same = 1;
-        for (unsigned i = 0; same && (a[i] || b[i]); i++) if (a[i] != b[i]) same = 0;
-        if (same) { t->pivot_old[0] = 0; return 0; }
+        char canon[256];
+        if (vfs_canonical(tgt, canon, sizeof canon) == 0) {
+            int same = 1;
+            for (unsigned i = 0; same && (canon[i] || t->pivot_old[i]); i++)
+                if (canon[i] != t->pivot_old[i]) same = 0;
+            if (same) { t->pivot_old[0] = 0; return 0; }
+        }
     }
     if (vfs_unbind(tgt) == 0) return 0;                  /* §M90 — a bind */
     /* Linux answers EINVAL for "not a mount point" — what every runtime's
@@ -1109,7 +1184,7 @@ static long h_uname(struct abi_ctx* c) {
 static long abi_setname(struct abi_ctx* c, int domain) {
     struct task* t = task_current();
     if (!t) return -ABI_EINVAL;
-    if (cred_uid(&t->cred) != 0 && !cred_is_admin(&t->cred)) return -ABI_EPERM;
+    if (!cred_capable(&t->cred, CAP_SYS_ADMIN_)) return -ABI_EPERM;
     size_t n = (size_t)c->a[1];
     if (n > NS_HOST_MAX) return -ABI_EINVAL;
     char k[NS_HOST_MAX + 1];
@@ -1154,10 +1229,47 @@ static long h_chdir(struct abi_ctx* c) {
     for (unsigned i = 0; i < sizeof t->cred.cwd; i++) { t->cred.cwd[i] = canon[i]; if (!canon[i]) break; }
     return 0;
 }
+/* §M90 — fchdir(fd): the working directory becomes the directory behind the
+ * descriptor, by the path it was opened by (through a bind: the mount's).
+ * It was missing on every guest; runc enters a container's root with it. */
+static long h_fchdir(struct abi_ctx* c) {
+    char p[256], canon[256];
+    int r = sys_fd_dirpath((int)c->a[0], p, sizeof p);
+    if (r == -20) return -ABI_ENOTDIR;
+    if (r == -2) {
+        /* An open directory OUTSIDE this task's root: a working directory here
+         * is a path inside the root, so it cannot be represented.  The one
+         * program that does this is a runtime after pivot_root(".", "."):
+         * fchdir(old root), umount2(".", MNT_DETACH), chdir("/") — whose result
+         * is the working directory at the NEW root, set here directly.  A
+         * program that wanted to work inside the old root would find the new
+         * one instead — a divergence from Linux, stated (DOCS §M90). */
+        struct task* t = task_current();
+        if (!t) return -ABI_EINVAL;
+        t->cred.cwd[0] = 0;
+        return 0;
+    }
+    if (r != 0) return -9;                                /* EBADF */
+    if (vfs_canonical(p, canon, sizeof canon) != 0) return -36;
+    struct task* t = task_current();
+    if (!t) return -ABI_EINVAL;
+    for (unsigned i = 0; i < sizeof t->cred.cwd; i++) { t->cred.cwd[i] = canon[i]; if (!canon[i]) break; }
+    return 0;
+}
 static long h_getgroups(struct abi_ctx* c) {
     /* The primary group is the one supplementary group we report: `id` and
-     * friends refuse an error here, and an empty list is a lie about admins. */
+     * friends refuse an error here, and an empty list is a lie about admins.
+     * §M90 — unless setgroups(2) set the list: then exactly that list. */
     int size = (int)c->a[0];
+    struct task* t = task_current();
+    if (t && t->cred.groups_explicit) {
+        int n = t->cred.ngroups;
+        if (size == 0) return n;
+        if (size < n) return -ABI_EINVAL;
+        if (n && !abi_w_ok(c->a[1], 4u * (unsigned)n)) return -ABI_EFAULT;
+        for (int i = 0; i < n; i++) ((uint32_t*)(uintptr_t)c->a[1])[i] = (uint32_t)t->cred.groups[i];
+        return n;
+    }
     if (size == 0) return 1;
     if (size < 0) return -ABI_EINVAL;
     if (!abi_w_ok(c->a[1], 4)) return -ABI_EFAULT;
@@ -1801,6 +1913,21 @@ static long h_wait(struct abi_ctx* c) {
 /* execve(path, argv, envp) — §M89: envp IS honoured (it used to be dropped,
  * and a JRE's launcher, which sets LD_LIBRARY_PATH and re-executes itself,
  * looped forever).  Does not return on success. */
+/* §M90 — bpf(cmd, attr, size): the guest's union bpf_attr is copied in, the
+ * command run (bpf.c — cgroup device programs only), and copied back (some
+ * commands write results into it: PROG_QUERY's count, OBJ_GET_INFO's length). */
+static long h_bpf(struct abi_ctx* c) {
+    unsigned size = (unsigned)c->a[2];
+    if (size > 256) size = 256;
+    uint8_t a[256];
+    for (unsigned i = 0; i < sizeof a; i++) a[i] = 0;
+    if (size && !abi_r_ok(c->a[1], size)) return -ABI_EFAULT;
+    for (unsigned i = 0; i < size; i++) a[i] = ((const uint8_t*)(uintptr_t)c->a[1])[i];
+    long r = bpf_syscall((int)c->a[0], a, size);
+    if (size && abi_w_ok(c->a[1], size))
+        for (unsigned i = 0; i < size; i++) ((uint8_t*)(uintptr_t)c->a[1])[i] = a[i];
+    return r;
+}
 static long h_execve(struct abi_ctx* c) {
     int r = proc_execve_env((const char*)(uintptr_t)c->a[0],
                             (char* const*)(uintptr_t)c->a[1],
@@ -2010,21 +2137,45 @@ static long h_clock_getres(struct abi_ctx* c) {
  * guest and two on a 32-bit one. */
 /* §M90 — f_type is the MAGIC of the filesystem the path is on, not always
  * ramfs's: runc and dockerd tell the cgroup v2 hierarchy from everything else
- * by statfs("/sys/fs/cgroup").f_type == CGROUP2_SUPER_MAGIC, and Go's os
- * package asks the same question of /proc. */
-static uint32_t abi_fs_magic(const char* kpath) {
-    if (!kpath) return 0x858458f6u;
+ * by statfs("/sys/fs/cgroup").f_type == CGROUP2_SUPER_MAGIC, and runc refuses
+ * a container whose /proc is not PROC_SUPER_MAGIC.
+ *
+ * It is decided by the NODE, from its GLOBAL path (vfs_dentry_path_global):
+ * inside a container "/proc" is a bind of the host's /proc and its dentry
+ * lies above the container's root, so a task-relative path either cannot be
+ * formed or names the wrong thing.  The classifier below sees global paths
+ * only. */
+static int pfx(const char* p, const char* q) {
+    while (*q) if (*p++ != *q++) return 0;
+    return *p == 0 || *p == '/';
+}
+static uint32_t abi_fs_magic_global(const char* g) {
+    if (!g || !g[0]) return 0x858458f6u;                        /* the root: ramfs */
     /* /proc and /dev are ramfs directories here, presented as proc / devtmpfs */
-    if (kpath[0] == '/' && kpath[1] == 'p' && kpath[2] == 'r' && kpath[3] == 'o' &&
-        kpath[4] == 'c' && (kpath[5] == 0 || kpath[5] == '/')) return 0x9fa0u;
-    if (kpath[0] == '/' && kpath[1] == 'd' && kpath[2] == 'e' && kpath[3] == 'v' &&
-        (kpath[4] == 0 || kpath[4] == '/')) return 0x01021994u;
-    const struct vfs_mount* m = vfs_mount_for(kpath);
+    if (pfx(g, "/proc")) return 0x9fa0u;                        /* PROC_SUPER_MAGIC */
+    if (pfx(g, "/dev"))  return 0x01021994u;                    /* TMPFS (devtmpfs) */
+    /* the anonymous filesystems a mount(2) made (vfs_anon_fs: /.mounts/<kind>-N) */
+    if (pfx(g, "/.mounts")) {
+        const char* k = g + 9;
+        if (k[0] == 'd' && k[1] == 'e' && k[2] == 'v' && k[3] == 'p') return 0x1cd1u;     /* devpts */
+        if (k[0] == 'm' && k[1] == 'q') return 0x19800202u;                               /* mqueue */
+        if (k[0] == 'r' && k[1] == 'a') return 0x858458f6u;                               /* ramfs  */
+        return 0x01021994u;                                                               /* tmpfs  */
+    }
+    const struct vfs_mount* m = vfs_mount_for(g);
     const char* n = m ? m->fs_name : NULL;
-    if (!n) return 0x858458f6u;
-    if (n[0] == 'c' && n[1] == 'g') return 0x63677270u;         /* cgroup2 */
-    if (n[0] == 'e' && n[1] == 'x') return 0x2011bab0u;         /* exfat   */
+    if (n && n[0] == 'c' && n[1] == 'g') return 0x63677270u;    /* cgroup2 */
+    if (n && n[0] == 'e' && n[1] == 'x') return 0x2011bab0u;    /* exfat   */
+    if (pfx(g, "/sys")) return 0x62656572u;                     /* SYSFS_MAGIC */
     return 0x858458f6u;                                         /* ramfs   */
+}
+static uint32_t abi_dentry_fs_magic(struct dentry* d) {
+    char g[256];
+    if (d && vfs_dentry_path_global(d, g, sizeof g) == 0) return abi_fs_magic_global(g);
+    return 0x858458f6u;
+}
+static uint32_t abi_fs_magic(const char* kpath) {
+    return abi_dentry_fs_magic(kpath ? vfs_resolve(kpath) : NULL);
 }
 static long put_statfs(struct abi_ctx* c, uintptr_t p, int wide64, uint32_t magic) {
     unsigned w = wide64 ? 8 : c->map->word_bytes;
@@ -2072,11 +2223,9 @@ static long h_statfs64(struct abi_ctx* c) {
     return put_statfs64_i386((uintptr_t)c->a[2], abi_fs_magic(kp));
 }
 static uint32_t abi_fd_fs_magic(int fd) {
-    char kp[256];
     struct ofile* o = fd_lookup(fd);
-    if (o && (o->kind == FD_VFS || o->kind == FD_FIFO) && o->file && o->file->dentry &&
-        vfs_dentry_path(o->file->dentry, kp, sizeof kp) == 0)
-        return abi_fs_magic(kp[0] ? kp : "/");
+    if (o && (o->kind == FD_VFS || o->kind == FD_FIFO) && o->file && o->file->dentry)
+        return abi_dentry_fs_magic(o->file->dentry);
     return 0x858458f6u;
 }
 static long h_fstatfs64(struct abi_ctx* c) {
@@ -2095,6 +2244,88 @@ static long h_fstatfs(struct abi_ctx* c) {
  * PR_GET_DUMPABLE (there are no core dumps; report "dumpable" and accept a
  * change).  Anything else is EINVAL, which is what Linux answers for an
  * option it does not know. */
+/* §M90 — capget(hdr, data) / capset(hdr, data): Linux's three header
+ * versions (v1: one 32-bit set triple; v2 and v3: two, low word first).  An
+ * unknown version is answered with the preferred one written back and EINVAL
+ * — or 0 when the data pointer is NULL, which is how libcap probes.  capget may name any
+ * process (pid in the caller's PID namespace); capset only the caller. */
+#define CAPV1_ 0x19980330u
+#define CAPV2_ 0x20071026u
+#define CAPV3_ 0x20080522u
+static long abi_cap_hdr(struct abi_ctx* c, unsigned* words, int* pid) {
+    (void)c;
+    uintptr_t h = (uintptr_t)c->a[0];
+    if (!abi_w_ok(h, 8)) return -ABI_EFAULT;
+    uint32_t v = *(uint32_t*)h;
+    *pid = *(int32_t*)(h + 4);
+    if (v == CAPV1_) *words = 1;
+    else if (v == CAPV2_ || v == CAPV3_) *words = 2;
+    else { *(uint32_t*)h = CAPV3_; return -ABI_EINVAL; }
+    return 0;
+}
+static long h_capget(struct abi_ctx* c) {
+    unsigned words; int pid;
+    long e = abi_cap_hdr(c, &words, &pid);
+    /* Linux: a NULL data pointer is the version PROBE — the preferred version
+     * has been written back, and the answer is 0 even for an unknown one. */
+    if (e == -ABI_EINVAL && !c->a[1]) return 0;
+    if (e) return e;
+    struct task* t = task_current();
+    if (!t) return -ABI_EINVAL;
+    if (pid > 0) {
+        int g = ns_pid_resolve(t, pid);
+        t = g > 0 ? task_find(g) : NULL;
+        if (!t) return -3;                                             /* ESRCH */
+    }
+    if (!c->a[1]) return 0;
+    uintptr_t d = (uintptr_t)c->a[1];
+    if (!abi_w_ok(d, 12 * words)) return -ABI_EFAULT;
+    uint64_t ef = cred_cap_effective(&t->cred), pr = cred_cap_permitted(&t->cred);
+    uint64_t in = t->cred.cap_inh;
+    for (unsigned i = 0; i < words; i++) {
+        uint32_t* q = (uint32_t*)(d + 12 * i);
+        q[0] = (uint32_t)(ef >> (32 * i));
+        q[1] = (uint32_t)(pr >> (32 * i));
+        q[2] = (uint32_t)(in >> (32 * i));
+    }
+    return 0;
+}
+static long h_capset(struct abi_ctx* c) {
+    unsigned words; int pid;
+    long e = abi_cap_hdr(c, &words, &pid);
+    if (e) return e;
+    struct task* t = task_current();
+    if (!t) return -ABI_EINVAL;
+    if (pid != 0 && ns_pid_resolve(t, pid) != t->pid) return -ABI_EPERM;
+    uintptr_t d = (uintptr_t)c->a[1];
+    if (!abi_r_ok(d, 12 * words)) return -ABI_EFAULT;
+    uint64_t ef = 0, pr = 0, in = 0;
+    for (unsigned i = 0; i < words; i++) {
+        const uint32_t* q = (const uint32_t*)(d + 12 * i);
+        ef |= (uint64_t)q[0] << (32 * i);
+        pr |= (uint64_t)q[1] << (32 * i);
+        in |= (uint64_t)q[2] << (32 * i);
+    }
+    struct cred* cr = &t->cred;
+    uint64_t cur_p = cred_cap_permitted(cr);
+    /* Linux's rules: permitted may only shrink; effective within the new
+     * permitted; inheritable within (old inheritable | old permitted) and,
+     * without CAP_SETPCAP, within (old inheritable | old permitted) anyway —
+     * and never beyond the bounding set for the newly added bits. */
+    if (pr & ~cur_p) return -ABI_EPERM;
+    if (ef & ~pr) return -ABI_EPERM;
+    uint64_t room = cr->cap_inh | (cred_capable(cr, CAP_SETPCAP_) ? cur_p : 0);
+    if (in & ~(cr->cap_inh | cur_p)) return -ABI_EPERM;
+    if ((in & ~cr->cap_inh) & ~room) return -ABI_EPERM;
+    if ((in & ~cr->cap_inh) & ~cred_cap_bounding(cr)) return -ABI_EPERM;
+    if (!cred_is_admin(cr)) return (pr | ef | in) ? -ABI_EPERM : 0;
+    cr->cap_prm_drop = CAP_FULL_SET_ & ~pr;
+    cr->cap_eff_drop = CAP_FULL_SET_ & ~ef;
+    cr->cap_inh      = in & CAP_FULL_SET_;
+    cr->cap_amb     &= pr & in;                  /* ambient stays within both */
+    return 0;
+}
+
 static long h_prctl(struct abi_ctx* c) {
     struct task* t = task_current();
     int opt = (int)c->a[0];
@@ -2126,14 +2357,64 @@ static long h_prctl(struct abi_ctx* c) {
         *(int32_t*)(uintptr_t)c->a[1] = t->pdeathsig;
         return 0;
     }
-    if (opt == 36) {                                      /* PR_SET_CHILD_SUBREAPER */
-        t->child_subreaper = c->a[1] ? 1 : 0;
+    /* The subreaper mark belongs to the PROCESS (Linux keeps it in the shared
+     * signal struct), and adoption looks for it on the parent PROCESS — the
+     * thread-group leader.  A Go program sets it from whatever thread it is
+     * running on; kept on that thread, containerd's shim never adopted its
+     * containers' processes and they went to init. */
+    if (opt == 36 || opt == 37) {
+        struct task* lead = task_find(task_tgid(t));
+        if (!lead) lead = t;
+        if (opt == 36) {                                  /* PR_SET_CHILD_SUBREAPER */
+            lead->child_subreaper = c->a[1] ? 1 : 0;
+            t->child_subreaper = lead->child_subreaper;
+            return 0;
+        }
+        if (!abi_w_ok(c->a[1], 4)) return -ABI_EFAULT;   /* PR_GET_CHILD_SUBREAPER */
+        *(int32_t*)(uintptr_t)c->a[1] = lead->child_subreaper;
         return 0;
     }
-    if (opt == 37) {                                      /* PR_GET_CHILD_SUBREAPER */
-        if (!abi_w_ok(c->a[1], 4)) return -ABI_EFAULT;
-        *(int32_t*)(uintptr_t)c->a[1] = t->child_subreaper;
+    /* §M90 — capabilities (cred.h) */
+    if (opt == 23) {                                      /* PR_CAPBSET_READ */
+        if (c->a[1] > CAP_LAST_CAP_) return -ABI_EINVAL;
+        return (long)((cred_cap_bounding(&t->cred) >> c->a[1]) & 1);
+    }
+    if (opt == 24) {                                      /* PR_CAPBSET_DROP */
+        if (c->a[1] > CAP_LAST_CAP_) return -ABI_EINVAL;
+        if (!cred_capable(&t->cred, CAP_SETPCAP_)) return -ABI_EPERM;
+        t->cred.cap_bnd_drop |= 1ull << c->a[1];
         return 0;
+    }
+    if (opt == 7) return t->cred.cap_keep;                /* PR_GET_KEEPCAPS */
+    if (opt == 8) {                                       /* PR_SET_KEEPCAPS */
+        if (c->a[1] > 1) return -ABI_EINVAL;
+        t->cred.cap_keep = (int)c->a[1];
+        return 0;
+    }
+    if (opt == 38) {                                      /* PR_SET_NO_NEW_PRIVS */
+        /* one way and inherited.  Nothing here can GAIN privilege at exec
+         * (there are no set-uid programs and no file capabilities), so the
+         * guarantee holds by construction; it is recorded so it is reported. */
+        if (c->a[1] != 1 || c->a[2] || c->a[3] || c->a[4]) return -ABI_EINVAL;
+        t->cred.no_new_privs = 1;
+        return 0;
+    }
+    if (opt == 39) return t->cred.no_new_privs;           /* PR_GET_NO_NEW_PRIVS */
+    if (opt == 27) return t->cred.cap_keep ? 0x10 : 0;    /* PR_GET_SECUREBITS */
+    if (opt == 47) {                                      /* PR_CAP_AMBIENT */
+        unsigned long sub = c->a[1], cap = c->a[2];
+        if (sub == 4) { t->cred.cap_amb = 0; return 0; }  /* CLEAR_ALL */
+        if (cap > CAP_LAST_CAP_) return -ABI_EINVAL;
+        uint64_t bit = 1ull << cap;
+        if (sub == 1) return (t->cred.cap_amb & bit) ? 1 : 0;        /* IS_SET */
+        if (sub == 3) { t->cred.cap_amb &= ~bit; return 0; }         /* LOWER */
+        if (sub == 2) {                                              /* RAISE */
+            if (!(cred_cap_permitted(&t->cred) & bit) || !(t->cred.cap_inh & bit))
+                return -ABI_EPERM;
+            t->cred.cap_amb |= bit;
+            return 0;
+        }
+        return -ABI_EINVAL;
     }
     if (opt == 3) return 1;                               /* PR_GET_DUMPABLE */
     if (opt == 4) return 0;                               /* PR_SET_DUMPABLE */
@@ -2740,6 +3021,17 @@ static const struct {
     [ABI_PIPE2]           = { "pipe2",           h_pipe2 },
     [ABI_EXECVE]          = { "execve",          h_execve },
     [ABI_EXECVEAT]        = { "execveat",        h_execveat },   /* §M90 */
+    [ABI_BPF]             = { "bpf",             h_bpf },        /* §M90 */
+    [ABI_FCHDIR]          = { "fchdir",          h_fchdir },     /* §M90 */
+    [ABI_CAPGET]          = { "capget",          h_capget },     /* §M90 */
+    [ABI_CAPSET]          = { "capset",          h_capset },     /* §M90 */
+    [ABI_SETGROUPS]       = { "setgroups",       h_setgroups },  /* §M90 */
+    [ABI_SETRESUID]       = { "setresuid",       h_setresuid },
+    [ABI_SETRESGID]       = { "setresgid",       h_setresgid },
+    [ABI_GETRESUID]       = { "getresuid",       h_getresuid },
+    [ABI_GETRESGID]       = { "getresgid",       h_getresgid },
+    [ABI_SETREUID]        = { "setreuid",        h_setreuid },
+    [ABI_SETREGID]        = { "setregid",        h_setregid },
     /* §M24 — the socket surface, shared by all three arches at once. */
     [ABI_SOCKET]       = { "socket",       h_socket       },
     [ABI_SOCKETPAIR]   = { "socketpair",   h_socketpair   },   /* §M90 */

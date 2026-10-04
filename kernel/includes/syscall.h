@@ -357,6 +357,10 @@ struct kstat_full {
     uint32_t mode;          /* S_IF* type bits | rwx permission bits          */
     int      uid, gid;      /* the owner the VFS records (0 where none is)    */
     uint32_t nlink;
+    /* §M90 — APPENDED.  A device node's Linux device number (major, minor);
+     * 0:0 for everything else.  runc refuses a container whose /dev/null is
+     * not 1:3, and every program that compares two stats by st_rdev needs it. */
+    uint32_t rdev_major, rdev_minor;
 };
 #define KS_IFMT   0170000u
 #define KS_IFSOCK 0140000u
@@ -364,6 +368,7 @@ struct kstat_full {
 #define KS_IFREG  0100000u
 #define KS_IFDIR  0040000u
 #define KS_IFCHR  0020000u
+#define KS_IFBLK  0060000u      /* §M90 */
 #define KS_IFIFO  0010000u
 int  sys_stat_full_k(const char* kpath, struct kstat_full* out);   /* -1: none */
 int  sys_lstat_full_k(const char* kpath, struct kstat_full* out);  /* §M89 */

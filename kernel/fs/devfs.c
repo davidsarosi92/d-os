@@ -228,3 +228,30 @@ void devfs_init(void) {
     kprintf("devfs: ready, /dev populated (%d driver nodes + 2 built-ins)\n",
             flushed);
 }
+
+/* §M90 — Linux's device NUMBERS for the nodes this devfs has, by name: what a
+ * cgroup device program (bpf.c) is asked about, and what a container's device
+ * list names ("c 1:3 rwm" is /dev/null).  A node with no Linux number answers
+ * 0:0 — no allow-list names that, so a container cannot reach it.
+ * 1 = character device, 0 = block device; -1 = not a devfs node. */
+int devfs_devnum(struct inode* in, uint32_t* major, uint32_t* minor) {
+    if (!in || in->ops != &devfs_file_ops || !in->private) return -1;
+    const struct devfs_node* n = (const struct devfs_node*)in->private;
+    static const struct { const char* name; uint32_t maj, min; } tab[] = {
+        { "null", 1, 3 }, { "zero", 1, 5 }, { "full", 1, 7 }, { "random", 1, 8 },
+        { "urandom", 1, 9 }, { "tty", 5, 0 }, { "console", 5, 1 }, { "ptmx", 5, 2 },
+    };
+    *major = 0; *minor = 0;
+    for (unsigned i = 0; i < sizeof tab / sizeof tab[0]; i++) {
+        const char* a = tab[i].name; const char* b = n->name;
+        while (*a && *a == *b) { a++; b++; }
+        if (!*a && !*b) { *major = tab[i].maj; *minor = tab[i].min; break; }
+    }
+    /* virtio disks: Linux's dynamic block major for vd*, minor = 16 per disk */
+    if (n->kind == DEVFS_BLOCK && n->name[0] == 'v' && n->name[1] == 'd' &&
+        n->name[2] >= 'a' && n->name[2] <= 'z') {
+        *major = 253;
+        *minor = (uint32_t)(n->name[2] - 'a') * 16u + (n->name[3] >= '1' && n->name[3] <= '9' ? (uint32_t)(n->name[3] - '0') : 0u);
+    }
+    return n->kind == DEVFS_BLOCK ? 0 : 1;
+}

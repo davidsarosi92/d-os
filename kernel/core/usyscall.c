@@ -39,6 +39,8 @@
 #include "netlink.h"   /* §M90 */
 #include "fd.h"
 #include "fifo.h"
+#include "bpf.h"
+#include "devfs.h"
 #include "nsproxy.h"
 int procfs_ns_stat_ino(const struct inode* in, uint64_t* ino);          /* procfs.c */
 int procfs_ns_handle(struct file* f, int* kind, struct nsobj** obj, int* mnt, uint32_t* ino);
@@ -314,6 +316,8 @@ static int fd_install(struct ofile* o) {
     fdt_unlock(t, fl);
     return -1;
 }
+/* §M90 — fd_install for other kernel files (bpf.c). */
+int fd_install_k(struct ofile* o) { return fd_install(o); }
 
 /* Forward decls — FD_NETSOCK stream I/O (defined with the socket layer below). */
 static long netsock_write(struct netsock* ns, const void* buf, size_t n);
@@ -555,6 +559,18 @@ long sys_open_ex_k(const char* kpath, int flags, int nonblock, int opath) {
     int oerr = -2;
     struct file* f = vfs_open_ex(kpath, (flags ? flags : VFS_RDONLY) & (opath ? ~0 : ~VFS_NOFOLLOW), &oerr);
     if (!f) return oerr;                                  /* -2, or -30 EROFS */
+    /* §M90 — a DEVICE opened by a Linux process: its cgroup's device programs
+     * (bpf.c, runc's allow-list) decide.  O_PATH only names it, as on Linux. */
+    if (!opath && f->inode && f->inode->type == INODE_DEVICE) {
+        struct task* me = task_current();
+        uint32_t maj = 0, min = 0;
+        int chr = devfs_devnum(f->inode, &maj, &min);
+        uint32_t acc = ((flags & VFS_RDONLY) ? 2u : 0u) | ((flags & VFS_WRONLY) ? 4u : 0u);
+        if (me && me->linux_abi && chr >= 0 && !bpf_devcg_allowed(me, chr, maj, min, acc)) {
+            vfs_close(f);
+            return -1;                                    /* EPERM */
+        }
+    }
     /* O_NOFOLLOW without O_PATH on a symbolic link: ELOOP, as on Linux. */
     if ((flags & VFS_NOFOLLOW) && !opath) {
         struct dentry* ld = vfs_resolve_nofollow(kpath);
@@ -922,6 +938,7 @@ int sys_stat_k(const char* kpath, struct kstat* out) {
 /* §M73 — the full answer, from the INODE rather than from an open (a stat
  * needs no read permission on the file itself, only the lookup). */
 static void stat_full_of(const struct inode* in, struct kstat_full* o) {
+    o->rdev_major = 0; o->rdev_minor = 0;
     o->size  = in->size;
     o->ino   = (uint64_t)((uintptr_t)in >> 3);
     o->nlink = in->type == INODE_DIR ? 2 : 1;          /* ramfs keeps the true count private */
@@ -931,6 +948,13 @@ static void stat_full_of(const struct inode* in, struct kstat_full* o) {
                   : in->type == INODE_SYMLINK ? KS_IFLNK
                   : in->type == INODE_FIFO ? KS_IFIFO : KS_IFREG;
     if (in->type == INODE_SYMLINK) perm = 0777u;
+    /* §M90 — a device node: its Linux number, and a block device is S_IFBLK
+     * (it used to read as a character device, which every disk tool checks) */
+    if (in->type == INODE_DEVICE) {
+        uint32_t ma = 0, mi = 0;
+        if (devfs_devnum((struct inode*)in, &ma, &mi) == 0) fmt = KS_IFBLK;
+        o->rdev_major = ma; o->rdev_minor = mi;
+    }
     o->mode = fmt | perm;
     /* §M90 — a namespace handle reports its NAMESPACE's number (procfs.c). */
     { uint64_t nsi; if (procfs_ns_stat_ino(in, &nsi)) o->ino = nsi; }
@@ -2100,11 +2124,15 @@ int sys_accept_k(int fd, uint32_t* ip_out, int* port_out) {
  * message to the peer. */
 int sys_shutdown(int fd, int how) {
     struct ofile* o = fd_lookup(fd);
-    if (!o || o->kind != FD_NETSOCK) return -1;
+    if (!o) return -9;                                   /* EBADF */
+    if (how < 0 || how > 2) return -22;                  /* EINVAL */
+    /* §M90 — a unix socket (socketpair, a connected AF_UNIX): its halves */
+    if (o->kind == FD_SOCK) return usock_shutdown(o->sock, how);
+    if (o->kind != FD_NETSOCK) return -88;               /* ENOTSOCK */
     struct netsock* ns = o->nsock;
     if (how == 0 || how == 2) ns->rd_shut = 1;
     if (how == 1 || how == 2) {
-        if (!ns->conn) return -1;
+        if (!ns->conn) return -107;                      /* ENOTCONN */
         net_tcp_shutdown(ns->conn);
     }
     return 0;
@@ -2706,6 +2734,7 @@ int sys_fd_link_of(struct task* t, int fd, char* out, size_t cap) {
     case FD_EVENT:   tag = "anon_inode:[eventfd]"; break;
     case FD_EPOLL:   tag = "anon_inode:[eventpoll]"; break;
     case FD_TIMER:   tag = "anon_inode:[timerfd]"; break;
+    case FD_BPF:     tag = "anon_inode:bpf-prog"; break;
     case FD_CONSOLE: tag = "/dev/console"; break;
     default:         tag = "anon_inode:[?]"; break;
     }

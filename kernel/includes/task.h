@@ -585,6 +585,11 @@ struct task {
     /* §M90 — pivot_root's put_old, relative to the new root ("" = none): the
      * one umount2 target that is answered without a mount table. */
     char        pivot_old[96];
+    /* §M90 — when the task was created, in ms of the monotonic clock: what
+     * /proc/<pid>/stat reports as starttime.  runc records it at create and
+     * checks it before every later operation, so a recycled pid is never
+     * mistaken for the container's init. */
+    uint64_t    start_ms;
 };
 
 /* §M90 — the process a task belongs to: its own pid unless it is a thread. */
@@ -795,6 +800,8 @@ void task_for_each(task_iter_fn fn, void* ctx);
  * caller destroys afterwards.  Every write of another walker-visible task's
  * `mm` goes through this (see task.c). */
 struct vmm_space* task_swap_mm(struct task* t, struct vmm_space* ns);
+/* §M90 — execve's de_thread (task.c): 1 = the caller frees `old` itself. */
+int task_exec_detach(struct task* me, struct vmm_space* old, int me_owned);
 
 /* M18.6.3 — find a task by pid.  Returns NULL if no live task carries
  * that pid.  Used by `taskset` and a future `kill`.  Walks the global

@@ -37,6 +37,7 @@
  * ============================================================================= */
 
 #include "cgroupfs.h"
+#include "bpf.h"
 #include "vfs.h"
 #include "task.h"
 #include "kmalloc.h"
@@ -466,6 +467,7 @@ static int cg_unlink(struct inode* dir, const char* name, struct inode* child) {
     cg_scan(cg, &s, NULL, 0);
     if (s.alive) return -2;                                 /* EBUSY: members */
     parent->nchildren--;
+    bpf_cgroup_gone(cg);                        /* §M90 — its device programs go too */
     kfree(cg);
     return 0;
 }
@@ -571,3 +573,14 @@ static void cmd_cgrouptest(const char* args) {
 }
 SHELL_CMD(cgrouptest) = { "cgrouptest", "", "cgroup v2: nodes, membership, delegation, rmdir rules",
                           SHELL_G_TEST, cmd_cgrouptest, SHELL_P_ANY };
+
+/* §M90 — for bpf.c: the cgroup a directory inode IS (NULL for any other
+ * inode), a cgroup's parent (NULL at the root), and a task's cgroup. */
+void* cgroupfs_of_inode(struct inode* in) {
+    return (in && in->ops == &cg_dir_ops) ? in->private : NULL;
+}
+void* cgroupfs_parent(void* cg) {
+    struct cgroup* c = (struct cgroup*)cg;
+    return (c && !cg_is_root(c)) ? c->parent : NULL;
+}
+void* cgroupfs_task_node(const struct task* t) { return task_cg(t); }

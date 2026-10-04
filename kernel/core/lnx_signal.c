@@ -475,7 +475,9 @@ static long send_to(int tid, int sig, int code) {
         if (sig == 9 || sig == SIGSTOP || h == 0) return 0;
     }
     if (sig == SIGSTOP || sig == 20 /* SIGTSTP */ || sig == SIGCONT)
-        return sys_kill(tid, sig) == 0 ? 0 : -E_PERM;        /* §M72 acts on these */
+        /* §M72 acts on these — by GLOBAL pid (it used to be handed the
+         * caller's namespace number, i.e. some other task in a container) */
+        return sys_kill(g, sig) == 0 ? 0 : -E_PERM;
     struct lnx_siginfo si;
     si.signo = sig; si.code = code; si.addr = 0;
     si.pid = me ? ns_vnr(t, me) : 0;                 /* §M90 — as the receiver sees us */
@@ -486,4 +488,15 @@ static long send_to(int tid, int sig, int code) {
 
 long lnx_h_kill(struct abi_ctx* c)   { return send_to((int)c->a[0], (int)c->a[1], LNX_SI_USER); }
 long lnx_h_tkill(struct abi_ctx* c)  { return send_to((int)c->a[0], (int)c->a[1], LNX_SI_TKILL); }
-long lnx_h_tgkill(struct abi_ctx* c) { return send_to((int)c->a[1], (int)c->a[2], LNX_SI_TKILL); }
+/* tgkill(tgid, tid, sig): the thread must belong to that thread group (both
+ * numbers in the sender's pid namespace) — ESRCH otherwise, as on Linux, so a
+ * signal aimed at a recycled tid cannot land in an unrelated process. */
+long lnx_h_tgkill(struct abi_ctx* c) {
+    int tgid = (int)c->a[0], tid = (int)c->a[1];
+    if (tgid <= 0 || tid <= 0) return -E_INVAL;
+    struct task* me = task_current();
+    int gt = ns_pid_resolve(me, tgid), gi = ns_pid_resolve(me, tid);
+    struct task* t = gi > 0 ? task_find(gi) : NULL;
+    if (gt <= 0 || !t || task_tgid(t) != gt) return -E_SRCH;
+    return send_to(tid, (int)c->a[2], LNX_SI_TKILL);
+}

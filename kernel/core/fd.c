@@ -6,6 +6,7 @@
 
 #include "fd.h"
 #include "fifo.h"
+#include "bpf.h"
 #include "hal_api.h"   /* phys_to_virt / virt_to_phys — kernel direct map */
 #include "vfs.h"
 #include "timerfd.h"
@@ -46,6 +47,15 @@ void fd_readiness_changed(struct ofile* o) {
     fd_readiness_signal();
 }
 
+/* §M90 — an eBPF program behind a descriptor (bpf.c); takes a reference. */
+struct bpf_prog_ref;
+void bpf_prog_ref_get(struct bpf_prog* p);
+struct ofile* ofile_from_bpf(struct bpf_prog* p) {
+    if (!p) return NULL;
+    struct ofile* o = ofile_alloc(FD_BPF);
+    if (o) { bpf_prog_ref_get(p); o->bpf = p; }
+    return o;
+}
 struct ofile* ofile_from_file(struct file* f) {
     if (!f) return NULL;
     struct ofile* o = ofile_alloc(FD_VFS);
@@ -144,6 +154,7 @@ void ofile_unref(struct ofile* o) {
         case FD_EVENT:   if (o->efd)   eventfd_close(o->efd);    break;
         case FD_NETLINK: if (o->nl)    nl_close(o->nl);          break;
         case FD_FIFO:    fifo_detach(o); if (o->file) vfs_close(o->file); break;
+        case FD_BPF:     bpf_prog_put(o->bpf); break;
     }
     o->kind = (enum fd_kind)0x0DEAD;     /* the poison, see above */
     kfree(o);

@@ -638,6 +638,7 @@ int proc_execve_env_k(const char* kpath, char* const uargv[], char* const uenvp[
      * set_tid_address or CLONE_CHILD_CLEARTID); at exit it would be zeroed in
      * the NEW one, corrupting whatever lives there.  Linux drops it at exec. */
     me->clear_tid = NULL;
+    cred_exec_caps(&me->cred);                     /* §M90 — Linux's execve rule */
     for (int i = 0; i < NSIG; i++) me->sig_handler[i] = SIG_DFL;
     me->sig_pending = 0;
     for (unsigned i = 0; i < sizeof me->cred.exe; i++) me->cred.exe[i] = new_exe[i];
@@ -658,12 +659,16 @@ int proc_execve_env_k(const char* kpath, char* const uargv[], char* const uenvp[
         }
     }
     lnx_sig_exec(me);                         /* §M89 — handlers pointed into the old image */
+    int owned_old = !me->mm_shared;
     struct vmm_space* old = task_swap_mm(me, ns);   /* under the walkers' lock */
+    me->mm_shared = 0;                              /* §M90 — the new space is ours */
     vmm_space_switch(ns);
     /* §M74 — a pressure eviction may be inside the OLD space; it pinned this
      * task and releases in a bounded batch. */
     while (__atomic_load_n(&me->swap_busy, __ATOMIC_ACQUIRE)) task_msleep(2);
-    if (old) vmm_space_destroy(old);
+    /* §M90 — the other threads die, and the old space is freed by whoever
+     * owns it last (task_exec_detach) — never under a thread still on it. */
+    if (old && task_exec_detach(me, old, owned_old)) vmm_space_destroy(old);
     kfree(strbuf);
     fd_close_on_exec();                       /* §M90 — past the point of no return */
 
