@@ -997,7 +997,13 @@ void pmm_reserve_stats(uint32_t* reserve_kb, uint32_t* refused, int* low) {
     if (low) *low = pmm_free_frames() < (uint32_t)reserve_frames();
 }
 
+/* §M90 rung 3 — memory.max: the cgroup charge comes BEFORE the machine's
+ * reserve, because a container over its own limit must be answered by its
+ * own OOM kill, not by refusing frames the machine still has (cgroupfs.c). */
+#include "cgroupfs.h"
+
 pmm_phys_t pmm_alloc_frame_user(void) {
+    if (!cgroup_mem_charge()) return PMM_ALLOC_FAIL;
     if (!reserve_allows(1)) return PMM_ALLOC_FAIL;
     return page_alloc(0, ZONE_HIGHMEM);
 }
@@ -1005,6 +1011,7 @@ pmm_phys_t pmm_alloc_frame_user(void) {
 /* The same, for a user frame the kernel must reach through a plain pointer
  * (memfd/shm, zeroed and copied by the kernel): never highmem. */
 pmm_phys_t pmm_alloc_frame_user_low(void) {
+    if (!cgroup_mem_charge()) return PMM_ALLOC_FAIL;
     if (!reserve_allows(1)) return PMM_ALLOC_FAIL;
     return page_alloc(0, ZONE_DEFAULT);
 }

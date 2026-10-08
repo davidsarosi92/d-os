@@ -23,6 +23,7 @@
  * points (the framework is here, but only "/" is exercised today).
  * ============================================================================= */
 
+#include "fsnotify.h"   /* §M90 — inotify events from every mutation */
 #include "vfs.h"
 #include "pcache.h"
 #include "block_cache.h"
@@ -1027,6 +1028,7 @@ static struct file* vfs_open_unlocked(const char* path, int flags) {
     d->inode->opens++;                       /* §M90 — see vfs_close / unlink */
     struct vfs_mount* m = mount_of_dentry(d);
     if (m) m->open_files++;
+    fsnotify_dentry(d, FSN_OPEN);            /* §M90 */
     return f;
 }
 int vfs_file_path(struct file* f, char* out, size_t cap) {
@@ -1070,6 +1072,12 @@ int vfs_close(struct file* f) {
      * in the file: mount records move when one is removed, and a pointer kept
      * across that would decrement somebody else's count. */
     kmutex_lock(&ns_lock);
+    /* §M90 — inotify: CLOSE_WRITE for a file opened for writing, else
+     * CLOSE_NOWRITE.  The dentry is used only while the name exists (an
+     * unlinked file's dentry was freed with its name; its watches ended). */
+    if (f->inode && !f->inode->unlink_dir && f->dentry && !(f->inode->vflags & VFS_IF_LINKHANDLE))
+        fsnotify_dentry(f->dentry, (f->flags & (VFS_WRONLY | VFS_TRUNC)) ? FSN_CLOSE_WRITE
+                                                                         : FSN_CLOSE_NOWRITE);
     /* §M90 — the dentry may be gone (the file was unlinked while open): the
      * mount is then not found from it, and its count is left as it was. */
     struct vfs_mount* m = f->dentry && f->inode && !f->inode->unlink_dir
@@ -1153,7 +1161,28 @@ ssize_t vfs_write(struct file* f, const void* buf, size_t n) {
      * write and outside the filesystem's lock (the cache reads through the
      * filesystem, so the order is always cache -> fs, never the reverse). */
     if (r > 0 && f->inode->pc_id) pcache_update(f->inode, at, buf, (size_t)r);
+    /* §M90 — inotify MODIFY.  The parent's watch needs the dentry, which an
+     * unlink may free: read it under the namespace lock, and only when some
+     * watch exists at all (vfs_watch_active keeps the hot path one load). */
+    if (r > 0 && vfs_watch_active()) {
+        kmutex_lock(&ns_lock);
+        if (!f->inode->unlink_dir && f->dentry) fsnotify_dentry(f->dentry, FSN_MODIFY);
+        else fsnotify_inode(f->inode, FSN_MODIFY, NULL);
+        kmutex_unlock(&ns_lock);
+    }
     return r;
+}
+
+/* §M90 — inotify: the inode a watch names.  Resolved under the namespace
+ * lock; the watch then holds the pointer (never dereferenced by inotify,
+ * only compared) until fsnotify_inode_gone drops it. */
+struct inode* vfs_watch_inode(const char* path, int follow, int* is_dir) {
+    kmutex_lock(&ns_lock);
+    struct dentry* d = resolve_path_ex(path, NULL, NULL, follow);
+    struct inode* in = d ? d->inode : NULL;
+    if (is_dir) *is_dir = in && in->type == INODE_DIR;
+    kmutex_unlock(&ns_lock);
+    return in;
 }
 
 static int vfs_readdir_unlocked(struct file* f, struct dirent* out) {
@@ -1316,6 +1345,7 @@ static int vfs_mutator_unlocked(const char* path, int kind) {
     }
 
     if (!vfs_attach_child(parent, last, ino)) return -4;
+    fsnotify_inode(parent->inode, FSN_CREATE | (is_dir ? FSN_ISDIR : 0), last);   /* §M90 */
     return 0;
 }
 
@@ -1357,6 +1387,7 @@ static int vfs_unlink_unlocked(const char* path) {
      * pointing at freed memory — a daemon that removes a file it still holds
      * (or renames a new one over it) then crashed the kernel at close. */
     if (d->inode->type != INODE_DIR && d->inode->opens > 0) {
+        struct inode* d_ino_tmp = d->inode;
         size_t nl = strlen_(last);
         char* nm = (char*)kmalloc(nl + 1);
         if (!nm) return -1;
@@ -1365,12 +1396,26 @@ static int vfs_unlink_unlocked(const char* path) {
         d->inode->unlink_name = nm;
         *link = d->sibling;
         kfree(d);
+        /* §M90 — the NAME is gone now: the directory hears DELETE, and the
+         * file's own watches end (Linux sends DELETE_SELF only at the last
+         * close; here the watch is keyed by an inode pointer that must not
+         * outlive the inode, so it ends with the name). */
+        fsnotify_inode(parent->inode, FSN_DELETE, last);
+        fsnotify_inode_gone(d_ino_tmp);
         return 0;
     }
 
     pcache_invalidate(d->inode);                 /* §M74 — before the inode goes */
+    struct inode* gone = d->inode;
+    uint32_t isdir = gone->type == INODE_DIR ? FSN_ISDIR : 0;
     int r = parent->inode->dir_ops->unlink(parent->inode, last, d->inode);
     if (r != 0) return r;
+    /* §M90 — the inode is freed: its watches end.  Safe after the free
+     * because inotify only COMPARES the pointer, and no watch can be added
+     * to an inode reusing the address while we hold the namespace lock
+     * (vfs_watch_inode takes it). */
+    fsnotify_inode_gone(gone);
+    fsnotify_inode(parent->inode, FSN_DELETE | isdir, last);
 
     *link = d->sibling;                          /* splice out of the tree */
     /* §M90 — a VFS_IF_OWN_CHILDREN directory's remaining entries are the
@@ -1420,7 +1465,10 @@ static int vfs_link_unlocked(const char* oldpath, const char* newpath) {
     for (struct dentry* c = parent->children; c; c = c->sibling)
         if (streq(c->name, last)) return -2;
     if (parent->inode->dir_ops->link(parent->inode, last, src->inode) != 0) return -1;
-    return vfs_attach_child_unlocked(parent, last, src->inode) ? 0 : -1;
+    if (!vfs_attach_child_unlocked(parent, last, src->inode)) return -1;
+    fsnotify_inode(parent->inode, FSN_CREATE, last);              /* §M90 */
+    fsnotify_inode(src->inode, FSN_ATTRIB, NULL);                  /* its link count */
+    return 0;
 }
 int vfs_link(const char* oldpath, const char* newpath) {
     return NS_LOCKED(int, vfs_link_unlocked(oldpath, newpath));
@@ -1460,6 +1508,7 @@ static int vfs_move_unlocked(struct dentry* op, const char* olast,
     }
     int r = op->inode->dir_ops->move(op->inode, olast, np->inode, nlast, d->inode);
     if (r != 0) return r;
+    fsnotify_move(op->inode, olast, np->inode, nlast, d->inode);   /* §M90 */
     /* Relink: out of the old parent's list, into the new one's. */
     struct dentry** pp = &op->children;
     while (*pp && *pp != d) pp = &(*pp)->sibling;
@@ -1500,6 +1549,7 @@ static int vfs_rename_unlocked(const char* oldpath, const char* newpath) {
     int r = oparent->inode->dir_ops->rename(oparent->inode, olast, nlast,
                                             d->inode);
     if (r != 0) return r;
+    fsnotify_move(oparent->inode, olast, oparent->inode, nlast, d->inode);   /* §M90 */
 
     /* The fs said yes — rewrite the dentry (the VFS owns names). */
     size_t i = 0;
@@ -1763,6 +1813,7 @@ static int vfs_chmod_unlocked(const char* path, uint32_t mode) {
     uint32_t was = d->inode->mode;
     d->inode->mode = mode & 07777u;
     if (persist_attr(d) != 0) { d->inode->mode = was; return -3; }
+    fsnotify_dentry(d, FSN_ATTRIB);                                /* §M90 */
     return 0;
 }
 int vfs_chmod(const char* path, uint32_t mode) {
@@ -1782,6 +1833,7 @@ static int vfs_chown_unlocked(const char* path, int uid, int gid) {
     if (uid != CRED_UID_NONE) d->inode->owner_uid = uid;
     if (gid != CRED_UID_NONE) d->inode->owner_gid = gid;
     if (persist_attr(d) != 0) { d->inode->owner_uid = ou; d->inode->owner_gid = og; return -3; }
+    fsnotify_dentry(d, FSN_ATTRIB);                                /* §M90 */
     return 0;
 }
 /* §M32 — owner, mode, size and kind of `path`, as this kernel enforces them.
@@ -1859,7 +1911,9 @@ static int vfs_symlink_unlocked(const char* target, const char* linkpath) {
     const struct cred* cr = cred_current();
     if (cr->owner == TASK_OWNER_USER) { ino->owner_uid = cred_uid(cr); ino->owner_gid = cred_gid(cr); }
     ino->mode = 0777;                                      /* a link's own bits mean nothing */
-    return vfs_attach_child_unlocked(parent, last, ino) ? 0 : -1;
+    if (!vfs_attach_child_unlocked(parent, last, ino)) return -1;
+    fsnotify_inode(parent->inode, FSN_CREATE, last);              /* §M90 */
+    return 0;
 }
 int vfs_symlink(const char* target, const char* linkpath) {
     return NS_LOCKED(int, vfs_symlink_unlocked(target, linkpath));

@@ -865,6 +865,7 @@ CORE_C_SRCS := \
     kernel/fs/vfs.c \
     kernel/fs/ramfs.c \
     kernel/fs/cgroupfs.c \
+    kernel/fs/inotify.c \
     kernel/fs/devfs.c \
     kernel/fs/procfs.c \
     kernel/fs/exfat.c \
@@ -1051,6 +1052,7 @@ CORE_C_SRCS := \
     kernel/fs/vfs.c \
     kernel/fs/ramfs.c \
     kernel/fs/cgroupfs.c \
+    kernel/fs/inotify.c \
     kernel/fs/procfs.c \
     kernel/fs/devfs.c \
     kernel/fs/exfat.c
@@ -1238,6 +1240,7 @@ CORE_C_SRCS := \
     kernel/fs/vfs.c \
     kernel/fs/ramfs.c \
     kernel/fs/cgroupfs.c \
+    kernel/fs/inotify.c \
     kernel/fs/devfs.c \
     kernel/fs/procfs.c \
     kernel/fs/exfat.c \

@@ -29,7 +29,8 @@ struct usock;                   /* unix socket endpoint (stage 5)          */
  * exactly as the empty slot would. */
 enum fd_kind { FD_VFS, FD_SHM, FD_SOCK, FD_NETSOCK, FD_TIMER, FD_EPOLL, FD_CONSOLE, FD_EVENT,
                FD_NETLINK /* §M90 */, FD_FIFO /* §M90 — a named pipe end, fifo.c */,
-               FD_BPF /* §M90 — an eBPF program, bpf.c */ };
+               FD_BPF /* §M90 — an eBPF program, bpf.c */,
+               FD_INOTIFY /* §M90 — an inotify instance, inotify.c */ };
 
 struct netsock;                 /* network (AF_INET) socket — usyscall.c        */
 struct timerfd;                 /* §M53 stage 3 — a deadline behind a descriptor */
@@ -74,8 +75,12 @@ struct ofile {
     uint64_t       shm_pos;
     /* §M90 — APPENDED.  FD_BPF: the loaded program (bpf.c), one reference. */
     struct bpf_prog* bpf;
+    /* §M90 — APPENDED.  FD_INOTIFY: the instance (inotify.c), owned. */
+    struct inotify*  ino;
 };
 struct ofile* ofile_from_bpf(struct bpf_prog* p);   /* §M90 — takes a reference */
+struct inotify;
+struct ofile* ofile_from_inotify(struct inotify* in);   /* §M90 — takes ownership */
 /* §M90 — install `o` in the caller's lowest free slot (>= 3); the fd or -1. */
 int fd_install_k(struct ofile* o);
 

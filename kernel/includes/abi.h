@@ -199,6 +199,8 @@ enum abi_op {
     ABI_CAPSET,                                        /* §M90 */
     ABI_SETGROUPS, ABI_SETRESUID, ABI_SETRESGID,       /* §M90 */
     ABI_GETRESUID, ABI_GETRESGID, ABI_SETREUID, ABI_SETREGID,
+    ABI_INOTIFY_INIT1, ABI_INOTIFY_INIT,               /* §M90 rung 3 — inotify */
+    ABI_INOTIFY_ADD_WATCH, ABI_INOTIFY_RM_WATCH,
     ABI_RMDIR,              /* §M90 */  /* §M90 — lchown maps to ABI_CHOWN: no per-call
                                * link handling, see h_fchownat */
     /* §M73 — identity.  The answer is the task's §M32 credential: a container

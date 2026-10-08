@@ -9,6 +9,7 @@
  * ============================================================================= */
 
 #include "proc.h"
+#include "cgroupfs.h"   /* §M90 rung 3 — pids.max */
 #include "elf.h"
 #include "vmm.h"
 #include "pmm.h"
@@ -963,7 +964,12 @@ static int fork_vnr(int pid) {
     struct task* c = pid > 0 ? task_find(pid) : NULL;
     return c ? ns_vnr(task_current(), c) : pid;
 }
-int proc_fork_vnr(struct user_regs* r) { int p = proc_fork(r); return p > 0 ? fork_vnr(p) : p; }
+int proc_fork_vnr(struct user_regs* r) {
+    /* §M90 rung 3 — pids.max answers EAGAIN, as Linux's fork does. */
+    if (!cgroup_fork_allowed(task_current())) return -11;
+    int p = proc_fork(r);
+    return p > 0 ? fork_vnr(p) : p;
+}
 
 int vfs_mntns_new(int parent);
 long proc_clone_fork(struct user_regs* r, unsigned long flags, uintptr_t stack,
@@ -976,6 +982,7 @@ long proc_clone_fork(struct user_regs* r, unsigned long flags, uintptr_t stack,
     }
     struct task* me = task_current();
     if (!me) return -22;
+    if (!cgroup_fork_allowed(me)) return -11;      /* §M90 rung 3 — pids.max: EAGAIN */
     if ((flags & (NS_CLONE_NEWNS | CL_NSOBJ)) &&
         cred_uid(&me->cred) != 0 && !cred_is_admin(&me->cred)) return -1;   /* EPERM */
     if ((flags & CL_PARENT_SETTID) && !vmm_user_access_ok(ptid, sizeof(int), 1)) return -14;

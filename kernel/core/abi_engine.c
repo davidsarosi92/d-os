@@ -9,6 +9,7 @@
  * that it does not fit is the design telling you something.
  * ============================================================================= */
 
+#include "fsnotify.h"   /* §M90 rung 3 — inotify */
 #include "lnx_signal.h"   /* §M89 */
 #include "abi.h"
 #include "nsproxy.h"
@@ -513,6 +514,22 @@ static long h_fsync(struct abi_ctx* c)   { return sys_fsync((int)c->a[0]); }
 static long abi_cx(long fd, unsigned long flags) {
     if (fd >= 0 && (flags & ABI_O_CLOEXEC)) fd_set_cloexec((int)fd, 1);
     return fd;
+}
+
+/* §M90 rung 3 — inotify (kernel/fs/inotify.c).  The path is copied in and
+ * resolved as the caller sees it (its root, cwd and mount namespace), like
+ * every other path-taking call here. */
+static long h_inotify_init1(struct abi_ctx* c) {
+    return abi_cx(sys_inotify_init((int)c->a[0]), c->a[0]);
+}
+static long h_inotify_init(struct abi_ctx* c) { (void)c; return sys_inotify_init(0); }
+static long h_inotify_add_watch(struct abi_ctx* c) {
+    char kp[256];
+    if (abi_path(c->a[1], kp, sizeof kp) != 0) return -ABI_EFAULT;
+    return sys_inotify_add_watch((int)c->a[0], kp, (uint32_t)c->a[2]);
+}
+static long h_inotify_rm_watch(struct abi_ctx* c) {
+    return sys_inotify_rm_watch((int)c->a[0], (int)c->a[1]);
 }
 
 /* Linux open flags → VFS flags.  The access mode, O_CREAT and O_TRUNC share
@@ -3032,6 +3049,10 @@ static const struct {
     [ABI_GETRESGID]       = { "getresgid",       h_getresgid },
     [ABI_SETREUID]        = { "setreuid",        h_setreuid },
     [ABI_SETREGID]        = { "setregid",        h_setregid },
+    [ABI_INOTIFY_INIT1]   = { "inotify_init1",   h_inotify_init1 },
+    [ABI_INOTIFY_INIT]    = { "inotify_init",    h_inotify_init },
+    [ABI_INOTIFY_ADD_WATCH] = { "inotify_add_watch", h_inotify_add_watch },
+    [ABI_INOTIFY_RM_WATCH]  = { "inotify_rm_watch",  h_inotify_rm_watch },
     /* §M24 — the socket surface, shared by all three arches at once. */
     [ABI_SOCKET]       = { "socket",       h_socket       },
     [ABI_SOCKETPAIR]   = { "socketpair",   h_socketpair   },   /* §M90 */

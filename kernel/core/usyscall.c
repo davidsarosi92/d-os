@@ -33,6 +33,7 @@
  *      so a concurrent munmap turns into a short count or -EFAULT.
  * ============================================================================= */
 
+#include "fsnotify.h"   /* §M90 — FD_INOTIFY */
 #include "syscall.h"
 #include "task.h"
 #include "vfs.h"
@@ -454,6 +455,7 @@ long sys_read_k(int fd, void* buf, size_t n) {
     if (o->kind == FD_EVENT) return eventfd_read(o->efd, buf, n, block);   /* §M90 */
     if (o->kind == FD_NETLINK) return nl_recv(o->nl, buf, n, block, 0, 0); /* §M90 */
     if (o->kind == FD_FIFO) return fifo_read(o, buf, n, block);           /* §M90 */
+    if (o->kind == FD_INOTIFY) return inotify_read(o->ino, buf, n, block); /* §M90 */
     if (o->kind == FD_SHM && o->shm) {             /* §M90 — and read like one */
         size_t r = shm_read(o->shm, o->shm_pos, buf, n);
         o->shm_pos += r;
@@ -1434,6 +1436,11 @@ uint32_t fd_readiness_of(int fd, struct ofile* o) {
     case FD_NETLINK:
         if (nl_can_read(o->nl)) r |= POLLIN;
         r |= POLLOUT;
+        break;
+    /* §M90 — an inotify instance: readable while events are queued; never
+     * writable (a write to it is EINVAL on Linux too). */
+    case FD_INOTIFY:
+        if (inotify_can_read(o->ino)) r |= POLLIN;
         break;
     /* §M90 — a named pipe end: Linux pipe_poll's rules (fifo.c). */
     case FD_FIFO:
@@ -2744,6 +2751,7 @@ int sys_fd_link_of(struct task* t, int fd, char* out, size_t cap) {
     case FD_EPOLL:   tag = "anon_inode:[eventpoll]"; break;
     case FD_TIMER:   tag = "anon_inode:[timerfd]"; break;
     case FD_BPF:     tag = "anon_inode:bpf-prog"; break;
+    case FD_INOTIFY: tag = "anon_inode:inotify"; break;
     case FD_CONSOLE: tag = "/dev/console"; break;
     default:         tag = "anon_inode:[?]"; break;
     }

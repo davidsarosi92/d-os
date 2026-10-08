@@ -590,6 +590,13 @@ struct task {
      * checks it before every later operation, so a recycled pid is never
      * mistaken for the container's init. */
     uint64_t    start_ms;
+    /* §M90 rung 3 — up to which moment (ms of the monotonic clock) this
+     * task's CPU time has been charged to its cgroup's cpu.max budget.  The
+     * tick charges the running task incrementally (a lone hog on a CPU is
+     * never switched out, so charging only at the switch would never charge
+     * it), the switch charges the remainder; this mark stops the two from
+     * charging the same milliseconds twice. */
+    uint64_t    cg_cpu_mark_ms;
 };
 
 /* §M90 — the process a task belongs to: its own pid unless it is a thread. */
@@ -721,6 +728,11 @@ void task_exit_code(int code) __attribute__((noreturn));
 /* §M90 — exit_group: end every thread of the caller's process, then the
  * caller; the group's code is what the parent's wait sees. */
 void task_exit_group(int code) __attribute__((noreturn));
+
+/* §M90 rung 3 — the cgroup OOM killer's kill: every thread of `tgid` ends
+ * with `code`, no permission check (a kernel policy, not a signal
+ * from a program).  See task.c. */
+void task_kill_group_oom(int tgid, int code);
 
 /* M27 — process model.
  *

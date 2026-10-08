@@ -4,6 +4,7 @@
  * bookkeeping.
  * ============================================================================= */
 
+#include "fsnotify.h"   /* §M90 — FD_INOTIFY */
 #include "fd.h"
 #include "fifo.h"
 #include "bpf.h"
@@ -54,6 +55,13 @@ struct ofile* ofile_from_bpf(struct bpf_prog* p) {
     if (!p) return NULL;
     struct ofile* o = ofile_alloc(FD_BPF);
     if (o) { bpf_prog_ref_get(p); o->bpf = p; }
+    return o;
+}
+/* §M90 — an inotify instance behind a descriptor (inotify.c). */
+struct ofile* ofile_from_inotify(struct inotify* in) {
+    if (!in) return NULL;
+    struct ofile* o = ofile_alloc(FD_INOTIFY);
+    if (o) { o->ino = in; inotify_set_owner(in, o); }
     return o;
 }
 struct ofile* ofile_from_file(struct file* f) {
@@ -155,6 +163,7 @@ void ofile_unref(struct ofile* o) {
         case FD_NETLINK: if (o->nl)    nl_close(o->nl);          break;
         case FD_FIFO:    fifo_detach(o); if (o->file) vfs_close(o->file); break;
         case FD_BPF:     bpf_prog_put(o->bpf); break;
+        case FD_INOTIFY: inotify_close(o->ino); break;
     }
     o->kind = (enum fd_kind)0x0DEAD;     /* the poison, see above */
     kfree(o);

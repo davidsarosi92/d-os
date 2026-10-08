@@ -667,7 +667,12 @@ static void gen_selfcgroup(struct procfs_writer* w) {
     char view[256];
     struct task* t = procfs_target();
     cgroup_path_of(t, path, sizeof path);
-    ns_cgroup_view(t, path, view, sizeof view);          /* §M90 — its cgroup namespace */
+    /* §M90 rung 3 — relative to the READER's cgroup namespace, as Linux
+     * prints it, not the target's: containerd's shim reads
+     * /proc/<container init>/cgroup from OUTSIDE the container's namespace
+     * to find the cgroup it must watch, and with the target's view it heard
+     * "0::/" and went looking for /sys/fs/cgroup/memory.events. */
+    ns_cgroup_view(task_current(), path, view, sizeof view);
     pw_puts(w, "0::"); pw_puts(w, view); pw_putc(w, '\n');
 }
 static struct procfs_node nd_selfcgroup = { .name = "self/cgroup",    .gen = gen_selfcgroup };

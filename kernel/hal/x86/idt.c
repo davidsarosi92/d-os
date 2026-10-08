@@ -16,6 +16,7 @@
  * APIC (still on legacy 8259), SMP (single-CPU assumption everywhere).
  * ============================================================================= */
 
+#include "cgroupfs.h"   /* §M90 rung 3 — cgroup_oom_victim_self */
 #include "lnx_signal.h"   /* §M89 */
 #include "vma.h"      /* §M89 — demand pages */
 #include "idt.h"
@@ -739,6 +740,10 @@ void isr_handler(struct int_frame* f) {
             struct task* t = task_current();
             int sig = fault_signal((int)f->int_no);
             /* §M89 — a Linux program that handles this signal gets it. */
+            /* §M90 rung 3 — a fault that could not get a frame because the
+             * cgroup OOM killer chose THIS process: it ends with SIGKILL (137),
+             * not with a SIGSEGV and a crash record — a policy, not a bug. */
+            if (cgroup_oom_victim_self()) task_exit_group(137);
             if (lnx_fault_deliver(f, sig, (uintptr_t)_cr2)) return;
             kprintf("\nfault: user EXCEPTION %d (%s) pid %d '%s' "
                     "cs:eip=%x:%p err=%x cr2=%p — killing process\n",

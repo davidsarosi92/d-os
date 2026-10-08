@@ -14,6 +14,7 @@
  * the serial log.  This is diagnostics-grade, not a full decoder.
  * ============================================================================= */
 
+#include "cgroupfs.h"   /* §M90 rung 3 — cgroup_oom_victim_self */
 #include <stdint.h>
 #include "lnx_signal.h"   /* §M89 */
 #include "vma.h"      /* §M89 — demand pages */
@@ -368,6 +369,10 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
                                 (unsigned long)esr, (unsigned long)far,
                                 (unsigned long)tf->elr, (unsigned long)sp0);
                     }
+                    /* §M90 rung 3 — a fault that could not get a frame because the
+                     * cgroup OOM killer chose THIS process: it ends with SIGKILL (137),
+                     * not with a SIGSEGV and a crash record — a policy, not a bug. */
+                    if (cgroup_oom_victim_self()) task_exit_group(137);
                     if (lnx_fault_deliver_esr(tf, lsig, (uintptr_t)far, esr)) {
                         check_el0_return(tf, "signal");
                         return;

@@ -232,7 +232,7 @@ fixed first, whatever it touches.
 | queued UI | ✅ done (§4.116) — Memory page, System information, translations 73 → 0 | — |
 | §M88 | ✅ (§4.118) | open: a taskbar per monitor |
 | §M89 | ◐ → core ✅ | Java: `java Hello.java` from the unmodified JDK on x86_64 + aarch64 (DOCS §4.119); open: `app install` end to end, host-side delivery, rung 5 measurements |
-| §M90 | ◐ ~55-60 % (2026-10-04) | Docker itself on d-os (dockerd + containerd + runc + the CLI), no Docker Desktop — rungs 1-2 ✅ (`docker run … echo hi` prints `hi`, aarch64); next: cgroup limits + inotify, overlayfs, networking, `-it`/build, x86_64 — resume order in §M90 |
+| §M90 | ◐ ~62-65 % (2026-10-08) | Docker itself on d-os (dockerd + containerd + runc + the CLI), no Docker Desktop — rungs 1-2 ✅ (`docker run … echo hi` prints `hi`, aarch64); cgroup limits + inotify ✅ (OOMKilled true/137); next: overlayfs, networking, `-it`/build, x86_64 — resume order in §M90 |
 | §M91 | — | the ABI as its own project: d-os, Linux and NT personalities over one common language (ReactOS's pattern) — designed, not started |
 | §M92 | — | a driver engine for d-os, Linux and Windows drivers — an OPEN QUESTION, recorded, not decided |
 | §M93 | — | installing software as a user: DOWNLOAD from the vendor (`wget`) → `app install` → run, no OCI image required — the guide plus the `.tar.gz` install, glibc decision, manifest, service registration; **next after §M90**, before §M91/§M92 |
@@ -6115,17 +6115,24 @@ fixed-address Go binaries load at 0x200000, inside the low identity map):**
   namespace runc asks for exists.
 - **STATE 2026-10-04, estimated ~55-60 % of the milestone** (by effort: rungs
   1-2, the larger half, are done).  Work pauses until next week.
+- Rung 3's rest DONE (2026-10-08): cgroup v2 limits ENFORCED — pids.max
+  (fork EAGAIN), cpu.max (quota per period, throttled tasks not picked),
+  memory.max (measured near the limit, OOM kill = 137, memory.events) — and
+  inotify (`kernel/fs/inotify.c`).  Through the real Docker on aarch64:
+  `--memory 64m` → OOMKilled true / 137, `--pids-limit` → fork EAGAIN,
+  `--cpus 0.5` → cpu.max 50000 100000.  Not enforced, stated in cgroupfs.c:
+  cpu.weight, memory.high/low/min, swap, io, cpuset.  Open: NEXT #18 (an
+  exec'd image counts as private memory, so `runc init` alone needs ~40 MiB —
+  a charge model is the user's decision).  Estimate now ~62-65 %.
 - **RESUME HERE — in this order:**
-  1. Rung 3's rest: cgroup v2 LIMITS ENFORCED (`memory.max`, `cpu.max`,
-     `pids.max` — stored today, not enforced), and `inotify` (containerd's
-     OOM-event watch and dockerd's CDI watcher fail without it — warnings
-     today, needed with memory limits).
+  1. (done 2026-10-08 — cgroup limits + inotify)
   2. Rung 4: overlayfs (today `--storage-driver=vfs`).
   3. Rung 5: networking — network namespace, veth, bridge, NAT; `-p 8080:80`.
   4. Rung 6: `docker run -it` (pty/devpts), `docker build`, volumes.
   5. x86_64: waits for the higher-half kernel move.
-  Open beside it: NEXT.md #14 (rare pthread_join hang) and #16 (a non-leader
-  thread's execve keeps its pid); `noexec` accepted, not enforced.
+  Open beside it: NEXT.md #14 (rare pthread_join hang), #16 (a non-leader
+  thread's execve keeps its pid) and #18 (memory.max counts exec'd images);
+  `noexec` accepted, not enforced.
 - Test recipe (aarch64, ~15 min a run): `scripts/dos-shell-test.py --arch
   aarch64 --smp 2 --mem 3G --disk build/aarch64/dk.img --via serial
   --boot-timeout 240 --between 45` with `mkdir /run`, `containerd &`,

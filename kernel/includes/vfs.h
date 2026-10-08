@@ -550,4 +550,11 @@ struct dentry* vfs_resolve_nofollow(const char* path); /* §M89 — a final link
 int vfs_canonical(const char* path, char* out, size_t cap);
 void           vfs_chown_tree(struct dentry* d, int uid, int gid);   /* §M73 */
 
+/* §M90 — inotify (fsnotify.h): the inode `path` names (following a final
+ * symlink when `follow`), or NULL; *is_dir says whether it is a directory. */
+struct inode* vfs_watch_inode(const char* path, int follow, int* is_dir);
+/* 1 while any inotify watch exists (a single load: the VFS's write path asks
+ * before taking the namespace lock for an event nobody would receive). */
+int vfs_watch_active(void);
+
 #endif

@@ -18,6 +18,7 @@
  * Reference: AMD64 APM Vol 2 §8.9 (Long-Mode Interrupt Descriptors).
  * ============================================================================= */
 
+#include "cgroupfs.h"   /* §M90 rung 3 — cgroup_oom_victim_self */
 #include "lnx_signal.h"   /* §M89 */
 #include "vma.h"      /* §M89 — demand pages */
 #include "idt.h"
@@ -635,6 +636,10 @@ void isr_handler(struct int_frame* f) {
             /* §M89 — a Linux program that HANDLES this signal gets it, with
              * the address, instead of dying: a JVM's null checks and stack
              * guards are faults on purpose.  Unhandled, it dies as before. */
+            /* §M90 rung 3 — a fault that could not get a frame because the
+             * cgroup OOM killer chose THIS process: it ends with SIGKILL (137),
+             * not with a SIGSEGV and a crash record — a policy, not a bug. */
+            if (cgroup_oom_victim_self()) task_exit_group(137);
             if (lnx_fault_deliver(f, sig, (uintptr_t)ucr2)) return;
             /* cr2 names the address, cr3 the address space the CPU was in —
              * "a page is missing" and "the task ran in somebody else's space"

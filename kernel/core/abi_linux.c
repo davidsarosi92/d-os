@@ -179,6 +179,9 @@ static const struct abi_nument linux_i386_ents[] = {
      * pipeline) failed on the one arch that had never been asked. */
     {  42, ABI_PIPE   },
     { 331, ABI_PIPE2  },
+    /* §M90 rung 3 — inotify: init 291, add_watch 292, rm_watch 293, init1 332. */
+    { 291, ABI_INOTIFY_INIT }, { 292, ABI_INOTIFY_ADD_WATCH }, { 293, ABI_INOTIFY_RM_WATCH },
+    { 332, ABI_INOTIFY_INIT1 },
 };
 
 /* ---- Linux / amd64 -------------------------------------------------------- */
@@ -297,6 +300,9 @@ static const struct abi_nument linux_amd64_ents[] = {
     {  18, ABI_PWRITE64 }, { 204, ABI_SCHED_GETAFFINITY }, { 203, ABI_SCHED_SETAFFINITY },
     { 273, ABI_SET_ROBUST_LIST }, { 271, ABI_PPOLL }, {  88, ABI_SYMLINK }, { 266, ABI_SYMLINKAT },
     { 288, ABI_ACCEPT4     },
+    /* §M90 rung 3 — inotify: init 253, add_watch 254, rm_watch 255, init1 294. */
+    { 253, ABI_INOTIFY_INIT }, { 254, ABI_INOTIFY_ADD_WATCH }, { 255, ABI_INOTIFY_RM_WATCH },
+    { 294, ABI_INOTIFY_INIT1 },
     /* §M65 — d-os display-bridge op; the SAME number on every guest,
      * because it is ours to choose (Linux has no such call). */
     { 0xD054, ABI_UI_BUILD },
@@ -418,6 +424,8 @@ static const struct abi_nument linux_arm64_ents[] = {
     {  99, ABI_SET_ROBUST_LIST }, {  73, ABI_PPOLL }, {  36, ABI_SYMLINKAT },
     { 210, ABI_SHUTDOWN    },
     { 242, ABI_ACCEPT4     },
+    /* §M90 rung 3 — inotify: init1 26, add_watch 27, rm_watch 28 (no plain init). */
+    {  26, ABI_INOTIFY_INIT1 }, {  27, ABI_INOTIFY_ADD_WATCH }, {  28, ABI_INOTIFY_RM_WATCH },
     /* §M65 — d-os display-bridge op; the SAME number on every guest,
      * because it is ours to choose (Linux has no such call). */
     { 0xD054, ABI_UI_BUILD },

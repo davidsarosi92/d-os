@@ -17,10 +17,19 @@
  * count the members, cgroup.kill kills them and cgroup.freeze stops and
  * resumes them through §M72's TASK_STOPPED.
  *
+ * WHAT IS ENFORCED (§M90 rung 3, 2026-10-08) — see "ENFORCEMENT" below:
+ * pids.max (fork/clone refused with EAGAIN), cpu.max (quota per period: a
+ * node that spent its quota is not scheduled until the period ends) and
+ * memory.max (an OOM kill inside the node, SIGKILL = exit 137, counted in
+ * memory.events).  Limits are hierarchical; current/peak/stat figures count
+ * the whole subtree, as on Linux.
+ *
  * WHAT IT IS NOT YET — said here so a pass is not read as more than it is:
- * the LIMITS (memory.max, pids.max, cpu.max, cpu.weight, io.*, cpuset.*) are
- * stored and read back but not enforced; enforcement is §M90 rung 3 ("cgroup
- * limits enforced"), where memory.max is to become a §M72 reserve per node.
+ * cpu.weight, memory.high/low/min, memory.swap.max, io.* and cpuset.* are
+ * stored and read back but NOT enforced (a write is accepted so runc and
+ * dockerd can configure a container; nothing throttles on them).  memory.max
+ * has no reclaim stage: Linux first shrinks the page cache and swaps, here
+ * the first answer to "over the limit" is the OOM kill.
  * The "no internal processes" rule and the threaded mode are not modelled
  * (cgroup.type answers "domain").  rmdir of a node whose control file is
  * still OPEN frees the node under the open file — Linux keeps it alive; this
@@ -44,6 +53,10 @@
 #include "printf.h"
 #include "percpu.h"
 #include "module.h"
+#include "lock.h"
+#include "timer.h"
+#include "klog.h"
+#include "fsnotify.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -56,7 +69,7 @@ enum cgk {
     K_CPU_MAX, K_CPU_WEIGHT, K_CPU_STAT,
     K_MEM_MAX, K_MEM_HIGH, K_MEM_LOW, K_MEM_MIN, K_MEM_CURRENT, K_MEM_PEAK,
     K_MEM_SWAP_MAX, K_MEM_SWAP_CUR, K_MEM_EVENTS, K_MEM_STAT, K_MEM_OOM_GROUP,
-    K_PIDS_MAX, K_PIDS_CURRENT,
+    K_PIDS_MAX, K_PIDS_CURRENT, K_PIDS_EVENTS,
     K_IO_MAX, K_IO_WEIGHT, K_IO_STAT,
     K_CPUSET_CPUS, K_CPUSET_MEMS, K_CPUSET_CPUS_EFF, K_CPUSET_MEMS_EFF,
     K_N
@@ -91,6 +104,7 @@ static const struct { const char* name; char root; char rw; const char* def; } g
     [K_MEM_OOM_GROUP] = { "memory.oom.group",        0, 1, "0" },
     [K_PIDS_MAX]      = { "pids.max",                0, 1, "max" },
     [K_PIDS_CURRENT]  = { "pids.current",            0, 0, NULL },
+    [K_PIDS_EVENTS]   = { "pids.events",             0, 0, NULL },
     [K_IO_MAX]        = { "io.max",                  0, 1, "" },
     [K_IO_WEIGHT]     = { "io.weight",               0, 1, "default 100" },
     [K_IO_STAT]       = { "io.stat",                 1, 0, NULL },
@@ -119,6 +133,25 @@ struct cgroup {
     int            frozen;
     uint64_t       mem_peak;
     char           val[K_N][CG_VAL];     /* stored text of the limit files */
+
+    /* §M90 rung 3 — the parsed limits and their enforcement state.  -1 =
+     * "max" (no limit).  The text in val[] is what reads back; these are what
+     * the hooks consult, so a hot path never parses. */
+    int64_t        pids_max;
+    uint64_t       pids_ev_max;          /* pids.events "max": forks refused  */
+    int64_t        mem_max;              /* bytes, page-aligned               */
+    uint64_t       mem_est;              /* an UPPER estimate of the usage    */
+    int            mem_stale;            /* the estimate must be re-measured  */
+    int            oom_tgid;             /* an OOM kill under way, or 0       */
+    uint64_t       mem_ev_max, mem_ev_oom, mem_ev_oom_kill;
+    spinlock_t     cpu_lock;             /* the cpu.max state below           */
+    int64_t        cpu_quota_us;
+    uint64_t       cpu_period_us;
+    uint64_t       cpu_period_start_ms;
+    uint64_t       cpu_used_us;          /* in the current period             */
+    int            cpu_throttled;
+    uint64_t       cpu_throttle_start_ms;
+    uint64_t       cpu_nr_periods, cpu_nr_throttled, cpu_throttled_us;
 };
 
 static struct cgroup g_root;
@@ -169,6 +202,26 @@ static void cg_init(struct cgroup* cg, struct cgroup* parent, const char* name) 
         cg->files[k].private = &cg->fp[k];
         if (g_kind[k].def) s_cpy(cg->val[k], g_kind[k].def, CG_VAL);
     }
+    cg->pids_max = -1;
+    cg->mem_max = -1;
+    cg->mem_stale = 1;
+    cg->cpu_quota_us = -1;
+    cg->cpu_period_us = 100000;
+    spinlock_t z = SPINLOCK_INIT;
+    cg->cpu_lock = z;
+}
+
+/* Is node `c` inside the subtree rooted at `anc` (itself included)? */
+static int cg_within(const struct cgroup* c, const struct cgroup* anc) {
+    for (; c; c = c->parent) if (c == anc) return 1;
+    return 0;
+}
+
+/* A control file's content changed by itself (an event counter, populated):
+ * tell anyone watching it with inotify — containerd watches memory.events to
+ * learn of an OOM kill, which is how `docker inspect` comes to say OOMKilled. */
+static void cg_changed(struct cgroup* cg, int k) {
+    fsnotify_inode(&cg->files[k], FSN_MODIFY, NULL);
 }
 
 static uint32_t cg_available(const struct cgroup* cg) {
@@ -223,6 +276,39 @@ static void cg_scan(struct cgroup* cg, struct scan* s, struct wbuf* w, int procs
     task_for_each(scan_fn, s);
 }
 
+/* §M90 rung 3 — the SUBTREE totals (Linux's pids.current, memory.current,
+ * cpu.stat and cgroup.events count descendants too), small enough for the
+ * stack of a fault path, plus the OOM killer's candidate: the process holding
+ * the most private memory, skipping oom_score_adj -1000 ("never kill me"). */
+struct tally { struct cgroup* cg; uint64_t tasks, mem, cpu_ms;
+               int best_tgid; uint64_t best_mem; int best_adj; };
+
+static void tally_fn(const struct task* t, int is_current, void* ctx) {
+    (void)is_current;
+    struct tally* a = (struct tally*)ctx;
+    if (t->state == TASK_DEAD || !cg_within(task_cg(t), a->cg)) return;
+    a->tasks++;
+    a->cpu_ms += t->cpu_ms;
+    uint64_t priv = 0; int owns = 0;
+    task_mem_bytes(t, &priv, NULL, &owns);
+    a->mem += priv;
+    if (owns && t->oom_score_adj > -1000 && !t->kill_pending) {
+        /* Linux's badness: usage plus oom_score_adj thousandths of the limit;
+         * here the adj only breaks ties toward the more willing victim. */
+        if (!a->best_tgid || priv > a->best_mem ||
+            (priv == a->best_mem && t->oom_score_adj > a->best_adj)) {
+            a->best_tgid = task_tgid(t); a->best_mem = priv; a->best_adj = t->oom_score_adj;
+        }
+    }
+}
+
+static void cg_tally(struct cgroup* cg, struct tally* a) {
+    a->cg = cg; a->tasks = a->mem = a->cpu_ms = 0;
+    a->best_tgid = 0; a->best_mem = 0; a->best_adj = -1000;
+    task_for_each(tally_fn, a);
+    if (a->mem > cg->mem_peak) cg->mem_peak = a->mem;
+}
+
 struct move { int tgid; int tid; struct cgroup* to; int moved; };
 static void move_fn(const struct task* t, int is_current, void* ctx) {
     (void)is_current;
@@ -231,13 +317,20 @@ static void move_fn(const struct task* t, int is_current, void* ctx) {
     if (m->tid ? t->pid == m->tid : task_tgid(t) == m->tgid) {
         ((struct task*)t)->cgroup = cg_is_root(m->to) ? NULL : m->to;
         m->moved++;
+        /* What the member brings must be MEASURED before the next charge is
+         * believed: the estimate counts frames charged since the last
+         * measurement and knows nothing about memory that walked in. */
+        for (struct cgroup* c = m->to; c; c = c->parent) c->mem_stale = 1;
     }
 }
 
 /* ---- control files: read -------------------------------------------------- */
 
+static void cpu_period_roll(struct cgroup* c, uint64_t now);
+
 static void gen(struct cgroup* cg, int k, struct wbuf* w) {
     struct scan s;
+    struct tally a;
     switch (k) {
     case K_CONTROLLERS: case K_SUBTREE: {
         uint32_t m = (k == K_CONTROLLERS) ? cg_available(cg) : cg->subtree;
@@ -251,8 +344,8 @@ static void gen(struct cgroup* cg, int k, struct wbuf* w) {
     case K_THREADS: cg_scan(cg, &s, w, 0); return;
     case K_TYPE:    w_s(w, "domain\n"); return;
     case K_EVENTS:
-        cg_scan(cg, &s, NULL, 0);
-        w_s(w, "populated "); w_u(w, s.alive ? 1 : 0);
+        cg_tally(cg, &a);
+        w_s(w, "populated "); w_u(w, a.tasks ? 1 : 0);
         w_s(w, "\nfrozen "); w_u(w, (uint64_t)cg->frozen); w_s(w, "\n");
         return;
     case K_STAT:
@@ -260,24 +353,41 @@ static void gen(struct cgroup* cg, int k, struct wbuf* w) {
         w_s(w, "\nnr_dying_descendants 0\n");
         return;
     case K_FREEZE: w_u(w, (uint64_t)cg->frozen); w_s(w, "\n"); return;
-    case K_CPU_STAT:
-        cg_scan(cg, &s, NULL, 0);
-        w_s(w, "usage_usec "); w_u(w, s.cpu_ms * 1000);
-        w_s(w, "\nuser_usec "); w_u(w, s.cpu_ms * 1000);
-        w_s(w, "\nsystem_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\n");
+    case K_CPU_STAT: {
+        cg_tally(cg, &a);
+        uint64_t np, nt, tu;
+        uint32_t fl = spin_lock_irqsave(&cg->cpu_lock);
+        if (cg->cpu_quota_us >= 0) cpu_period_roll(cg, timer_ticks_ms());
+        np = cg->cpu_nr_periods; nt = cg->cpu_nr_throttled; tu = cg->cpu_throttled_us;
+        if (cg->cpu_throttled) tu += (timer_ticks_ms() - cg->cpu_throttle_start_ms) * 1000;
+        spin_unlock_irqrestore(&cg->cpu_lock, fl);
+        /* This kernel does not split user from system time per task: all of
+         * it is reported as user, and system_usec as 0 — stated, not hidden. */
+        w_s(w, "usage_usec "); w_u(w, a.cpu_ms * 1000);
+        w_s(w, "\nuser_usec "); w_u(w, a.cpu_ms * 1000);
+        w_s(w, "\nsystem_usec 0\nnr_periods "); w_u(w, np);
+        w_s(w, "\nnr_throttled "); w_u(w, nt);
+        w_s(w, "\nthrottled_usec "); w_u(w, tu);
+        w_s(w, "\nnr_bursts 0\nburst_usec 0\n");
         return;
+    }
     case K_MEM_CURRENT: case K_MEM_PEAK:
-        cg_scan(cg, &s, NULL, 0);
-        if (s.mem > cg->mem_peak) cg->mem_peak = s.mem;
-        w_u(w, k == K_MEM_CURRENT ? s.mem : cg->mem_peak); w_s(w, "\n");
+        cg_tally(cg, &a);
+        w_u(w, k == K_MEM_CURRENT ? a.mem : cg->mem_peak); w_s(w, "\n");
         return;
     case K_MEM_SWAP_CUR: w_s(w, "0\n"); return;
-    case K_MEM_EVENTS:  w_s(w, "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n"); return;
-    case K_MEM_STAT:
-        cg_scan(cg, &s, NULL, 0);
-        w_s(w, "anon "); w_u(w, s.mem); w_s(w, "\nfile 0\nkernel 0\nsock 0\nshmem 0\n");
+    case K_MEM_EVENTS:
+        w_s(w, "low 0\nhigh 0\nmax "); w_u(w, cg->mem_ev_max);
+        w_s(w, "\noom "); w_u(w, cg->mem_ev_oom);
+        w_s(w, "\noom_kill "); w_u(w, cg->mem_ev_oom_kill);
+        w_s(w, "\noom_group_kill 0\n");
         return;
-    case K_PIDS_CURRENT: cg_scan(cg, &s, NULL, 0); w_u(w, s.tasks); w_s(w, "\n"); return;
+    case K_MEM_STAT:
+        cg_tally(cg, &a);
+        w_s(w, "anon "); w_u(w, a.mem); w_s(w, "\nfile 0\nkernel 0\nsock 0\nshmem 0\n");
+        return;
+    case K_PIDS_CURRENT: cg_tally(cg, &a); w_u(w, a.tasks); w_s(w, "\n"); return;
+    case K_PIDS_EVENTS: w_s(w, "max "); w_u(w, cg->pids_ev_max); w_s(w, "\n"); return;
     case K_IO_STAT: return;
     case K_CPUSET_CPUS_EFF: {
         int n = smp_ncpus();
@@ -320,6 +430,34 @@ static int parse_int(const char* s, long* out) {
     while (*s >= '0' && *s <= '9') { v = v * 10 + (*s++ - '0'); any = 1; }
     *out = v;
     return any ? 0 : -1;
+}
+
+/* "max" -> -1; else a non-negative integer, with memparse's K/M/G/T suffix
+ * when `suffix` (memory.max accepts "512M", as on Linux).  -2 = malformed. */
+static int64_t parse_limit(const char* s, int suffix) {
+    while (*s == ' ' || *s == '\t') s++;
+    if (s_eq(s, "max")) return -1;
+    int64_t v = 0; int any = 0;
+    while (*s >= '0' && *s <= '9') { v = v * 10 + (*s++ - '0'); any = 1; }
+    if (!any) return -2;
+    if (suffix) {
+        int sh = 0;
+        switch (*s) {
+        case 'k': case 'K': sh = 10; s++; break;
+        case 'm': case 'M': sh = 20; s++; break;
+        case 'g': case 'G': sh = 30; s++; break;
+        case 't': case 'T': sh = 40; s++; break;
+        }
+        v <<= sh;
+    }
+    return *s ? -2 : v;
+}
+
+static void put_limit(char* out, int64_t v) {
+    if (v < 0) { s_cpy(out, "max", CG_VAL); return; }
+    struct wbuf w = { out, 0, CG_VAL };
+    out[0] = 0;
+    w_u(&w, (uint64_t)v);
 }
 
 static int set_subtree(struct cgroup* cg, const char* s) {
@@ -395,6 +533,52 @@ static ssize_t cg_write(struct file* f, const void* buf, size_t n, uint64_t off)
         return -1;
     case K_TYPE:
         return s_eq(s, "domain") ? (ssize_t)n : -1;   /* threaded mode: not modelled */
+    case K_PIDS_MAX: {
+        int64_t v = parse_limit(s, 0);
+        if (v == -2) return -1;
+        cg->pids_max = v;
+        put_limit(cg->val[K_PIDS_MAX], v);
+        return (ssize_t)n;
+    }
+    case K_MEM_MAX: {
+        int64_t v = parse_limit(s, 1);
+        if (v == -2) return -1;
+        if (v >= 0) v &= ~(int64_t)4095;          /* Linux rounds down to a page */
+        cg->mem_max = v;
+        cg->mem_stale = 1;                        /* measure before the next charge */
+        put_limit(cg->val[K_MEM_MAX], v);
+        return (ssize_t)n;
+    }
+    case K_CPU_MAX: {
+        /* "$MAX $PERIOD", "$MAX" or "max [$PERIOD]"; period 1 ms .. 1 s and
+         * a quota of at least 1 ms, Linux's bounds. */
+        char q[24]; int i = 0;
+        const char* p = s;
+        while (*p == ' ') p++;
+        while (*p && *p != ' ' && i < 23) q[i++] = *p++;
+        q[i] = 0;
+        int64_t quota = parse_limit(q, 0);
+        if (quota == -2 || (quota >= 0 && quota < 1000)) return -1;
+        uint64_t period = cg->cpu_period_us;
+        while (*p == ' ') p++;
+        if (*p) {
+            int64_t pv = parse_limit(p, 0);
+            if (pv < 1000 || pv > 1000000) return -1;
+            period = (uint64_t)pv;
+        }
+        uint32_t fl = spin_lock_irqsave(&cg->cpu_lock);
+        cg->cpu_quota_us = quota;
+        cg->cpu_period_us = period;
+        cg->cpu_period_start_ms = 0;              /* a fresh period from the next charge */
+        cg->cpu_used_us = 0;
+        cg->cpu_throttled = 0;
+        spin_unlock_irqrestore(&cg->cpu_lock, fl);
+        put_limit(cg->val[K_CPU_MAX], quota);
+        size_t o = s_len(cg->val[K_CPU_MAX]);
+        struct wbuf w = { cg->val[K_CPU_MAX], o, CG_VAL };
+        w_s(&w, " "); w_u(&w, period);
+        return (ssize_t)n;
+    }
     default:
         s_cpy(cg->val[cf->kind], s, CG_VAL);
         return (ssize_t)n;
@@ -468,6 +652,9 @@ static int cg_unlink(struct inode* dir, const char* name, struct inode* child) {
     if (s.alive) return -2;                                 /* EBUSY: members */
     parent->nchildren--;
     bpf_cgroup_gone(cg);                        /* §M90 — its device programs go too */
+    /* §M90 rung 3 — the control files are freed with the node: their
+     * inotify watches end now (containerd watches memory.events). */
+    for (int k = 0; k < K_N; k++) fsnotify_inode_gone(&cg->files[k]);
     kfree(cg);
     return 0;
 }
@@ -478,6 +665,203 @@ static const struct inode_ops cg_inode_ops = {
     .mkdir  = cg_mkdir,
     .unlink = cg_unlink,
 };
+
+/* ---- ENFORCEMENT (§M90 rung 3) ---------------------------------------------
+ *
+ * Each hook starts at the task's own node and walks up to (not including) the
+ * root, so a container inside a parent that runc gave a limit is bounded by
+ * both.  A task in the root costs one pointer test.
+ *
+ * KNOWN RACE, stated: the scheduler reads `t->cgroup` without the cgroup
+ * tree's lock.  A task moved out of a node at the very moment that node is
+ * removed (rmdir requires it EMPTY, so the move must come first) could be
+ * read with the old pointer for one pick.  Nodes are removed by runc after
+ * the container is gone, i.e. long after its tasks were last scheduled. */
+
+/* -- pids.max ----------------------------------------------------------------- */
+
+int cgroup_fork_allowed(const struct task* t) {
+    if (!t || !t->cgroup) return 1;
+    for (struct cgroup* c = (struct cgroup*)t->cgroup; c && !cg_is_root(c); c = c->parent) {
+        if (c->pids_max < 0) continue;
+        struct tally a;
+        cg_tally(c, &a);
+        if ((int64_t)a.tasks + 1 > c->pids_max) {
+            c->pids_ev_max++;
+            cg_changed(c, K_PIDS_EVENTS);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* -- cpu.max -----------------------------------------------------------------
+ *
+ * CFS bandwidth control, reduced to its contract: in every period of
+ * `cpu_period_us` the node's tasks together may run `cpu_quota_us`; once that
+ * is spent the node is THROTTLED and none of its tasks is picked until the
+ * period ends.  Time is charged in milliseconds of the monotonic clock — the
+ * tick's granularity (1 ms on x86, 10 ms on aarch64), so a quota below one
+ * tick overshoots by up to a tick per period, and "max 100000" style
+ * accounting is exact only to that grain.  An overrun is not carried into the
+ * next period (Linux's cpu.max.burst is 0 by default, i.e. the same).
+ *
+ * A task is throttled wherever it is — including inside a system call holding
+ * a sleeping lock.  Linux defers the throttle to the return to user mode; this
+ * kernel has no such hook in the scheduler, so a throttled lock holder can
+ * delay others by up to one period.  Spinlock holders are never preempted. */
+
+static void cpu_period_roll(struct cgroup* c, uint64_t now) {
+    uint64_t per = c->cpu_period_us / 1000;
+    if (!per) per = 1;
+    if (!c->cpu_period_start_ms) { c->cpu_period_start_ms = now; return; }
+    if (now < c->cpu_period_start_ms + per) return;
+    uint64_t n = (now - c->cpu_period_start_ms) / per;
+    c->cpu_period_start_ms += n * per;
+    c->cpu_nr_periods += n;
+    c->cpu_used_us = 0;
+    if (c->cpu_throttled) {
+        c->cpu_throttled_us += (now - c->cpu_throttle_start_ms) * 1000;
+        c->cpu_throttled = 0;
+    }
+}
+
+void cgroup_cpu_charge(struct task* t, uint64_t now) {
+    if (!t) return;
+    uint64_t from = t->cg_cpu_mark_ms > t->sched_in_ms ? t->cg_cpu_mark_ms : t->sched_in_ms;
+    t->cg_cpu_mark_ms = now;
+    if (!t->cgroup || now <= from) return;
+    uint64_t us = (now - from) * 1000;
+    for (struct cgroup* c = (struct cgroup*)t->cgroup; c && !cg_is_root(c); c = c->parent) {
+        if (c->cpu_quota_us < 0) continue;
+        uint32_t fl = spin_lock_irqsave(&c->cpu_lock);
+        cpu_period_roll(c, now);
+        c->cpu_used_us += us;
+        if (!c->cpu_throttled && c->cpu_used_us >= (uint64_t)c->cpu_quota_us) {
+            c->cpu_throttled = 1;
+            c->cpu_throttle_start_ms = now;
+            c->cpu_nr_throttled++;
+        }
+        spin_unlock_irqrestore(&c->cpu_lock, fl);
+    }
+}
+
+int cgroup_cpu_throttled(const struct task* t) {
+    if (!t || !t->cgroup) return 0;
+    uint64_t now = 0;
+    for (struct cgroup* c = (struct cgroup*)t->cgroup; c && !cg_is_root(c); c = c->parent) {
+        if (c->cpu_quota_us < 0) continue;
+        if (!now) now = timer_ticks_ms();
+        uint32_t fl = spin_lock_irqsave(&c->cpu_lock);
+        cpu_period_roll(c, now);
+        int thr = c->cpu_throttled;
+        spin_unlock_irqrestore(&c->cpu_lock, fl);
+        if (thr) return 1;
+    }
+    return 0;
+}
+
+/* -- memory.max --------------------------------------------------------------
+ *
+ * THERE IS NO PER-FRAME COUNTER TO CHARGE, ON PURPOSE: §M75 (vmm.h) measures a
+ * space's memory by walking it, because a counter cannot stay right when COW
+ * sharing changes under it.  So the charge keeps an UPPER ESTIMATE: every
+ * user frame taken adds a page, nothing is subtracted, and only when the
+ * estimate crosses the limit is the subtree MEASURED (one walk per member
+ * process).  Usage far below the limit therefore costs an atomic add per
+ * frame; usage at the limit costs a measurement per frame, which is the
+ * price of exactness exactly where exactness decides a kill.
+ *
+ * Over the limit after measuring = OOM: the process with the most private
+ * memory in the node's subtree is killed with SIGKILL (exit 137) — every
+ * process of the subtree when memory.oom.group is 1 — and memory.events
+ * counts max/oom/oom_kill.  While that kill is under way further charges are
+ * allowed (the victim's frames are about to come back; measuring again per
+ * frame would only find the same answer).  A victim never gets another frame.
+ * When every candidate has oom_score_adj -1000 nothing is killed and the
+ * charge simply fails. */
+
+int cgroup_oom_victim_self(void) {
+    struct task* me = task_current();
+    return me && me->kill_pending && me->group_exit_plus1 == 137 + 1;
+}
+
+struct oomall { struct cgroup* cg; int tg[64]; int n; };
+static void oomall_fn(const struct task* t, int is_current, void* ctx) {
+    (void)is_current;
+    struct oomall* o = (struct oomall*)ctx;
+    if (t->state == TASK_DEAD || !cg_within(task_cg(t), o->cg)) return;
+    if (t->tgid && t->tgid != t->pid) return;          /* threads go with their group */
+    if (t->oom_score_adj <= -1000 || o->n >= 64) return;
+    o->tg[o->n++] = t->pid;
+}
+
+int cgroup_mem_charge(void) {
+    struct task* me = task_current();
+    if (!me || !me->cgroup) return 1;
+    if (cgroup_oom_victim_self()) return 0;
+    for (struct cgroup* c = (struct cgroup*)me->cgroup; c && !cg_is_root(c); c = c->parent) {
+        if (c->mem_max < 0) continue;
+        uint64_t est = __atomic_add_fetch(&c->mem_est, 4096, __ATOMIC_RELAXED);
+        if (!c->mem_stale && est <= (uint64_t)c->mem_max) continue;
+        if (c->oom_tgid) {
+            struct task* v = task_find(c->oom_tgid);
+            if (v && v->state != TASK_DEAD) continue;  /* the kill is still under way */
+            c->oom_tgid = 0;
+        }
+        struct tally a;
+        cg_tally(c, &a);
+        c->mem_stale = 0;
+        __atomic_store_n(&c->mem_est, a.mem + 4096, __ATOMIC_RELAXED);
+        if (a.mem + 4096 <= (uint64_t)c->mem_max) continue;
+
+        /* Over the limit, measured. */
+        c->mem_ev_max++;
+        char path[96];
+        cg_path(c, path, sizeof path);
+        int group = s_eq(c->val[K_MEM_OOM_GROUP], "1");
+        if (!group && !a.best_tgid) {
+            klog(KLOG_WARN, "cgroup", "%s: memory.max %lu reached, every member is "
+                 "oom_score_adj -1000 - allocation refused, nothing killed\n",
+                 path, (unsigned long)c->mem_max);
+            cg_changed(c, K_MEM_EVENTS);
+            return 0;
+        }
+        c->mem_ev_oom++;
+        int self_dies = 0;
+        if (group) {
+            struct oomall* o = (struct oomall*)kmalloc(sizeof *o);
+            if (o) {
+                o->cg = c; o->n = 0;
+                task_for_each(oomall_fn, o);
+                for (int i = 0; i < o->n; i++) {
+                    if (o->tg[i] == task_tgid(me)) self_dies = 1;
+                    task_kill_group_oom(o->tg[i], 137);
+                    c->mem_ev_oom_kill++;
+                }
+                if (o->n) c->oom_tgid = o->tg[0];
+                kfree(o);
+            }
+        } else {
+            struct task* v = task_find(a.best_tgid);
+            klog(KLOG_WARN, "cgroup", "%s: memory.max %lu reached (%lu in use) - OOM kill "
+                 "pid %d '%s' (%lu KiB)\n", path, (unsigned long)c->mem_max,
+                 (unsigned long)a.mem, a.best_tgid, v ? v->name : "?",
+                 (unsigned long)(a.best_mem / 1024));
+            task_kill_group_oom(a.best_tgid, 137);
+            c->mem_ev_oom_kill++;
+            c->oom_tgid = a.best_tgid;
+            self_dies = (a.best_tgid == task_tgid(me));
+        }
+        /* Every ancestor's memory.events counts what happened below it. */
+        for (struct cgroup* p = c; p && !cg_is_root(p); p = p->parent) {
+            if (p != c) { p->mem_ev_oom++; p->mem_ev_oom_kill++; }
+            cg_changed(p, K_MEM_EVENTS);
+        }
+        if (self_dies) return 0;
+    }
+    return 1;
+}
 
 /* ---- outside API -------------------------------------------------------- */
 
@@ -584,3 +968,131 @@ void* cgroupfs_parent(void* cg) {
     return (c && !cg_is_root(c)) ? c->parent : NULL;
 }
 void* cgroupfs_task_node(const struct task* t) { return task_cg(t); }
+
+/* ---- `cglimittest` — §M90 rung 3: each limit made to BITE ------------------
+ *
+ * A limit that is stored and read back proves nothing about enforcement (that
+ * was exactly the state before rung 3), so each check here drives real load
+ * into a node and measures what the kernel did to it:
+ *   pids.max   — with the node full, cgroup_fork_allowed says no and
+ *                pids.events counts it; lifting the limit says yes again.
+ *   memory.max — memhog `fill` grows 4 MiB at a time inside an 8 MiB node and
+ *                must end with exit code 137, memory.events oom_kill 1.
+ *   cpu.max    — a kernel spinner in a node allowed 20 ms per 100 ms must get
+ *                about a fifth of the CPU time an unlimited one gets in the
+ *                same wall time, and the node must report throttling. */
+#include "proc.h"
+#include "crash.h"
+extern const unsigned char _binary_user_memhog_elf_start[]         __attribute__((weak));
+extern const unsigned char _binary_user_memhog_elf_end[]           __attribute__((weak));
+extern const unsigned char _binary_user_memhog_x86_64_elf_start[]  __attribute__((weak));
+extern const unsigned char _binary_user_memhog_x86_64_elf_end[]    __attribute__((weak));
+extern const unsigned char _binary_user_memhog_aarch64_elf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_memhog_aarch64_elf_end[]   __attribute__((weak));
+
+static volatile int g_hog_stop;
+static void cg_hog(void) {
+    while (!__atomic_load_n(&g_hog_stop, __ATOMIC_ACQUIRE)) { }
+}
+
+static int ct_contains(const char* hay, const char* needle) {
+    for (; *hay; hay++) {
+        const char* a = hay; const char* b = needle;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (!*b) return 1;
+    }
+    return 0;
+}
+
+/* CPU ms a spinner gets in `ms` of wall time inside node `node` ("" = root). */
+static uint64_t hog_cpu(const char* node_procs, unsigned ms) {
+    __atomic_store_n(&g_hog_stop, 0, __ATOMIC_RELEASE);
+    struct task* h = task_spawn("cg-hog", cg_hog);
+    if (!h) return 0;
+    int pid = h->pid;
+    char p[16]; struct wbuf w = { p, 0, sizeof p }; p[0] = 0; w_u(&w, (uint64_t)pid);
+    if (node_procs) ct_write(node_procs, p);
+    struct task* t = task_find(pid);
+    uint64_t c0 = t ? task_cpu_ms_now(t) : 0;
+    task_msleep(ms);
+    t = task_find(pid);
+    uint64_t c1 = t ? task_cpu_ms_now(t) : 0;
+    __atomic_store_n(&g_hog_stop, 1, __ATOMIC_RELEASE);
+    task_msleep(50);
+    return c1 - c0;
+}
+
+static void cmd_cglimittest(const char* args) {
+    (void)args;
+    struct task* me = task_current();
+    char mypid[16], buf[256];
+    struct wbuf w = { mypid, 0, sizeof mypid };
+    mypid[0] = 0;
+    w_u(&w, (uint64_t)task_tgid(me));
+    int ok = 1;
+    #define CT(cond, what) do { int _c = (cond); kprintf("cglimit: %s %s\n", what, _c ? "ok" : "FAIL"); if (!_c) ok = 0; } while (0)
+    vfs_unlink("/sys/fs/cgroup/lim");
+    CT(vfs_mkdir("/sys/fs/cgroup/lim") == 0, "mkdir lim");
+
+    /* -- pids.max -- */
+    CT(ct_write("/sys/fs/cgroup/lim/cgroup.procs", mypid) == 0, "move self into lim");
+    CT(cgroup_fork_allowed(me), "no limit: a fork is allowed");
+    CT(ct_write("/sys/fs/cgroup/lim/pids.max", "1") == 0, "pids.max = 1");
+    CT(!cgroup_fork_allowed(me), "full node: a fork is refused");
+    CT(ct_read("/sys/fs/cgroup/lim/pids.events", buf, sizeof buf) == 0 && s_eq(buf, "max 1\n"),
+       "pids.events counts the refusal");
+    CT(ct_write("/sys/fs/cgroup/lim/pids.max", "max") == 0 && cgroup_fork_allowed(me),
+       "pids.max = max: allowed again");
+    CT(ct_write("/sys/fs/cgroup/lim/pids.max", "bogus") != 0, "a malformed pids.max is refused");
+
+    /* -- memory.max -- */
+    const unsigned char *s = 0, *e = 0;
+    if (_binary_user_memhog_elf_start)             { s = _binary_user_memhog_elf_start;         e = _binary_user_memhog_elf_end; }
+    else if (_binary_user_memhog_x86_64_elf_start) { s = _binary_user_memhog_x86_64_elf_start;  e = _binary_user_memhog_x86_64_elf_end; }
+    else if (_binary_user_memhog_aarch64_elf_start){ s = _binary_user_memhog_aarch64_elf_start; e = _binary_user_memhog_aarch64_elf_end; }
+    CT(ct_write("/sys/fs/cgroup/lim/memory.max", "8M") == 0 &&
+       ct_read("/sys/fs/cgroup/lim/memory.max", buf, sizeof buf) == 0 && s_eq(buf, "8388608\n"),
+       "memory.max = 8M reads back as 8388608");
+    if (s) {
+        const char* argv[2] = { "memhog", "fill" };
+        int crashes0 = crash_count();
+        int pid = proc_spawn_argv("cg-memhog", s, (size_t)(e - s), 2, argv, 0);   /* born in lim */
+        ct_write("/sys/fs/cgroup/cgroup.procs", mypid);                             /* we leave */
+        int code = -1;
+        int r = pid > 0 ? task_wait(pid, &code) : -1;
+        kprintf("cglimit: memhog pid %d ended, wait %d, code %d\n", pid, r, code);
+        CT(pid > 0 && r >= 0 && code == 137, "memhog over 8M ends with 137 (SIGKILL)");
+        /* An OOM kill is a policy, not a crash: no record, no Crash Reports
+         * window (the first version filed "unresponsive task reclaimed by
+         * force" for it, because it used the forced-kill path). */
+        CT(crash_count() == crashes0, "the OOM kill filed no crash record");
+        CT(ct_read("/sys/fs/cgroup/lim/memory.events", buf, sizeof buf) == 0 &&
+           ct_contains(buf, "oom_kill 1\n") && ct_contains(buf, "\noom 1\n"),
+           "memory.events: oom 1, oom_kill 1");
+        CT(ct_read("/sys/fs/cgroup/lim/memory.peak", buf, sizeof buf) == 0, "memory.peak readable");
+        kprintf("cglimit: memory.peak %s", buf);
+    } else {
+        kprintf("cglimit: no memhog embedded - memory.max not driven\n");
+        ct_write("/sys/fs/cgroup/cgroup.procs", mypid);
+    }
+
+    /* -- cpu.max -- */
+    CT(ct_write("/sys/fs/cgroup/lim/cpu.max", "20000 100000") == 0 &&
+       ct_read("/sys/fs/cgroup/lim/cpu.max", buf, sizeof buf) == 0 && s_eq(buf, "20000 100000\n"),
+       "cpu.max = 20000 100000");
+    CT(ct_write("/sys/fs/cgroup/lim/cpu.max", "500 100000") != 0, "a quota below 1 ms is refused");
+    uint64_t free_ms = hog_cpu(NULL, 1000);
+    uint64_t lim_ms  = hog_cpu("/sys/fs/cgroup/lim/cgroup.procs", 1000);
+    kprintf("cglimit: spinner got %lu ms unlimited, %lu ms at 20%% (of 1000 ms)\n",
+            (unsigned long)free_ms, (unsigned long)lim_ms);
+    CT(free_ms >= 500, "the unlimited spinner ran (control)");
+    CT(lim_ms >= 120 && lim_ms <= 320, "the limited spinner got about 20%");
+    CT(ct_read("/sys/fs/cgroup/lim/cpu.stat", buf, sizeof buf) == 0 && !ct_contains(buf, "nr_throttled 0\n"),
+       "cpu.stat reports throttling");
+    task_msleep(100);
+    CT(vfs_unlink("/sys/fs/cgroup/lim") == 0, "rmdir lim");
+    #undef CT
+    kprintf("cglimit: %s\n", ok ? "ALL ok" : "FAIL");
+}
+SHELL_CMD(cglimittest) = { "cglimittest", "", "cgroup v2 limits enforced: pids.max, memory.max (OOM), cpu.max",
+                           SHELL_G_TEST, cmd_cglimittest, SHELL_P_ANY };

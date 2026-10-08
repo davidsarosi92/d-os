@@ -97,6 +97,7 @@
 #include "waitq.h"
 #include "crash.h"          /* §M47 — record a forced kill */
 #include "klog.h"           /* §M54 — report a corpse found in a runqueue */
+#include "cgroupfs.h"       /* §M90 rung 3 — cpu.max / pids.max enforced here */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -996,6 +997,9 @@ static struct task* spawn_common_ex(const char* name, void (*entry)(void),
  * the console binding INTO the spawn for this reason; this is the general
  * form: build held, fill in, then task_release(). */
 struct task* task_spawn_arg_held(const char* name, void (*entry)(void), void* arg) {
+    /* §M90 rung 3 — this is the fork/clone/thread path, so pids.max is
+     * enforced here: every way a program creates a task passes through it. */
+    if (!cgroup_fork_allowed(task_current())) return NULL;
     return spawn_common_ex(name, entry, -1, arg, NULL, 1);
 }
 void task_release(struct task* t) {
@@ -1131,7 +1135,8 @@ static struct task* pick_next_local_locked(struct percpu* rq) {
             if (t->state == TASK_RUNNABLE &&
                 !t->is_idle &&
                 (t->cpu_mask & (1u << self)) &&
-                !task_running_elsewhere(t)) {
+                !task_running_elsewhere(t) &&
+                !(t->cgroup && cgroup_cpu_throttled(t))) {    /* §M90 — cpu.max */
                 if (pass == 0 && t->skips_left > 0) {
                     t->skips_left--;            /* passed over, pays a turn */
                 } else {
@@ -1504,7 +1509,8 @@ static void schedule_locked(struct percpu* me) {
          * could not reach two of three on x86_64 -smp 3 (the same wait made
          * `hardlock`'s own pinning loop a matter of luck). */
         if (prev->state == TASK_RUNNABLE && !prev->is_idle &&
-            (prev->cpu_mask & (1u << this_cpu_id()))) return;
+            (prev->cpu_mask & (1u << this_cpu_id())) &&
+            !(prev->cgroup && cgroup_cpu_throttled(prev))) return;   /* §M90 — cpu.max */
         struct task* idle = me->idle;
         if (!idle || idle->state != TASK_RUNNABLE) return;
         if (idle == prev) return;
@@ -1519,6 +1525,7 @@ static void schedule_locked(struct percpu* me) {
         uint64_t now   = timer_ticks_ms();
         uint64_t slice = now - prev->sched_in_ms;
         prev->cpu_ms += slice;
+        if (prev->cgroup) cgroup_cpu_charge(prev, now);   /* §M90 — cpu.max, the rest */
         next->sched_in_ms = now;
         /* §M49 — per-CPU busy time.  Everything that is not the idle task
          * counts as work, which is what makes "is this core actually loaded"
@@ -2694,6 +2701,45 @@ void task_exit_group(int code) {
     task_exit_code(code);
 }
 
+/* §M90 rung 3 — a KERNEL decision to end a whole process (the cgroup OOM
+ * killer): every thread of group `tgid` is told to die with `code` (137 =
+ * SIGKILL), woken if asleep and resumed if stopped.  No may_signal()
+ * check: the caller is not a program exercising permission over another but
+ * the memory policy itself, and the victim is very often owned by someone
+ * else than the task whose allocation hit the limit.  The caller's own group
+ * may be the victim; it then ends itself at its next safe point (or at once,
+ * from a fault path, via cgroup_oom_victim_self). */
+void task_kill_group_oom(int tgid, int code) {
+    int pids[64];
+    int n = 0;
+    uint32_t fl = spin_lock_irqsave(&master_lock);
+    if (master_head) {
+        struct task* c = master_head;
+        do {
+            if (c->state != TASK_DEAD && !c->is_idle && task_tgid(c) == tgid && n < 64) {
+                c->group_exit_plus1 = code + 1;
+                /* NOT kill_forced: that path files a "stopped responding"
+                 * crash record (task_force_kill_point), and an OOM kill is a
+                 * policy decision, not an unresponsive program.  The plain
+                 * kill is honoured at the next tick in user mode anyway, so a
+                 * victim spinning without system calls still dies at once;
+                 * group_exit_plus1 makes its code 137 whichever exit it takes. */
+                c->kill_pending = 1;
+                pids[n++] = c->pid;
+            }
+            c = c->next;
+        } while (c != master_head);
+    }
+    spin_unlock_irqrestore(&master_lock, fl);
+    for (int i = 0; i < n; i++) {
+        struct task* t = task_find(pids[i]);
+        if (!t || t->state == TASK_DEAD) continue;
+        wake_blocked_task(t);
+        resume_stopped(t);
+    }
+    task_notify_change();
+}
+
 /* §M90 — task_wait with WNOHANG: 0 when a matching child exists but none has
  * exited yet (instead of sleeping).  containerd's reaper drains its children
  * with wait4(-1, WNOHANG) from a SIGCHLD loop; a wait that ignored the flag
@@ -3233,8 +3279,13 @@ void schedule_check(void) {
      * would drain a task's budget by how often OTHER tasks wake up). */
     {
         struct task* cur = me->current;
-        if (__atomic_exchange_n(&me->tick_due, 0, __ATOMIC_ACQ_REL) && cur && !cur->is_idle)
+        if (__atomic_exchange_n(&me->tick_due, 0, __ATOMIC_ACQ_REL) && cur && !cur->is_idle) {
             cur->deficit -= (int)TASK_WEIGHT_BASE;
+            /* §M90 rung 3 — cpu.max: the running task's time so far, so a
+             * lone hog that is never switched out is still charged (and,
+             * once its node's quota is spent, the pick below skips it). */
+            if (cur->cgroup) cgroup_cpu_charge(cur, timer_ticks_ms());
+        }
         /* §M74 — a wake kick ends the running task's turn: deficit 0 makes
          * schedule_locked rotate it to the tail with a FRESH budget, so the
          * woken task runs now and the preempted one loses no share. */
