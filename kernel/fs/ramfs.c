@@ -131,7 +131,8 @@ static int rfs_unlink_op(struct inode* dir, const char* name,
                          struct inode* child) {
     (void)dir; (void)name;           /* emptiness checked by vfs_unlink */
     if (!child) return -1;
-    if (child->type == INODE_FILE || child->type == INODE_SYMLINK || child->type == INODE_FIFO) {
+    if (child->type == INODE_FILE || child->type == INODE_SYMLINK || child->type == INODE_FIFO ||
+        child->type == INODE_WHITEOUT) {   /* §M90 — made by create, retyped */
         struct ramfs_file* rf = (struct ramfs_file*)child->private;
         /* §M73 — another name still points here: only this one goes. */
         if (rf && rf->nlink > 1) { rf->nlink--; return 0; }

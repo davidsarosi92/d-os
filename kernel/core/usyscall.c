@@ -947,6 +947,7 @@ static void stat_full_of(const struct inode* in, struct kstat_full* o) {
     uint32_t perm = in->mode ? (in->mode & 07777u) : (in->type == INODE_DIR ? 0755u : 0644u);
     uint32_t fmt  = in->type == INODE_DIR ? KS_IFDIR
                   : in->type == INODE_DEVICE ? KS_IFCHR
+                  : in->type == INODE_WHITEOUT ? KS_IFCHR      /* §M90 — 0:0 */
                   : in->type == INODE_SYMLINK ? KS_IFLNK
                   : in->type == INODE_FIFO ? KS_IFIFO : KS_IFREG;
     if (in->type == INODE_SYMLINK) perm = 0777u;
@@ -1104,7 +1105,7 @@ long sys_getdents64_k(int fd, void* buf, size_t cap) {
         r[16] = (uint8_t)(reclen & 0xFF);                                        /* d_reclen */
         r[17] = (uint8_t)(reclen >> 8);
         r[18] = (de.type == INODE_DIR) ? 4 :                                     /* DT_DIR  */
-                (de.type == INODE_DEVICE) ? 2 :                                  /* DT_CHR  */
+                (de.type == INODE_DEVICE || de.type == INODE_WHITEOUT) ? 2 :     /* DT_CHR  */
                 (de.type == INODE_SYMLINK) ? 10 :                                /* DT_LNK  */
                 (de.type == INODE_FIFO) ? 1 : 8;                                 /* DT_FIFO / DT_REG */
         for (int i = 0; i < nlen; i++) r[19 + i] = (uint8_t)de.name[i];          /* d_name  */

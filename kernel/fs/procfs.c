@@ -676,6 +676,20 @@ static void gen_selfcgroup(struct procfs_writer* w) {
     pw_puts(w, "0::"); pw_puts(w, view); pw_putc(w, '\n');
 }
 static struct procfs_node nd_selfcgroup = { .name = "self/cgroup",    .gen = gen_selfcgroup };
+/* §M90 — /proc/filesystems: the registered types, "nodev" before each that
+ * needs no block device (Linux's format).  Docker's overlay2 driver looks for
+ * "overlay" here before it tries a mount.  The tmpfs-like types a mount(2)
+ * makes from a fresh directory (vfs_anon_fs) are listed too, as they mount. */
+static void gen_filesystems(struct procfs_writer* w) {
+    int nodev;
+    const char* n;
+    for (int i = 0; (n = vfs_fs_type_at(i, &nodev)) != NULL; i++) {
+        pw_puts(w, nodev ? "nodev\t" : "\t"); pw_puts(w, n); pw_putc(w, '\n');
+    }
+    static const char* anon[] = { "tmpfs", "devpts", "mqueue", "sysfs", NULL };
+    for (int i = 0; anon[i]; i++) { pw_puts(w, "nodev\t"); pw_puts(w, anon[i]); pw_putc(w, '\n'); }
+}
+static struct procfs_node nd_filesystems = { .name = "filesystems", .gen = gen_filesystems };
 
 /* §M90 — /proc/self/status, the lines programs actually parse: the ids, the
  * thread count, the memory figure, and the CAPABILITY masks — dockerd and runc
@@ -953,6 +967,7 @@ void procfs_init(void) {
     attach_node(&nd_cpuinfo);
     attach_node(&nd_mountinfo);
     attach_node(&nd_selfcgroup);
+    attach_node(&nd_filesystems);                 /* §M90 */
     attach_node(&nd_selfstatus);
     attach_node(&nd_selfstat);                     /* §M90 */
     attach_node(&nd_oomadj);

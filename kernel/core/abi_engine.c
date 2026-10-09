@@ -118,12 +118,15 @@ static long h_link(struct abi_ctx* c)    { return lnx_err(sys_link((const char*)
  *   S_IFIFO          a named pipe (vfs_mkfifo; memory-backed filesystems
  *                    only — EPERM on a volume that could not keep it)
  *   S_IFREG or 0     an empty regular file
- *   S_IFCHR/S_IFBLK  REFUSED with EPERM and named: device nodes are devfs's,
+ *   S_IFCHR 0:0      a WHITEOUT (overlayfs's deleted-name marker; Docker's
+ *                    overlay2 driver makes them unpacking a layer) — memory-
+ *                    backed filesystems only
+ *   S_IFCHR/S_IFBLK  otherwise REFUSED with EPERM and named: device nodes are devfs's,
  *                    and a node pointing at a device number nothing here
  *                    resolves would be a file that lies about what it is
  *   S_IFSOCK         refused likewise (a socket's name is made by bind)
  * The permission bits honour the caller's umask, as mkdir's do. */
-static long abi_mknod(unsigned long upath, unsigned long mode) {
+static long abi_mknod(unsigned long upath, unsigned long mode, unsigned long dev) {
     char kp[256];
     if (abi_path(upath, kp, sizeof kp) != 0) return -ABI_EFAULT;
     unsigned fmt = (unsigned)mode & 0170000u;
@@ -133,6 +136,7 @@ static long abi_mknod(unsigned long upath, unsigned long mode) {
     int r;
     if (fmt == 0010000u)                  r = vfs_mkfifo(kp);
     else if (fmt == 0 || fmt == 0100000u) r = vfs_create(kp);
+    else if (fmt == 0020000u && dev == 0) r = vfs_mkwhiteout(kp);   /* §M90 — overlay whiteout */
     else {
         kprintf("mknod: '%s' type 0x%x refused - device/socket nodes are not made by mknod here\n",
                 kp, fmt);
@@ -145,8 +149,8 @@ static long abi_mknod(unsigned long upath, unsigned long mode) {
     vfs_chmod(kp, perm);
     return 0;
 }
-static long h_mknod(struct abi_ctx* c)   { return abi_mknod(c->a[0], c->a[1]); }
-static long h_mknodat(struct abi_ctx* c) { return AT_WRAP(c->a[0], abi_mknod(c->a[1], c->a[2])); }
+static long h_mknod(struct abi_ctx* c)   { return abi_mknod(c->a[0], c->a[1], c->a[2]); }
+static long h_mknodat(struct abi_ctx* c) { return AT_WRAP(c->a[0], abi_mknod(c->a[1], c->a[2], c->a[3])); }
 /* §M90 — a guest path made absolute against a directory descriptor, for the
  * calls that take TWO (linkat): the at_dir override in AT_WRAP serves one.
  * A relative path with AT_FDCWD is left relative — the VFS joins the working
@@ -219,12 +223,71 @@ static long abi_xattr_target(struct abi_ctx* c, int by_fd) {
     if (abi_path(c->a[0], kp, sizeof kp) != 0) return -14;
     return sys_lstat_full_k(kp, &k) == 0 ? 0 : -2;
 }
-static long h_xattr_get(struct abi_ctx* c)  { long r = abi_xattr_target(c, 0); return r ? r : -61; }
-static long h_xattr_fget(struct abi_ctx* c) { long r = abi_xattr_target(c, 1); return r ? r : -61; }
-static long h_xattr_list(struct abi_ctx* c) { return abi_xattr_target(c, 0); }   /* 0 bytes */
-static long h_xattr_flist(struct abi_ctx* c){ return abi_xattr_target(c, 1); }
-static long h_xattr_set(struct abi_ctx* c)  { long r = abi_xattr_target(c, 0); return r ? r : -95; }
-static long h_xattr_fset(struct abi_ctx* c) { long r = abi_xattr_target(c, 1); return r ? r : -95; }
+/* §M90 — ONE attribute is stored: overlayfs's OPAQUE mark on a directory
+ * ("trusted.overlay.opaque" or "user.overlay.opaque" = "y"), kept as an inode
+ * flag (VFS_IF_OPAQUE) on memory-backed filesystems.  Docker's overlay2
+ * driver writes it when a layer replaces a whole directory, and the overlay
+ * reads it to stop merging the lower layers there.  Every other name keeps
+ * the answers above. */
+static int xa_is_opaque(unsigned long uname) {
+    char n[48];
+    if (!uname || copy_str_from_user(n, (uintptr_t)uname, sizeof n) < 0) return 0;
+    const char* a = "trusted.overlay.opaque"; const char* b = "user.overlay.opaque";
+    int i = 0; while (a[i] && n[i] == a[i]) i++;
+    if (!a[i] && !n[i]) return 1;
+    i = 0; while (b[i] && n[i] == b[i]) i++;
+    return !b[i] && !n[i];
+}
+static long xa_flag(struct abi_ctx* c, int by_fd, int op) {
+    if (by_fd) return vfs_file_inode_flag(sys_fd_vfs_file((int)c->a[0]), VFS_IF_OPAQUE, op);
+    char kp[256];
+    if (abi_path(c->a[0], kp, sizeof kp) != 0) return -1;
+    return vfs_inode_flag(kp, 0, VFS_IF_OPAQUE, op);
+}
+static long xa_get(struct abi_ctx* c, int by_fd) {
+    long r = abi_xattr_target(c, by_fd);
+    if (r) return r;
+    if (!xa_is_opaque(c->a[1]) || xa_flag(c, by_fd, 0) != 1) return -61;      /* ENODATA */
+    if (c->a[3] == 0) return 1;                                               /* size probe */
+    char y = 'y';
+    if (copy_to_user((uintptr_t)c->a[2], &y, 1) != 0) return -14;
+    return 1;
+}
+static long xa_list(struct abi_ctx* c, int by_fd) {
+    long r = abi_xattr_target(c, by_fd);
+    if (r) return r;
+    if (xa_flag(c, by_fd, 0) != 1) return 0;
+    static const char nm[] = "trusted.overlay.opaque";                       /* with its NUL */
+    if (c->a[2] == 0) return (long)sizeof nm;
+    if (c->a[2] < sizeof nm) return -34;                                      /* ERANGE */
+    if (copy_to_user((uintptr_t)c->a[1], nm, sizeof nm) != 0) return -14;
+    return (long)sizeof nm;
+}
+static long xa_set(struct abi_ctx* c, int by_fd) {
+    long r = abi_xattr_target(c, by_fd);
+    if (r) return r;
+    if (!xa_is_opaque(c->a[1])) return -95;                                   /* EOPNOTSUPP */
+    char v = 0;
+    if (c->a[3] != 1 || copy_from_user(&v, (uintptr_t)c->a[2], 1) != 0 || v != 'y')
+        return -22;
+    long f = xa_flag(c, by_fd, 1);
+    return f == 0 ? 0 : (f == -3 ? -95 : -2);
+}
+static long xa_remove(struct abi_ctx* c, int by_fd) {
+    long r = abi_xattr_target(c, by_fd);
+    if (r) return r;
+    if (!xa_is_opaque(c->a[1])) return -95;
+    if (xa_flag(c, by_fd, 0) != 1) return -61;
+    return xa_flag(c, by_fd, 2) == 0 ? 0 : -2;
+}
+static long h_xattr_get(struct abi_ctx* c)  { return xa_get(c, 0); }
+static long h_xattr_fget(struct abi_ctx* c) { return xa_get(c, 1); }
+static long h_xattr_list(struct abi_ctx* c) { return xa_list(c, 0); }
+static long h_xattr_flist(struct abi_ctx* c){ return xa_list(c, 1); }
+static long h_xattr_set(struct abi_ctx* c)  { return xa_set(c, 0); }
+static long h_xattr_fset(struct abi_ctx* c) { return xa_set(c, 1); }
+static long h_xattr_remove(struct abi_ctx* c)  { return xa_remove(c, 0); }
+static long h_xattr_fremove(struct abi_ctx* c) { return xa_remove(c, 1); }
 
 /* §M90 — fchmodat2(dirfd, path, mode, flags): fchmodat with the flags word
  * the old call never had.  AT_SYMLINK_NOFOLLOW on a symlink asks to change
@@ -985,7 +1048,9 @@ static long h_mount(struct abi_ctx* c) {
      *                 a fresh empty directory (vfs_anon_fs): devpts with no
      *                 terminals allocated, mqueue with no queues — both true,
      *                 as neither exists here yet.
-     * Anything else (overlay, ext4, …) is refused and named. */
+     *   overlay       overlayfs on a fresh directory, with the caller's options
+ *                 (lowerdir/upperdir/workdir — kernel/fs/overlayfs.c).
+ * Anything else (ext4, …) is refused and named. */
     if (fst[0] && !(fl & MS_BIND_)) {
         char from[256];
         int anon = 0;
@@ -1001,12 +1066,33 @@ static long h_mount(struct abi_ctx* c) {
                    mnt_eq(fst, "ramfs")) {
             if (vfs_anon_fs(fst, from, sizeof from) != 0) return -12;
             anon = 1;
+        } else if (mnt_eq(fst, "overlay")) {
+            /* §M90 rung 4 — overlayfs (kernel/fs/overlayfs.c): mounted on a
+             * fresh directory under /.mounts with the caller's options, then
+             * bound at the target like the others; the unmount of the target
+             * unmounts the overlay and removes the directory. */
+            char* data = (char*)kmalloc(4096);
+            if (!data) return -12;
+            data[0] = 0;
+            if (c->a[4] && copy_str_from_user(data, (uintptr_t)c->a[4], 4096) < 0) {
+                kfree(data); return -ABI_EFAULT;
+            }
+            if (vfs_anon_fs("overlay", from, sizeof from) != 0) { kfree(data); return -12; }
+            int mr = vfs_mount_data("overlay", from, data);
+            kfree(data);
+            if (mr != 0) {
+                vfs_unlink_recursive(from);
+                return mr == -2 ? -ABI_ENOENT : -ABI_EINVAL;
+            }
+            anon = 1;
         } else {
             kprintf("mount: '%s' on '%s' type '%s' flags %lx - not supported yet\n", src, tgt, fst, fl);
             return -19;                                   /* ENODEV: unknown fs type */
         }
         int r = vfs_bind(from, tgt);
-        if (r != 0 && anon) vfs_unlink_recursive(from);
+        /* an overlay is unmounted BEFORE its directory goes: emptying the
+         * directory through a live overlay would empty its upper layer */
+        if (r != 0 && anon) { vfs_umount(from); vfs_unlink_recursive(from); }
         if (r == 0 && (fl & 0x1ul)) vfs_set_readonly(tgt, 1);   /* mounted read-only */
         if (r == 0) return 0;
         if (r == -1) return -ABI_ENOENT;
@@ -2177,6 +2263,7 @@ static uint32_t abi_fs_magic_global(const char* g) {
         if (k[0] == 'd' && k[1] == 'e' && k[2] == 'v' && k[3] == 'p') return 0x1cd1u;     /* devpts */
         if (k[0] == 'm' && k[1] == 'q') return 0x19800202u;                               /* mqueue */
         if (k[0] == 'r' && k[1] == 'a') return 0x858458f6u;                               /* ramfs  */
+        if (k[0] == 'o' && k[1] == 'v') return 0x794c7630u;                               /* overlay */
         return 0x01021994u;                                                               /* tmpfs  */
     }
     const struct vfs_mount* m = vfs_mount_for(g);
@@ -3097,8 +3184,8 @@ static const struct {
     [ABI_XATTR_FGET]   = { "fgetxattr",    h_xattr_fget   },
     [ABI_XATTR_LIST]   = { "listxattr",    h_xattr_list   },
     [ABI_XATTR_FLIST]  = { "flistxattr",   h_xattr_flist  },
-    [ABI_XATTR_REMOVE] = { "removexattr",  h_xattr_set    },
-    [ABI_XATTR_FREMOVE]= { "fremovexattr", h_xattr_fset   },
+    [ABI_XATTR_REMOVE] = { "removexattr",  h_xattr_remove },
+    [ABI_XATTR_FREMOVE]= { "fremovexattr", h_xattr_fremove},
     [ABI_FSYNC]        = { "fsync",        h_fsync        },
     [ABI_RMDIR]        = { "rmdir",        h_rmdir        },
     [ABI_RENAMEAT]     = { "renameat",     h_renameat     },

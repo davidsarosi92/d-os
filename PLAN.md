@@ -232,7 +232,7 @@ fixed first, whatever it touches.
 | queued UI | ✅ done (§4.116) — Memory page, System information, translations 73 → 0 | — |
 | §M88 | ✅ (§4.118) | open: a taskbar per monitor |
 | §M89 | ◐ → core ✅ | Java: `java Hello.java` from the unmodified JDK on x86_64 + aarch64 (DOCS §4.119); open: `app install` end to end, host-side delivery, rung 5 measurements |
-| §M90 | ◐ ~62-65 % (2026-10-08) | Docker itself on d-os (dockerd + containerd + runc + the CLI), no Docker Desktop — rungs 1-2 ✅ (`docker run … echo hi` prints `hi`, aarch64); cgroup limits + inotify ✅ (OOMKilled true/137); next: overlayfs, networking, `-it`/build, x86_64 — resume order in §M90 |
+| §M90 | ◐ ~70 % (2026-10-09) | Docker itself on d-os (dockerd + containerd + runc + the CLI), no Docker Desktop — rungs 1-2 ✅ (`docker run … echo hi` prints `hi`, aarch64); cgroup limits + inotify ✅ (OOMKilled true/137); overlayfs + overlay2 ✅ (run/diff/commit); next: networking, `-it`/build, x86_64 — resume order in §M90 |
 | §M91 | — | the ABI as its own project: d-os, Linux and NT personalities over one common language (ReactOS's pattern) — designed, not started |
 | §M92 | — | a driver engine for d-os, Linux and Windows drivers — an OPEN QUESTION, recorded, not decided |
 | §M93 | — | installing software as a user: DOWNLOAD from the vendor (`wget`) → `app install` → run, no OCI image required — the guide plus the `.tar.gz` install, glibc decision, manifest, service registration; **next after §M90**, before §M91/§M92 |
@@ -6125,18 +6125,26 @@ fixed-address Go binaries load at 0x200000, inside the low identity map):**
   moved onto a Linux-style CHARGE MODEL (charge at allocation, uncharge at
   free, per-frame owner; a memfd's page cache charged to its creator) — an
   8 MiB container starts, memory.current is exact.  Estimate now ~62-65 %.
+- Rung 4 DONE (2026-10-09): overlayfs (kernel/fs/overlayfs.c) and Docker's
+  overlay2 driver on it — run, a write + a deletion in a container, `docker
+  diff`, `docker commit` and the committed image all correct.  Three VFS
+  defects fixed on the way (whole page cache dropped at every unmount, bind
+  records outliving their dentries, a bind made just before a namespace
+  invisible in it).  Estimate now ~70 %.
 - **RESUME HERE — in this order:**
   1. (done 2026-10-08 — cgroup limits + inotify)
-  2. Rung 4: overlayfs (today `--storage-driver=vfs`).
+  2. (done 2026-10-09 — overlayfs; the test recipe now uses
+     `--storage-driver=overlay2`)
   3. Rung 5: networking — network namespace, veth, bridge, NAT; `-p 8080:80`.
   4. Rung 6: `docker run -it` (pty/devpts), `docker build`, volumes.
   5. x86_64: waits for the higher-half kernel move.
   Open beside it: NEXT.md #14 (rare pthread_join hang) and #16 (a non-leader
   thread's execve keeps its pid); `noexec` accepted, not enforced.
-- Test recipe (aarch64, ~15 min a run): `scripts/dos-shell-test.py --arch
+- Test recipe (aarch64, ~20 min a run): `scripts/dos-shell-test.py --arch
   aarch64 --smp 2 --mem 3G --disk build/aarch64/dk.img --via serial
-  --boot-timeout 240 --between 45` with `mkdir /run`, `containerd &`,
-  `dockerd --containerd=/run/containerd/containerd.sock --storage-driver=vfs
+  --boot-timeout 240 --between 75 --settle 120` (the harness types on a fixed
+  clock: too short a pause reads as a hang) with `mkdir /run`, `containerd &`,
+  `dockerd --containerd=/run/containerd/containerd.sock --storage-driver=overlay2
   --iptables=false --bridge=none --ip6tables=false &`, `docker version`,
   `docker load -i /mnt/busybox.tar`, `docker run --network host busybox:musl
   echo hi`; `strace err name <task>` to see a failing step.

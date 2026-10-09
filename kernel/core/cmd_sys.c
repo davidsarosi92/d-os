@@ -1522,7 +1522,7 @@ static void sy_bindtest(const char* args) {
     struct vfs_stat st;
     struct task* me = task_current();
     int home = me->mntns;
-    vfs_mkdir("/bt"); vfs_mkdir("/bt/src"); vfs_mkdir("/bt/tgt"); vfs_mkdir("/bt/tgt2");
+    vfs_mkdir("/bt"); vfs_mkdir("/bt/src"); vfs_mkdir("/bt/tgt"); vfs_mkdir("/bt/tgt2"); vfs_mkdir("/bt/tgt3");
     vfs_create("/bt/src/f");
     vfs_create("/bt/file");
     int b1 = vfs_bind("/bt/src", "/bt/tgt");
@@ -1577,6 +1577,16 @@ static void sy_bindtest(const char* args) {
     me->mntns = ns;  int u2 = vfs_unbind("/bt/tgt2");  me->mntns = home;
     int u1 = vfs_unbind("/bt/tgt"), u3 = vfs_unbind("/bt/file");
     int gone = vfs_stat("/bt/tgt/f", &st) != 0;
+    /* §M90 — a bind made IMMEDIATELY before a namespace (nothing between):
+     * the off-by-one that emptied a second container's root. */
+    int b4 = vfs_bind("/bt/src", "/bt/tgt3");
+    int ns2 = vfs_mntns_new(home);
+    me->mntns = ns2;
+    int last_sees = vfs_stat("/bt/tgt3/f", &st) == 0;
+    me->mntns = home;
+    vfs_unbind("/bt/tgt3");
+    kprintf("bindtest: the bind made just before a namespace is %s in it\n",
+            b4 == 0 && last_sees ? "visible" : "INVISIBLE");
     kprintf("bindtest: dir=%d see=%d file=%d '%s' busy=%d ns=%d child-sees=%d child-bind=%d "
             "child-own=%d parent-blind=%d unbind-foreign=%d unbind=%d/%d/%d gone=%d\n",
             b1, see1, b2, fileok ? "net:" : "?", busy, ns, child_sees, b3, child_own,
@@ -1591,6 +1601,7 @@ static void sy_bindtest(const char* args) {
     kprintf("bindtest: proc aliases %s\n", al ? "ok" : "WRONG");
     vfs_unlink_recursive("/bt");
     int ok = al && vp && rook && b1 == 0 && see1 && b2 == 0 && fileok && busy == -6 && ns > 0 && child_sees &&
+             b4 == 0 && last_sees &&
              b3 == 0 && child_own && parent_blind && u_wrong == -1 && u1 == 0 && u2 == 0 &&
              u3 == 0 && gone;
     console_write(ok ? "bindtest: ok\n" : "bindtest: FAIL\n");

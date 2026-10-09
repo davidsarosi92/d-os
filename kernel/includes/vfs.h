@@ -63,6 +63,8 @@ enum inode_type {
     INODE_DEVICE,
     INODE_SYMLINK,      /* §M89 — its content is the target path */
     INODE_FIFO,         /* §M90 — a named pipe: opening it joins inode->fifo */
+    INODE_WHITEOUT,     /* §M90 — a character device 0:0 with no device: overlayfs's
+                         * "this name is deleted" (mknod S_IFCHR 0; opening is ENXIO) */
 };
 
 /* Open flags.  Mirror the lower bits of POSIX O_* but we own the values. */
@@ -334,6 +336,10 @@ struct fs_type {
     int  (*umount)(struct dentry* mountpoint);
     void (*evict)(struct inode* inode);
     int  (*statfs)(struct dentry* mountpoint, uint64_t* total, uint64_t* free);
+    /* §M90 — OPTIONAL, APPENDED.  A mount with an OPTIONS string (mount(2)'s
+     * data — overlayfs's "lowerdir=…,upperdir=…,workdir=…"), called instead
+     * of `mount` when vfs_mount_data is used.  Namespace lock held. */
+    int  (*mount_data)(struct dentry* mountpoint, const char* data);
 };
 
 /* ------------------------------------------------------------------- */
@@ -352,6 +358,8 @@ int  vfs_register_fs(struct fs_type* fs);
  * in-memory filesystems (ramfs / devfs-as-fs).  `path` must be an
  * existing empty directory, or "/" for the very first mount. */
 int  vfs_mount(const char* fs_name, const char* path, const char* dev_name);
+/* §M90 — a mount with an options string (fs_type.mount_data: overlayfs). */
+int  vfs_mount_data(const char* fs_name, const char* path, const char* data);
 
 /* Open a file or directory by absolute path.  Returns NULL on error.
  * Free the returned handle via `vfs_close`. */
@@ -560,5 +568,28 @@ struct inode* vfs_watch_inode(const char* path, int follow, int* is_dir);
 /* 1 while any inotify watch exists (a single load: the VFS's write path asks
  * before taking the namespace lock for an event nobody would receive). */
 int vfs_watch_active(void);
+
+/* §M90 — stacking filesystems (overlayfs): act on the layers below with the
+ * namespace lock HELD by the caller, by dentry, without permission checks
+ * (see vfs.c).  `kind` for vfs_make_locked: 0 file, 1 dir, 2 FIFO, 3 whiteout.
+ * Return 0 / negative like the path API (-2 = exists, -3 = not on this fs). */
+void vfs_ns_lock(void);
+void vfs_ns_unlock(void);
+struct dentry* vfs_resolve_locked(const char* path);
+struct dentry* vfs_child_locked(struct dentry* dir, const char* name);
+int vfs_make_locked(struct dentry* dir, const char* name, int kind, struct dentry** out);
+int vfs_symlink_locked(struct dentry* dir, const char* name, const char* target, struct dentry** out);
+int vfs_remove_locked(struct dentry* dir, const char* name);
+int vfs_rename_locked(struct dentry* odir, const char* oname, struct dentry* ndir, const char* nname);
+/* mknod(S_IFCHR, 0): a whiteout (memory-backed filesystems only). */
+int vfs_mkwhiteout(const char* path);
+/* §M90 — VFS_IF_OPAQUE: a directory marked opaque for overlayfs (the
+ * trusted.overlay.opaque / user.overlay.opaque = "y" attribute). */
+#define VFS_IF_OPAQUE 0x100u
+/* Read (op 0), set (1) or clear (2) an inode flag; see vfs.c. */
+int vfs_inode_flag(const char* path, int follow, uint32_t flag, int op);
+int vfs_file_inode_flag(struct file* f, uint32_t flag, int op);
+
+const char* vfs_fs_type_at(int i, int* nodev);   /* §M90 — /proc/filesystems */
 
 #endif

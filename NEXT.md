@@ -1,11 +1,11 @@
 # RESUME HERE (updated 2026-10-08)
 
-**§M90 Docker, ~62-65 %.**  `docker run --network host busybox:musl echo hi`
-prints `hi` on aarch64 (rungs 1-2 done); cgroup limits and inotify done (rung 3).  Next, in order — details and the
+**§M90 Docker, ~70 %.**  `docker run --network host busybox:musl echo hi`
+prints `hi` on aarch64 (rungs 1-2 done); cgroup limits and inotify done (rung 3); overlayfs + Docker's overlay2 done (rung 4).  Next, in order — details and the
 test recipe in PLAN.md §M90 "RESUME HERE":
 
 1. ~~cgroup v2 limits enforced (`memory.max`, `cpu.max`, `pids.max`) + `inotify`~~ — DONE 2026-10-08; memory.max on a Linux-style charge model 2026-10-09 (`--memory 8m` works, OOMKilled true/137)
-2. overlayfs
+2. ~~overlayfs~~ — DONE 2026-10-09 (overlay2 driver: run, diff, commit)
 3. networking (net namespace, veth, bridge, NAT, `-p`)
 4. `docker run -it` (pty), `docker build`, volumes
 5. x86_64 after the higher-half kernel move
@@ -221,6 +221,9 @@ Instruments added: `!! PIT STARVED` (per-CPU, falsified by `pitstarvetest`), NMI
 | 16 | A non-leader thread's `execve` keeps its own pid | **open** | Linux gives it the leader's pid (the process keeps its number); here the leader's death is what the parent sees.  Said on the console when it happens; no observed caller yet (Go execs from the locked main thread) |
 | 17 | ~~`docker run` prints nothing on its attached stdout~~ | — | **FIXED 2026-10-04**: a half-closed unix socket polled as HUP (the client's SHUT_WR of the attach stream), so dockerd failed the stream; now RDHUP|IN as on Linux (`usock_hangup`, `shutdowntest`) |
 | 18 | ~~`docker run --memory 8m` OOM-killed `runc init` itself~~ | — | **FIXED 2026-10-09** (asked for: "look at the Linux-like charge model"): frames are charged at allocation to the allocating cgroup and uncharged at free (per-frame owner table); a memfd's cached pages are charged to its creator.  An 8 MiB container starts (memory.current 4.4 MiB inside), OOMKilled true/137 when it overruns |
+| 20 | ~~every unmount dropped the whole page cache~~ | — | **FIXED 2026-10-09**: mapped pages of every file were detached; containerd's bbolt panicked after the first overlay unmount.  Now only the unmounted tree's inodes |
+| 21 | ~~bind records outlived their dentries~~ | — | **FIXED 2026-10-09**: kernel data abort at the next unbind after a container's overlay went; `binds_forget` before every dentry free |
+| 22 | ~~a bind made right before a mount namespace was invisible in it~~ | — | **FIXED 2026-10-09**: off-by-one (`<` for `<=`); a second container saw an empty root |
 | 19 | ~~`/proc/<pid>/cgroup` printed relative to the target's cgroup namespace~~ | — | **FIXED 2026-10-08**: Linux uses the READER's; containerd's shim read "0::/" for a container's init and could not watch its memory.events (no OOM event) |
 
 ### Checked and no longer open

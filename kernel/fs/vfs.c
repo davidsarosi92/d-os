@@ -23,6 +23,8 @@
  * points (the framework is here, but only "/" is exercised today).
  * ============================================================================= */
 
+#include "config.h"
+#include "task.h"
 #include "fsnotify.h"   /* §M90 — inotify events from every mutation */
 #include "vfs.h"
 #include "pcache.h"
@@ -138,6 +140,13 @@ void vfs_init(void) {
     kprintf("vfs: initialized\n");
 }
 
+/* §M90 — the registered filesystem types, for /proc/filesystems: the i-th
+ * name, and whether it needs a block device; NULL past the end. */
+const char* vfs_fs_type_at(int i, int* nodev) {
+    for (struct fs_type* p = fs_types; p; p = p->next)
+        if (i-- == 0) { if (nodev) *nodev = !p->stores_ownership && !p->statfs; return p->name; }
+    return NULL;
+}
 int vfs_register_fs(struct fs_type* fs) {
     if (!fs || !fs->name || !fs->mount) return -1;
     /* Refuse duplicate names. */
@@ -222,6 +231,36 @@ static unsigned g_bind_seq;
 #define VFS_MAX_BINDS 256
 static struct { struct dentry* tgt; struct dentry* src; } g_binds[VFS_MAX_BINDS];
 static int g_nbinds;
+/* Anonymous filesystems whose only bind went with a freed dentry (removed by
+ * vfs_umount once the namespace lock is dropped). */
+static char g_orphans[8][96];
+static int  g_norphans;
+static int dentry_path_from(struct dentry* d, struct dentry* top, char* out, size_t cap);
+
+/* §M90 — A BIND RECORD NEVER OUTLIVES THE DENTRIES IT NAMES.  Called (lock
+ * held) right before ANY dentry is freed — an unlink, a recursive removal, an
+ * unmount's tree walk.  Records whose target is `d` end; records whose source
+ * is `d` end and their target stops redirecting.  Without it a container left
+ * records behind (runc binds /etc/hosts and friends into its overlay root
+ * and /dev/null into its tmpfs /dev, in a mount namespace nobody unbinds when
+ * it exits); the next walk over the table followed a freed dentry, and the
+ * next unbind WROTE into freed memory.  An anonymous filesystem (/.mounts/…)
+ * that was the source of such a record is queued for removal. */
+static void binds_forget(struct dentry* d) {
+    for (int i = 0; i < g_nbinds; ) {
+        if (g_binds[i].tgt != d && g_binds[i].src != d) { i++; continue; }
+        struct dentry* S = g_binds[i].src;
+        if (g_binds[i].src == d && g_binds[i].tgt) g_binds[i].tgt->bound = NULL;
+        if (g_binds[i].tgt == d && S != d && g_norphans < 8 &&
+            dentry_path_from(S, root, g_orphans[g_norphans], sizeof g_orphans[0]) == 0) {
+            const char* pre = "/.mounts/";
+            int k = 0;
+            while (pre[k] && g_orphans[g_norphans][k] == pre[k]) k++;
+            if (!pre[k]) g_norphans++;
+        }
+        g_binds[i] = g_binds[--g_nbinds];
+    }
+}
 
 /* Is `d`'s bind visible to the caller?  Made in the caller's own namespace,
  * or in an ancestor of it BEFORE the descendant on the way down was created. */
@@ -229,7 +268,14 @@ static int bind_visible(const struct dentry* d) {
     int me = task_mntns_current();
     if (d->bound_ns == me) return 1;
     for (int n = me; n > 0 && n < g_ns_n; n = g_ns[n].parent) {
-        if (g_ns[n].parent == d->bound_ns) return d->bound_seq < g_ns[n].born;
+        /* §M90 — `born` is the LAST sequence number handed out when the
+         * namespace was made, i.e. a bind numbered `born` was made BEFORE it
+         * and is copied in: `<=`.  It was `<`, so a bind made immediately
+         * before a namespace was invisible in it — Docker binds a container's
+         * overlay root and runc unshares right after, and the second
+         * container ran in an EMPTY root ("stat /bin/busybox: no such file");
+         * the first worked only because an unrelated bind came between. */
+        if (g_ns[n].parent == d->bound_ns) return d->bound_seq <= g_ns[n].born;
     }
     return 0;
 }
@@ -247,7 +293,7 @@ static int ro_visible(const struct dentry* d) {
     int me = task_mntns_current();
     if (d->ro_ns == me) return 1;
     for (int n = me; n > 0 && n < g_ns_n; n = g_ns[n].parent)
-        if (g_ns[n].parent == d->ro_ns) return d->ro_seq < g_ns[n].born;
+        if (g_ns[n].parent == d->ro_ns) return d->ro_seq <= g_ns[n].born;   /* see bind_visible */
     return 0;
 }
 static struct dentry* follow_bind(struct dentry* d) {
@@ -266,6 +312,11 @@ int vfs_mntns_new(int parent) {
         id = g_ns_n++;
         g_ns[id].parent = parent;
         g_ns[id].born   = g_bind_seq;
+        if (config_get_long("debug.mntns", 0)) {
+            struct task* me = task_current();
+            kprintf("mntns: new ns %d parent %d born %u by %d '%s'\n", id, parent, g_bind_seq,
+                    me ? me->pid : -1, me ? me->name : "?");
+        }
     }
     kmutex_unlock(&ns_lock);
     return id;
@@ -795,7 +846,16 @@ static struct vfs_mount* mount_of_dentry(struct dentry* d) {
     return NULL;
 }
 
+static int vfs_mount_unlocked2(const char* fs_name, const char* path, const char* dev_name,
+                               const char* data);
 static int vfs_mount_unlocked(const char* fs_name, const char* path, const char* dev_name) {
+    return vfs_mount_unlocked2(fs_name, path, dev_name, NULL);
+}
+int vfs_mount_data(const char* fs_name, const char* path, const char* data) {
+    return NS_LOCKED(int, vfs_mount_unlocked2(fs_name, path, NULL, data));
+}
+static int vfs_mount_unlocked2(const char* fs_name, const char* path, const char* dev_name,
+                               const char* data) {
     if (!fs_name || !path) return -1;
 
     /* Find the fs implementation. */
@@ -848,7 +908,7 @@ static int vfs_mount_unlocked(const char* fs_name, const char* path, const char*
     if (mp != root) { mp->inode = NULL; mp->children = NULL; }
 
     /* Hand off to the fs to fill in the mountpoint. */
-    int r = fs->mount(bdev, mp);
+    int r = data ? (fs->mount_data ? fs->mount_data(mp, data) : -7) : fs->mount(bdev, mp);
     if (r != 0) {
         kprintf("vfs_mount: %s->mount() failed: %d\n", fs_name, r);
         if (mp != root) { mp->inode = covered; mp->children = covered_children; }
@@ -946,6 +1006,9 @@ static struct file* vfs_open_unlocked(const char* path, int flags) {
     }
 
     if (!d->inode) return NULL;
+    /* §M90 — a whiteout is a character device 0:0 with no device behind it:
+     * opening one is ENXIO, as on Linux. */
+    if (d->inode->type == INODE_WHITEOUT) { g_open_err = -6; return NULL; }
 
     /* §M32 stage 5 — read and/or write against the FILE, derived from the
      * flags the caller actually asked for.  A caller that opens read-only must
@@ -1173,6 +1236,86 @@ ssize_t vfs_write(struct file* f, const void* buf, size_t n) {
     return r;
 }
 
+/* ---- §M90 — for STACKING filesystems (overlayfs) -----------------------------
+ *
+ * A stacked filesystem's operations are called BY the VFS with the namespace
+ * lock held, and must then act on the layers below WITHOUT going back through
+ * a path (which would take the lock again).  These act on dentries, with the
+ * lock held by the caller, and with no permission check (`check` 0 in the
+ * cores): the stacked fs has already checked the caller against ITS view and
+ * acts on the layers as the mounter, as Linux's overlayfs does. */
+static int vfs_move_unlocked(struct dentry* op, const char* olast,
+                             struct dentry* np, const char* nlast);
+static int make_core(struct dentry* parent, const char* last, int kind, int check,
+                     struct dentry** out);
+static int unlink_core(struct dentry* parent, const char* last, int check);
+static int symlink_core(struct dentry* parent, const char* last, const char* target,
+                        int check, struct dentry** out);
+void vfs_ns_lock(void)   { kmutex_lock(&ns_lock); }
+void vfs_ns_unlock(void) { kmutex_unlock(&ns_lock); }
+struct dentry* vfs_resolve_locked(const char* path) { return resolve_path(path, NULL, NULL); }
+struct dentry* vfs_child_locked(struct dentry* dir, const char* name) {
+    return lookup_child(dir, name, strlen_(name));
+}
+int vfs_make_locked(struct dentry* dir, const char* name, int kind, struct dentry** out) {
+    return make_core(dir, name, kind, 0, out);
+}
+int vfs_symlink_locked(struct dentry* dir, const char* name, const char* target, struct dentry** out) {
+    return symlink_core(dir, name, target, 0, out);
+}
+int vfs_remove_locked(struct dentry* dir, const char* name) { return unlink_core(dir, name, 0); }
+int vfs_rename_locked(struct dentry* odir, const char* oname, struct dentry* ndir, const char* nname) {
+    if (!odir || !ndir) return -1;
+    if (odir != ndir) return vfs_move_unlocked(odir, oname, ndir, nname);
+    if (!odir->inode || !odir->inode->dir_ops || !odir->inode->dir_ops->rename) return -1;
+    if (strlen_(nname) > VFS_NAME_MAX) return -1;
+    struct dentry* d = NULL;
+    for (struct dentry* c = odir->children; c; c = c->sibling) {
+        if (streq(c->name, nname)) return -2;
+        if (streq(c->name, oname)) d = c;
+    }
+    if (!d || !d->inode) return -1;
+    if (odir->inode->dir_ops->rename(odir->inode, oname, nname, d->inode) != 0) return -1;
+    size_t i = 0;
+    for (; nname[i] && i < sizeof(d->name) - 1; i++) d->name[i] = nname[i];
+    d->name[i] = 0;
+    return 0;
+}
+
+/* §M90 — an inode FLAG reached by path (no final-link following when
+ * !follow) or through an open file: op 0 reads it (1/0), 1 sets, 2 clears.
+ * Setting is refused (-3) on a block-backed volume, which could not keep it;
+ * -1 = no such file.  The overlay's opaque mark (VFS_IF_OPAQUE) is the one
+ * user of it: Docker's overlay2 driver writes it as the extended attribute
+ * trusted.overlay.opaque when it unpacks a layer. */
+static int flag_op(struct dentry* d, struct inode* in, uint32_t flag, int op) {
+    if (!in) return -1;
+    if (op == 0) return (in->vflags & flag) ? 1 : 0;
+    if (op == 1) {
+        struct vfs_mount* m = d ? mount_of_dentry(d) : NULL;
+        if (m && m->dev_name[0]) return -3;
+        in->vflags |= flag;
+    } else {
+        in->vflags &= ~flag;
+    }
+    if (d) fsnotify_dentry(d, FSN_ATTRIB);
+    return 0;
+}
+int vfs_inode_flag(const char* path, int follow, uint32_t flag, int op) {
+    kmutex_lock(&ns_lock);
+    struct dentry* d = resolve_path_ex(path, NULL, NULL, follow);
+    int r = d ? flag_op(d, d->inode, flag, op) : -1;
+    kmutex_unlock(&ns_lock);
+    return r;
+}
+int vfs_file_inode_flag(struct file* f, uint32_t flag, int op) {
+    if (!f || !f->inode) return -1;
+    kmutex_lock(&ns_lock);
+    int r = flag_op(f->inode->unlink_dir ? NULL : f->dentry, f->inode, flag, op);
+    kmutex_unlock(&ns_lock);
+    return r;
+}
+
 /* §M90 — inotify: the inode a watch names.  Resolved under the namespace
  * lock; the watch then holds the pointer (never dereferenced by inotify,
  * only compared) until fsnotify_inode_gone drops it. */
@@ -1279,19 +1422,34 @@ static int vfs_mutator_unlocked(const char* path, int kind);
 static int vfs_mutator(const char* path, int kind) {
     return NS_LOCKED(int, vfs_mutator_unlocked(path, kind));
 }
+static int make_core(struct dentry* parent, const char* last, int kind, int check,
+                     struct dentry** out);
 static int vfs_mutator_unlocked(const char* path, int kind) {
-    int is_dir = kind == 1;
     if (ro_path(path)) return -30;                 /* §M90 — EROFS */
     char buf[256];
     const char* last;
     if (split_parent(path, buf, sizeof buf, &last) != 0) return -1;
     if (!*last) return -1;
     struct dentry* parent = resolve_path(buf, NULL, NULL);
+    return make_core(parent, last, kind, 1, NULL);
+}
+
+/* §M90 — the dentry-level core of create / mkdir / mkfifo / a whiteout, for
+ * the path API above and for stacking filesystems (overlayfs makes its copy-
+ * ups and whiteouts in an upper layer through it).  `check` = 1 applies the
+ * caller's permission and the ownership stamping a user's create gets; 0 is
+ * the kernel acting on its own behalf (the overlay copies ownership itself).
+ * `kind`: 0 file, 1 directory, 2 FIFO, 3 whiteout (a character device 0:0 —
+ * overlayfs's "this name is deleted", memory-backed filesystems only). */
+static int make_core(struct dentry* parent, const char* last, int kind, int check,
+                     struct dentry** out) {
+    int is_dir = kind == 1;
     if (!parent || !parent->inode || parent->inode->type != INODE_DIR) return -1;
     if (!parent->inode->dir_ops) return -1;
+    if (strlen_(last) > VFS_NAME_MAX) return -1;
     /* §M32 — creating a NAME changes the DIRECTORY, so the check is write on
      * the parent, not on the thing being created (which does not exist yet). */
-    if (!vfs_permitted(parent->inode, VFS_PERM_WRITE)) return -5;
+    if (check && !vfs_permitted(parent->inode, VFS_PERM_WRITE)) return -5;
 
     int (*op)(struct inode*, const char*, struct inode**) =
         is_dir ? parent->inode->dir_ops->mkdir
@@ -1300,7 +1458,7 @@ static int vfs_mutator_unlocked(const char* path, int kind) {
     /* §M90 — a FIFO only where nodes live in memory.  A block-backed
      * filesystem would hand it back after a reboot as an empty regular file
      * (exFAT has no node type to store), so the honest answer is a refusal. */
-    if (kind == 2) {
+    if (kind == 2 || kind == 3) {
         struct vfs_mount* m = mount_of_dentry(parent);
         if (m && m->dev_name[0]) return -3;
     }
@@ -1311,11 +1469,14 @@ static int vfs_mutator_unlocked(const char* path, int kind) {
     for (struct dentry* c = parent->children; c; c = c->sibling) {
         if (streq(c->name, last)) return -2;
     }
+    /* A lazy filesystem's (or a stacked one's) name need not be cached yet. */
+    if (parent->inode->dir_ops->lookup && lookup_child(parent, last, strlen_(last))) return -2;
 
     struct inode* ino = NULL;
     int r = op(parent->inode, last, &ino);
     if (r != 0 || !ino) return r ? r : -3;
     if (kind == 2) { ino->type = INODE_FIFO; ino->size = 0; }
+    if (kind == 3) { ino->type = INODE_WHITEOUT; ino->size = 0; }
 
     /* §M32 — A NEW FILE BELONGS TO WHOEVER MADE IT.
      *
@@ -1331,7 +1492,7 @@ static int vfs_mutator_unlocked(const char* path, int kind) {
      * their own home is not a permission model, it is a broken one*, and no
      * amount of staring at the defaults would have shown it: every path in the
      * test suite ran as SYSTEM, which bypasses the check entirely. */
-    {
+    if (check) {
         const struct cred* c = cred_current();
         if (c->owner == TASK_OWNER_USER) {
             ino->owner_uid = cred_uid(c);
@@ -1344,7 +1505,9 @@ static int vfs_mutator_unlocked(const char* path, int kind) {
         }
     }
 
-    if (!vfs_attach_child(parent, last, ino)) return -4;
+    struct dentry* nd = vfs_attach_child_unlocked(parent, last, ino);
+    if (!nd) return -4;
+    if (out) *out = nd;
     fsnotify_inode(parent->inode, FSN_CREATE | (is_dir ? FSN_ISDIR : 0), last);   /* §M90 */
     return 0;
 }
@@ -1352,25 +1515,32 @@ static int vfs_mutator_unlocked(const char* path, int kind) {
 int vfs_create(const char* path) { return vfs_mutator(path, 0); }
 int vfs_mkdir (const char* path) { return vfs_mutator(path, 1); }
 int vfs_mkfifo(const char* path) { return vfs_mutator(path, 2); }
+int vfs_mkwhiteout(const char* path) { return vfs_mutator(path, 3); }
 
 /* Remove `path` (file or empty dir).  The fs op frees the inode; we
  * then detach + free the dentry.  Mount roots refuse removal because
  * their parent belongs to a different fs (dir_ops mismatch would
  * corrupt the foreign inode's accounting). */
+static int unlink_core(struct dentry* parent, const char* last, int check);
 static int vfs_unlink_unlocked(const char* path) {
     if (ro_path(path)) return -30;                 /* §M90 — EROFS */
     char buf[256];
     const char* last;
     if (split_parent(path, buf, sizeof buf, &last) != 0) return -1;
     if (!*last) return -1;
+    return unlink_core(resolve_path(buf, NULL, NULL), last, 1);
+}
 
-    struct dentry* parent = resolve_path(buf, NULL, NULL);
+/* §M90 — the dentry-level core of unlink / rmdir (see make_core for `check`). */
+static int unlink_core(struct dentry* parent, const char* last, int check) {
     if (!parent || !parent->inode || parent->inode->type != INODE_DIR) return -1;
     if (!parent->inode->dir_ops || !parent->inode->dir_ops->unlink)    return -1;
     /* Removing a name is a write to the DIRECTORY.  Which is why a file you
      * cannot write can still be deleted if you own the directory it is in —
      * surprising the first time, and exactly what POSIX specifies. */
-    if (!vfs_permitted(parent->inode, VFS_PERM_WRITE)) return -5;
+    if (check && !vfs_permitted(parent->inode, VFS_PERM_WRITE)) return -5;
+    /* A lazy filesystem's name may not be cached yet: look it up first. */
+    if (parent->inode->dir_ops->lookup) lookup_child(parent, last, strlen_(last));
 
     /* Find the child dentry + keep the link BEFORE it for splicing. */
     struct dentry** link = &parent->children;
@@ -1395,6 +1565,7 @@ static int vfs_unlink_unlocked(const char* path) {
         d->inode->unlink_dir  = parent->inode;
         d->inode->unlink_name = nm;
         *link = d->sibling;
+        binds_forget(d);
         kfree(d);
         /* §M90 — the NAME is gone now: the directory hears DELETE, and the
          * file's own watches end (Linux sends DELETE_SELF only at the last
@@ -1421,7 +1592,8 @@ static int vfs_unlink_unlocked(const char* path) {
     /* §M90 — a VFS_IF_OWN_CHILDREN directory's remaining entries are the
      * fs's synthesised files: their inodes went with the fs's unlink, the
      * dentries are ours to free. */
-    while (d->children) { struct dentry* c = d->children; d->children = c->sibling; kfree(c); }
+    while (d->children) { struct dentry* c = d->children; d->children = c->sibling; binds_forget(c); kfree(c); }
+    binds_forget(d);
     kfree(d);
     return 0;
 }
@@ -1893,25 +2065,35 @@ int vfs_realpath(const char* path, char* out, size_t cap) {
     return NS_LOCKED(int, vfs_realpath_unlocked(path, out, cap));
 }
 
+static int symlink_core(struct dentry* parent, const char* last, const char* target,
+                        int check, struct dentry** out);
 static int vfs_symlink_unlocked(const char* target, const char* linkpath) {
     if (ro_path(linkpath)) return -30;             /* §M90 — EROFS */
-    if (!target || !*target || strlen_(target) >= 255) return -1;
     char buf[256];
     const char* last;
     if (split_parent(linkpath, buf, sizeof buf, &last) != 0 || !*last) return -1;
+    return symlink_core(resolve_path(buf, NULL, NULL), last, target, 1, NULL);
+}
+static int symlink_core(struct dentry* parent, const char* last, const char* target,
+                        int check, struct dentry** out) {
+    if (!target || !*target || strlen_(target) >= 255) return -1;
     if (strlen_(last) > VFS_NAME_MAX) return -1;
-    struct dentry* parent = resolve_path(buf, NULL, NULL);
     if (!parent || !parent->inode || parent->inode->type != INODE_DIR) return -1;
     if (!parent->inode->dir_ops || !parent->inode->dir_ops->symlink) return -3;   /* EPERM: fs has none */
-    if (!vfs_permitted(parent->inode, VFS_PERM_WRITE)) return -5;
+    if (check && !vfs_permitted(parent->inode, VFS_PERM_WRITE)) return -5;
     for (struct dentry* c = parent->children; c; c = c->sibling)
         if (streq(c->name, last)) return -2;                                     /* EEXIST */
+    if (parent->inode->dir_ops->lookup && lookup_child(parent, last, strlen_(last))) return -2;
     struct inode* ino = NULL;
     if (parent->inode->dir_ops->symlink(parent->inode, last, target, &ino) != 0 || !ino) return -1;
-    const struct cred* cr = cred_current();
-    if (cr->owner == TASK_OWNER_USER) { ino->owner_uid = cred_uid(cr); ino->owner_gid = cred_gid(cr); }
+    if (check) {
+        const struct cred* cr = cred_current();
+        if (cr->owner == TASK_OWNER_USER) { ino->owner_uid = cred_uid(cr); ino->owner_gid = cred_gid(cr); }
+    }
     ino->mode = 0777;                                      /* a link's own bits mean nothing */
-    if (!vfs_attach_child_unlocked(parent, last, ino)) return -1;
+    struct dentry* nd = vfs_attach_child_unlocked(parent, last, ino);
+    if (!nd) return -1;
+    if (out) *out = nd;
     fsnotify_inode(parent->inode, FSN_CREATE, last);              /* §M90 */
     return 0;
 }
@@ -1979,10 +2161,19 @@ static void free_tree(struct dentry* d, struct fs_type* fs) {
     while (c) {
         struct dentry* next = c->sibling;
         free_tree(c, fs);
+        /* §M90 — this inode's cached pages, and ONLY this inode's: the whole
+         * cache used to be dropped at every unmount, which detached every
+         * MAPPED page of every file on the machine from its file — so a
+         * database mapping its file MAP_SHARED (containerd's bbolt) kept
+         * frames that later writes no longer reached, and read a stale
+         * freelist ("page already freed") after the first container's
+         * overlay was unmounted. */
+        if (c->inode && c->inode->pc_id) pcache_invalidate(c->inode);
         if (c->inode) {
             if (fs && fs->evict) fs->evict(c->inode);
             kfree(c->inode);
         }
+        binds_forget(c);
         kfree(c);
         c = next;
     }
@@ -2010,6 +2201,12 @@ static int vfs_umount_unlocked(const char* path) {
     if (m->fs->umount(m->mp) != 0) return -5;
 
     struct dentry* mp = m->mp;
+    /* §M90 — bind records naming dentries of this tree end as each dentry is
+     * freed (binds_forget, in free_tree): a container's runtime binds files
+     * into its overlay root in a namespace nobody unbinds when it exits, and
+     * the overlay's unmount is where those records end (as Linux's
+     * MNT_DETACH takes the submounts with it). */
+    if (mp->inode && mp->inode->pc_id) pcache_invalidate(mp->inode);
     free_tree(mp, m->fs);
     if (mp->inode) {
         if (m->fs->evict) m->fs->evict(mp->inode);
@@ -2032,11 +2229,27 @@ static int vfs_umount_unlocked(const char* path) {
     return 0;
 }
 int vfs_umount(const char* path) {
-    int r = NS_LOCKED(int, vfs_umount_unlocked(path));
-    /* §M74 — the volume's inodes are gone; nothing may still hit their pages.
-     * The cache has no per-filesystem index, and an unmount is rare, so the
-     * whole cache goes (mapped pages are detached, not freed). */
-    if (r == 0) pcache_drop_all();
+    /* §M74/§M90 — the unmounted volume's cached pages went with its inodes
+     * (free_tree); nothing else's are touched. */
+    char orphans[8][96];
+    int n = 0;
+    kmutex_lock(&ns_lock);
+    int r = vfs_umount_unlocked(path);
+    for (; n < g_norphans; n++)
+        for (int i = 0; i < 96; i++) orphans[n][i] = g_orphans[n][i];
+    g_norphans = 0;
+    kmutex_unlock(&ns_lock);
+    for (int i = 0; i < n; i++) {
+        kmutex_lock(&ns_lock);
+        int still = 0;
+        for (int k = 0; k < g_nbinds; k++) {
+            char p2[96];
+            if (dentry_path_from(g_binds[k].src, root, p2, sizeof p2) == 0 && streq(p2, orphans[i]))
+                still = 1;
+        }
+        kmutex_unlock(&ns_lock);
+        if (!still) vfs_unlink_recursive(orphans[i]);
+    }
     return r;
 }
 
@@ -2169,6 +2382,12 @@ int vfs_bind(const char* src, const char* tgt) {
         T->bound_seq = ++g_bind_seq;
         T->bound_ns  = task_mntns_current();
         T->bound     = S;
+        if (config_get_long("debug.mntns", 0)) {
+            struct task* me = task_current();
+            kprintf("mntns: bind %s -> %s in ns %d seq %u by %d '%s'%s\n", src, tgt, T->bound_ns,
+                    T->bound_seq, me ? me->pid : -1, me ? me->name : "?",
+                    T->bound != S ? "" : "");
+        }
         g_binds[g_nbinds].tgt = T;
         g_binds[g_nbinds].src = S;
         g_nbinds++;
@@ -2196,7 +2415,22 @@ int vfs_unbind(const char* tgt) {
     const char* pre = "/.mounts/";
     int i = 0;
     while (pre[i] && anon[i] == pre[i]) i++;
-    if (r == 0 && !pre[i] && anon[i]) vfs_unlink_recursive(anon);
+    if (r == 0 && !pre[i] && anon[i]) {
+        /* §M90 — a FILESYSTEM mounted on the anonymous directory (overlayfs)
+         * is unmounted first.  Removing the directory's contents through a
+         * live overlay would delete them from its upper layer — so when the
+         * unmount is refused (a file still open), the directory is left as
+         * it is and said so, rather than emptied. */
+        int mounted = 0;
+        kmutex_lock(&ns_lock);
+        for (int k = 0; k < g_nmounts; k++) if (streq(g_mounts[k].path, anon)) mounted = 1;
+        kmutex_unlock(&ns_lock);
+        if (mounted && vfs_umount(anon) != 0) {
+            kprintf("umount: %s stays mounted (busy) - its directory is kept\n", anon);
+            return r;
+        }
+        vfs_unlink_recursive(anon);
+    }
     return r;
 }
 
