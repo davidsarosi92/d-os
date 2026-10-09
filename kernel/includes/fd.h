@@ -151,6 +151,7 @@ struct shm {
     uint64_t  size;             /* §M90 — bytes, as fstat/read/write see them */
     uint32_t  seals;            /* §M90 — SHM_SEAL_*                          */
     struct inode* ino;          /* §M90 — anonymous inode for exec (shm_file) */
+    int       memcg_id;         /* §M90 — the creator's cgroup charge id, held */
 };
 
 /* Create a shared-memory object of `size` bytes (rounded up to pages, at least

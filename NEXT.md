@@ -4,7 +4,7 @@
 prints `hi` on aarch64 (rungs 1-2 done); cgroup limits and inotify done (rung 3).  Next, in order — details and the
 test recipe in PLAN.md §M90 "RESUME HERE":
 
-1. ~~cgroup v2 limits enforced (`memory.max`, `cpu.max`, `pids.max`) + `inotify`~~ — DONE 2026-10-08 (OOMKilled true/137 through the real Docker)
+1. ~~cgroup v2 limits enforced (`memory.max`, `cpu.max`, `pids.max`) + `inotify`~~ — DONE 2026-10-08; memory.max on a Linux-style charge model 2026-10-09 (`--memory 8m` works, OOMKilled true/137)
 2. overlayfs
 3. networking (net namespace, veth, bridge, NAT, `-p`)
 4. `docker run -it` (pty), `docker build`, volumes
@@ -18,7 +18,7 @@ engine) come later.
 Recorded beside it, not scheduled: §M91 (the ABI as its own project, ReactOS
 pattern), §M92 (driver engine, open question) and §M93 (a user guide for
 installing downloaded software — Docker, Java — and the `.tar.gz` install,
-manifest and service registration it needs).  Open defects: #14, #16, #18 below.
+manifest and service registration it needs).  Open defects: #14, #16 below.
 
 # Where things stand (2026-09-28)
 
@@ -220,7 +220,7 @@ Instruments added: `!! PIT STARVED` (per-CPU, falsified by `pitstarvetest`), NMI
 | 15 | ~~`execve` left the other threads running on the freed old space~~ | — | **FIXED 2026-10-04** (§M90): no de_thread — runc's container init exec'd the container's program and a Go thread of the init faulted on torn-down page tables (`esr 0x82000009`).  `task_exec_detach` kills every other user of the old space and frees it only through its last owner |
 | 16 | A non-leader thread's `execve` keeps its own pid | **open** | Linux gives it the leader's pid (the process keeps its number); here the leader's death is what the parent sees.  Said on the console when it happens; no observed caller yet (Go execs from the locked main thread) |
 | 17 | ~~`docker run` prints nothing on its attached stdout~~ | — | **FIXED 2026-10-04**: a half-closed unix socket polled as HUP (the client's SHUT_WR of the attach stream), so dockerd failed the stream; now RDHUP|IN as on Linux (`usock_hangup`, `shutdowntest`) |
-| 18 | `docker run --memory 8m` OOM-kills `runc init` itself (37 MiB "in use") | **open** | memory.max measures a node by walking its spaces (§M75: frames a space alone owns).  An exec'd image's pages are PRIVATE here: copied (first/last page of each segment, every page when the cache is off), or shared with the page cache only while the source inode lives — a memfd exec's anonymous inode goes at exec and its cached pages become the process's own.  Linux charges file pages as page cache to the cgroup that first read them (the memfd's creator, outside the container).  Effect: a limit below ~40 MiB fails at container start; `--memory 64m` works (OOMKilled true/137 verified).  A real fix is a charge model (per-frame owner at allocation), which §M71 declined for its hot-path cost — a decision for the user, not a quiet change |
+| 18 | ~~`docker run --memory 8m` OOM-killed `runc init` itself~~ | — | **FIXED 2026-10-09** (asked for: "look at the Linux-like charge model"): frames are charged at allocation to the allocating cgroup and uncharged at free (per-frame owner table); a memfd's cached pages are charged to its creator.  An 8 MiB container starts (memory.current 4.4 MiB inside), OOMKilled true/137 when it overruns |
 | 19 | ~~`/proc/<pid>/cgroup` printed relative to the target's cgroup namespace~~ | — | **FIXED 2026-10-08**: Linux uses the READER's; containerd's shim read "0::/" for a container's init and could not watch its memory.events (no OOM event) |
 
 ### Checked and no longer open

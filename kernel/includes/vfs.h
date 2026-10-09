@@ -219,6 +219,10 @@ struct inode {
      * (fifo.c), NULL while nobody has it open.  Valid while any open holds the
      * inode, which every FIFO end does through its VFS open. */
     struct fifo*  fifo;
+    /* §M90 — APPENDED.  Whom the page cache charges for this file's pages:
+     * 0 = the reader (Linux's rule for files), n = cgroup charge id n - 1
+     * (a memfd: its pages are its creator's, see cgroupfs.c). */
+    int           memcg_as_plus1;
 };
 
 /* §M90 — a directory whose filesystem decides whether it may be removed while

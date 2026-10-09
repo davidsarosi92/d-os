@@ -4,6 +4,7 @@
  * bookkeeping.
  * ============================================================================= */
 
+#include "cgroupfs.h"   /* §M90 — memfd pages charged to their creator */
 #include "fsnotify.h"   /* §M90 — FD_INOTIFY */
 #include "fd.h"
 #include "fifo.h"
@@ -209,9 +210,11 @@ struct shm* shm_create(size_t size) {
     struct shm* s = (struct shm*)kcalloc(1, sizeof *s);
     if (!s) return NULL;
     s->refcount = 1;
+    s->memcg_id = cgroup_memcg_hold_current();       /* §M90 — whose its pages are */
     if (shm_fill(s, (int)n) != 0) {                  /* OOM or reserve — unwind */
         for (int j = 0; j < s->nframes; j++) pmm_free_frame((pmm_phys_t)s->frames[j]);
         kfree(s->frames);
+        cgroup_memcg_put(s->memcg_id);
         kfree(s);
         return NULL;
     }
@@ -319,6 +322,9 @@ struct file* shm_file(struct shm* s) {
         in->ops = &shm_file_ops;
         in->private = s;
         in->mode = 0755;
+        /* §M90 — the page cache's copies of these pages are charged to the
+         * memfd's creator, not to whoever execs or maps it (cgroupfs.c). */
+        in->memcg_as_plus1 = s->memcg_id + 1;
         s->ino = in;
     }
     s->ino->size = s->size;
@@ -347,5 +353,6 @@ void shm_unref(struct shm* s) {
     for (int i = 0; i < s->nframes; i++) pmm_free_frame((pmm_phys_t)s->frames[i]);
     kfree(s->frames);
     kfree(s->ino);
+    cgroup_memcg_put(s->memcg_id);
     kfree(s);
 }

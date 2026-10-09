@@ -35,14 +35,24 @@ void cgroup_cpu_charge(struct task* t, uint64_t now_ms);
  * Called with the runqueue lock held; takes only the cgroup's own lock. */
 int cgroup_cpu_throttled(const struct task* t);
 
-/* memory.max — may the CURRENT task take one more user frame?  Called by
- * pmm_alloc_frame_user*() before allocating.  1 = yes.  0 = the limit is
- * reached and the OOM killer chose the current process: the allocation must
- * fail, and the caller's fault path ends the process with SIGKILL (137) via
- * cgroup_oom_victim_self().  When the victim is ANOTHER process the call
- * answers 1 (the frames come back as the victim dies — Linux's charge
- * likewise succeeds once the kill is under way). */
-int cgroup_mem_charge(void);
+/* memory.max — THE CHARGE MODEL (cgroupfs.c).  pmm_alloc_frame_user*() call
+ * cgroup_mem_charge before allocating: `as` < 0 charges the current task's
+ * cgroup, `as` >= 0 that charge id (a memfd's page cache, charged to the
+ * memfd's creator).  1 = go ahead, *out_id = the id to record against the
+ * frame (0 = unaccounted); 0 = refused (the current process was OOM-killed).
+ * On a failed allocation the caller gives the charge back with
+ * cgroup_mem_uncharge(*out_id); on success it records the owner with
+ * cgroup_mem_set_owner, and pmm_free_frame uncharges through
+ * cgroup_mem_free_frame. */
+#include "pmm.h"
+int  cgroup_mem_charge(int as, int* out_id);
+void cgroup_mem_uncharge(int id);
+void cgroup_mem_set_owner(pmm_phys_t frame, int id);
+void cgroup_mem_free_frame(pmm_phys_t frame);
+/* The current task's charge id, held (a memfd remembers its creator's), and
+ * its release.  0 = the root (nothing held). */
+int  cgroup_memcg_hold_current(void);
+void cgroup_memcg_put(int id);
 
 /* 1 when the current task's process was chosen by a cgroup OOM kill: a fault
  * path that could not get a frame must then exit with 137 rather than report

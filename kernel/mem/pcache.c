@@ -132,7 +132,9 @@ int pcache_enabled(void) {
  * restored (the program owns it), through a kernel bounce page, because a
  * kmap must not be held across a sleep and vfs_read can sleep on the disk. */
 static pmm_phys_t fill_page(struct file* f, uint64_t idx) {
-    pmm_phys_t fr = pmm_alloc_frame_user();
+    /* §M90 — charged to the reader, or to whom the file says (a memfd). */
+    int as = f->inode->memcg_as_plus1 ? f->inode->memcg_as_plus1 - 1 : -1;
+    pmm_phys_t fr = as >= 0 ? pmm_alloc_frame_user_as(as) : pmm_alloc_frame_user();
     if (!fr) return 0;
     uint8_t* bounce = (uint8_t*)kmalloc(4096);
     if (!bounce) { pmm_free_frame(fr); return 0; }

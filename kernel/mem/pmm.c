@@ -1002,19 +1002,25 @@ void pmm_reserve_stats(uint32_t* reserve_kb, uint32_t* refused, int* low) {
  * own OOM kill, not by refusing frames the machine still has (cgroupfs.c). */
 #include "cgroupfs.h"
 
-pmm_phys_t pmm_alloc_frame_user(void) {
-    if (!cgroup_mem_charge()) return PMM_ALLOC_FAIL;
-    if (!reserve_allows(1)) return PMM_ALLOC_FAIL;
-    return page_alloc(0, ZONE_HIGHMEM);
+static pmm_phys_t alloc_user(int zone, int as) {
+    int id = 0;
+    if (!cgroup_mem_charge(as, &id)) return PMM_ALLOC_FAIL;
+    if (!reserve_allows(1)) { cgroup_mem_uncharge(id); return PMM_ALLOC_FAIL; }
+    pmm_phys_t f = page_alloc(0, zone);
+    if (!f) { cgroup_mem_uncharge(id); return PMM_ALLOC_FAIL; }
+    if (id) cgroup_mem_set_owner(f, id);
+    return f;
 }
+
+pmm_phys_t pmm_alloc_frame_user(void) { return alloc_user(ZONE_HIGHMEM, -1); }
+
+/* §M90 — the same, charged to charge id `memcg` (>= 0) instead of the current
+ * task: a page-cache copy of a memfd page is its creator's (pcache.c). */
+pmm_phys_t pmm_alloc_frame_user_as(int memcg) { return alloc_user(ZONE_HIGHMEM, memcg); }
 
 /* The same, for a user frame the kernel must reach through a plain pointer
  * (memfd/shm, zeroed and copied by the kernel): never highmem. */
-pmm_phys_t pmm_alloc_frame_user_low(void) {
-    if (!cgroup_mem_charge()) return PMM_ALLOC_FAIL;
-    if (!reserve_allows(1)) return PMM_ALLOC_FAIL;
-    return page_alloc(0, ZONE_DEFAULT);
-}
+pmm_phys_t pmm_alloc_frame_user_low(void) { return alloc_user(ZONE_DEFAULT, -1); }
 
 /* The portable half of kmap: where every frame is directly mapped (x86_64,
  * aarch64) a frame's address IS its pointer.  i386's vmm.c overrides these. */
@@ -1056,6 +1062,7 @@ void pmm_free_frame(pmm_phys_t addr) {
                 "(caller %p)\n", (unsigned long)addr, __builtin_return_address(0));
         return;
     }
+    cgroup_mem_free_frame(addr);          /* §M90 — give its cgroup charge back */
     page_free(addr, 0);
 }
 

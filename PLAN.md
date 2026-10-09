@@ -6121,18 +6121,18 @@ fixed-address Go binaries load at 0x200000, inside the low identity map):**
   inotify (`kernel/fs/inotify.c`).  Through the real Docker on aarch64:
   `--memory 64m` → OOMKilled true / 137, `--pids-limit` → fork EAGAIN,
   `--cpus 0.5` → cpu.max 50000 100000.  Not enforced, stated in cgroupfs.c:
-  cpu.weight, memory.high/low/min, swap, io, cpuset.  Open: NEXT #18 (an
-  exec'd image counts as private memory, so `runc init` alone needs ~40 MiB —
-  a charge model is the user's decision).  Estimate now ~62-65 %.
+  cpu.weight, memory.high/low/min, swap, io, cpuset.  2026-10-09: memory.max
+  moved onto a Linux-style CHARGE MODEL (charge at allocation, uncharge at
+  free, per-frame owner; a memfd's page cache charged to its creator) — an
+  8 MiB container starts, memory.current is exact.  Estimate now ~62-65 %.
 - **RESUME HERE — in this order:**
   1. (done 2026-10-08 — cgroup limits + inotify)
   2. Rung 4: overlayfs (today `--storage-driver=vfs`).
   3. Rung 5: networking — network namespace, veth, bridge, NAT; `-p 8080:80`.
   4. Rung 6: `docker run -it` (pty/devpts), `docker build`, volumes.
   5. x86_64: waits for the higher-half kernel move.
-  Open beside it: NEXT.md #14 (rare pthread_join hang), #16 (a non-leader
-  thread's execve keeps its pid) and #18 (memory.max counts exec'd images);
-  `noexec` accepted, not enforced.
+  Open beside it: NEXT.md #14 (rare pthread_join hang) and #16 (a non-leader
+  thread's execve keeps its pid); `noexec` accepted, not enforced.
 - Test recipe (aarch64, ~15 min a run): `scripts/dos-shell-test.py --arch
   aarch64 --smp 2 --mem 3G --disk build/aarch64/dk.img --via serial
   --boot-timeout 240 --between 45` with `mkdir /run`, `containerd &`,

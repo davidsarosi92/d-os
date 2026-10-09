@@ -20,7 +20,8 @@
  * WHAT IS ENFORCED (§M90 rung 3, 2026-10-08) — see "ENFORCEMENT" below:
  * pids.max (fork/clone refused with EAGAIN), cpu.max (quota per period: a
  * node that spent its quota is not scheduled until the period ends) and
- * memory.max (an OOM kill inside the node, SIGKILL = exit 137, counted in
+ * memory.max (a Linux-style CHARGE MODEL — charged at allocation, uncharged
+ * at free — and an OOM kill inside the node, SIGKILL = exit 137, counted in
  * memory.events).  Limits are hierarchical; current/peak/stat figures count
  * the whole subtree, as on Linux.
  *
@@ -29,7 +30,8 @@
  * stored and read back but NOT enforced (a write is accepted so runc and
  * dockerd can configure a container; nothing throttles on them).  memory.max
  * has no reclaim stage: Linux first shrinks the page cache and swaps, here
- * the first answer to "over the limit" is the OOM kill.
+ * the first answer to "over the limit" is the OOM kill.  Lowering memory.max
+ * below the current charge kills at the next charge, not at the write.
  * The "no internal processes" rule and the threaded mode are not modelled
  * (cgroup.type answers "domain").  rmdir of a node whose control file is
  * still OPEN frees the node under the open file — Linux keeps it alive; this
@@ -57,6 +59,7 @@
 #include "timer.h"
 #include "klog.h"
 #include "fsnotify.h"
+#include "pmm.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -140,8 +143,8 @@ struct cgroup {
     int64_t        pids_max;
     uint64_t       pids_ev_max;          /* pids.events "max": forks refused  */
     int64_t        mem_max;              /* bytes, page-aligned               */
-    uint64_t       mem_est;              /* an UPPER estimate of the usage    */
-    int            mem_stale;            /* the estimate must be re-measured  */
+    uint64_t       mem_charged;          /* bytes charged here + below (exact) */
+    uint16_t       memcg_id;             /* this node's charge id (0 = none)   */
     int            oom_tgid;             /* an OOM kill under way, or 0       */
     uint64_t       mem_ev_max, mem_ev_oom, mem_ev_oom_kill;
     spinlock_t     cpu_lock;             /* the cpu.max state below           */
@@ -204,7 +207,6 @@ static void cg_init(struct cgroup* cg, struct cgroup* parent, const char* name) 
     }
     cg->pids_max = -1;
     cg->mem_max = -1;
-    cg->mem_stale = 1;
     cg->cpu_quota_us = -1;
     cg->cpu_period_us = 100000;
     spinlock_t z = SPINLOCK_INIT;
@@ -306,7 +308,6 @@ static void cg_tally(struct cgroup* cg, struct tally* a) {
     a->cg = cg; a->tasks = a->mem = a->cpu_ms = 0;
     a->best_tgid = 0; a->best_mem = 0; a->best_adj = -1000;
     task_for_each(tally_fn, a);
-    if (a->mem > cg->mem_peak) cg->mem_peak = a->mem;
 }
 
 struct move { int tgid; int tid; struct cgroup* to; int moved; };
@@ -317,10 +318,8 @@ static void move_fn(const struct task* t, int is_current, void* ctx) {
     if (m->tid ? t->pid == m->tid : task_tgid(t) == m->tgid) {
         ((struct task*)t)->cgroup = cg_is_root(m->to) ? NULL : m->to;
         m->moved++;
-        /* What the member brings must be MEASURED before the next charge is
-         * believed: the estimate counts frames charged since the last
-         * measurement and knows nothing about memory that walked in. */
-        for (struct cgroup* c = m->to; c; c = c->parent) c->mem_stale = 1;
+        /* Its charges stay where they were made (cgroup v2 does not move
+         * charges with a task; new allocations charge the new node). */
     }
 }
 
@@ -372,8 +371,9 @@ static void gen(struct cgroup* cg, int k, struct wbuf* w) {
         return;
     }
     case K_MEM_CURRENT: case K_MEM_PEAK:
-        cg_tally(cg, &a);
-        w_u(w, k == K_MEM_CURRENT ? a.mem : cg->mem_peak); w_s(w, "\n");
+        w_u(w, k == K_MEM_CURRENT ? __atomic_load_n(&cg->mem_charged, __ATOMIC_RELAXED)
+                                  : cg->mem_peak);
+        w_s(w, "\n");
         return;
     case K_MEM_SWAP_CUR: w_s(w, "0\n"); return;
     case K_MEM_EVENTS:
@@ -382,10 +382,18 @@ static void gen(struct cgroup* cg, int k, struct wbuf* w) {
         w_s(w, "\noom_kill "); w_u(w, cg->mem_ev_oom_kill);
         w_s(w, "\noom_group_kill 0\n");
         return;
-    case K_MEM_STAT:
+    case K_MEM_STAT: {
+        /* anon = what the members' address spaces privately hold (walked);
+         * file = the rest of the charge (page cache, memfd pages, frames
+         * shared copy-on-write).  The split is a measurement beside an
+         * exact total, so it is a sample, not a ledger. */
         cg_tally(cg, &a);
-        w_s(w, "anon "); w_u(w, a.mem); w_s(w, "\nfile 0\nkernel 0\nsock 0\nshmem 0\n");
+        uint64_t ch = cg_is_root(cg) ? a.mem : __atomic_load_n(&cg->mem_charged, __ATOMIC_RELAXED);
+        uint64_t anon = a.mem < ch ? a.mem : ch;
+        w_s(w, "anon "); w_u(w, anon); w_s(w, "\nfile "); w_u(w, ch - anon);
+        w_s(w, "\nkernel 0\nsock 0\nshmem 0\n");
         return;
+    }
     case K_PIDS_CURRENT: cg_tally(cg, &a); w_u(w, a.tasks); w_s(w, "\n"); return;
     case K_PIDS_EVENTS: w_s(w, "max "); w_u(w, cg->pids_ev_max); w_s(w, "\n"); return;
     case K_IO_STAT: return;
@@ -544,8 +552,7 @@ static ssize_t cg_write(struct file* f, const void* buf, size_t n, uint64_t off)
         int64_t v = parse_limit(s, 1);
         if (v == -2) return -1;
         if (v >= 0) v &= ~(int64_t)4095;          /* Linux rounds down to a page */
-        cg->mem_max = v;
-        cg->mem_stale = 1;                        /* measure before the next charge */
+        cg->mem_max = v;          /* a node already above it OOMs at its next charge */
         put_limit(cg->val[K_MEM_MAX], v);
         return (ssize_t)n;
     }
@@ -628,6 +635,8 @@ static int cg_lookup(struct inode* dir, const char* name, struct inode** out) {
     return -1;
 }
 
+static void memcg_mkdir(struct cgroup* cg);
+static void memcg_retire(struct cgroup* cg);
 static int cg_mkdir(struct inode* dir, const char* name, struct inode** out) {
     struct cgroup* parent = (struct cgroup*)dir->private;
     if (!parent || s_len(name) > CG_NAME) return -1;
@@ -635,6 +644,7 @@ static int cg_mkdir(struct inode* dir, const char* name, struct inode** out) {
     struct cgroup* cg = (struct cgroup*)kcalloc(1, sizeof *cg);
     if (!cg) return -1;
     cg_init(cg, parent, name);
+    memcg_mkdir(cg);                            /* §M90 — its charge id */
     parent->nchildren++;
     *out = &cg->dir;
     return 0;
@@ -652,6 +662,7 @@ static int cg_unlink(struct inode* dir, const char* name, struct inode* child) {
     if (s.alive) return -2;                                 /* EBUSY: members */
     parent->nchildren--;
     bpf_cgroup_gone(cg);                        /* §M90 — its device programs go too */
+    memcg_retire(cg);                           /* §M90 — its charges stay in the parent */
     /* §M90 rung 3 — the control files are freed with the node: their
      * inotify watches end now (containerd watches memory.events). */
     for (int k = 0; k < K_N; k++) fsnotify_inode_gone(&cg->files[k]);
@@ -761,25 +772,192 @@ int cgroup_cpu_throttled(const struct task* t) {
     return 0;
 }
 
-/* -- memory.max --------------------------------------------------------------
+/* -- memory.max: THE CHARGE MODEL ----------------------------------------------
  *
- * THERE IS NO PER-FRAME COUNTER TO CHARGE, ON PURPOSE: §M75 (vmm.h) measures a
- * space's memory by walking it, because a counter cannot stay right when COW
- * sharing changes under it.  So the charge keeps an UPPER ESTIMATE: every
- * user frame taken adds a page, nothing is subtracted, and only when the
- * estimate crosses the limit is the subtree MEASURED (one walk per member
- * process).  Usage far below the limit therefore costs an atomic add per
- * frame; usage at the limit costs a measurement per frame, which is the
- * price of exactness exactly where exactness decides a kill.
+ * Linux's memory controller, reduced to its contract, as asked for after the
+ * first cut (an estimate measured by walking address spaces) OOM-killed
+ * `runc init` in an 8 MiB container (NEXT #18):
  *
- * Over the limit after measuring = OOM: the process with the most private
- * memory in the node's subtree is killed with SIGKILL (exit 137) — every
- * process of the subtree when memory.oom.group is 1 — and memory.events
- * counts max/oom/oom_kill.  While that kill is under way further charges are
- * allowed (the victim's frames are about to come back; measuring again per
- * frame would only find the same answer).  A victim never gets another frame.
- * When every candidate has oom_score_adj -1000 nothing is killed and the
- * charge simply fails. */
+ *   - A FRAME IS CHARGED ONCE, WHEN IT IS ALLOCATED, to the cgroup of the task
+ *     that allocated it, and UNCHARGED when it is freed — wherever it is
+ *     mapped in between.  pmm_alloc_frame_user*() charge; pmm_free_frame()
+ *     uncharges.  A per-frame OWNER TABLE (2 bytes a frame, a charge id) is
+ *     what makes the uncharge find its cgroup; it is allocated when the first
+ *     node is created, so a machine that never makes a cgroup pays nothing.
+ *   - A COPY-ON-WRITE share is charged to whoever allocated the frame, the
+ *     copy to whoever wrote.  A page-cache page is charged to the task whose
+ *     read brought it in — EXCEPT a page read from a memfd: on Linux a
+ *     memfd's pages ARE its page cache and mapping one allocates nothing, so
+ *     here the cached copy is charged to the memfd's CREATOR (shm.memcg_id,
+ *     inode.memcg_as).  That is what lets runc exec its init from a memfd
+ *     made outside the container without the container paying for runc.
+ *   - Charges do not move with a task (cgroup v2 semantics).  A removed node's
+ *     remaining charges stay counted in its parent: its id becomes a
+ *     TOMBSTONE that forwards to the parent's id and remembers the residual,
+ *     and the id is reused only when the residual is gone and nothing refers
+ *     to it any more.
+ *   - The counters are HIERARCHICAL: a charge adds to the node and every
+ *     ancestor, so memory.current is exact and memory.max is checked with one
+ *     comparison per ancestor.
+ *
+ * Over the limit = OOM: the process with the most private memory in the
+ * over-limit node's subtree is killed with SIGKILL (exit 137) — every process
+ * of the subtree when memory.oom.group is 1 — and memory.events counts
+ * max/oom/oom_kill.  While that kill is under way further charges are allowed
+ * (the victim's frames are about to come back).  A victim never gets another
+ * frame.  A charge made ON BEHALF of another node (a memfd's page cache) that
+ * finds nobody to kill is allowed rather than refused — the reader is not the
+ * one over the limit.  When every candidate has oom_score_adj -1000 and the
+ * allocating task is inside the node, nothing is killed and the charge fails.
+ *
+ * What is NOT charged, stated: kernel memory (page tables, the heap, socket
+ * buffers — Linux charges kmem too), and swap (memory.swap.current reads 0: an
+ * evicted page is uncharged when its frame is freed). */
+
+#define MEMCG_IDS 4096
+struct memcg_slot { struct cgroup* cg; uint16_t fwd; uint8_t used; int refs; uint64_t residual; };
+static struct memcg_slot g_ids[MEMCG_IDS];       /* [0] = the root: never charged */
+static uint16_t* volatile g_owner;               /* charge id per frame, by pfn - base */
+static uint32_t g_owner_n;
+static int g_owner_failed, g_ids_full_said;
+static spinlock_t g_mc_lock = SPINLOCK_INIT;
+
+/* Called from mkdir (task context): the owner table, once. */
+static void memcg_table_init(void) {
+    if (g_owner || g_owner_failed) return;
+    uint32_t n = pmm_nr_frames - pmm_pfn_base;
+    uint16_t* t = (uint16_t*)kcalloc(n, sizeof *t);
+    if (!t) {
+        g_owner_failed = 1;
+        klog(KLOG_WARN, "cgroup", "memory accounting OFF: no room for the owner table "
+             "(%u frames) - memory.max will not be enforced\n", (unsigned)n);
+        return;
+    }
+    g_owner_n = n;
+    __atomic_store_n(&g_owner, t, __ATOMIC_RELEASE);
+}
+
+/* A free charge id for `cg`, or 0.  Caller holds g_mc_lock. */
+static uint16_t memcg_id_new_locked(struct cgroup* cg) {
+    for (int i = 1; i < MEMCG_IDS; i++) {
+        if (g_ids[i].used) continue;
+        g_ids[i].used = 1; g_ids[i].cg = cg; g_ids[i].fwd = 0;
+        g_ids[i].refs = 0; g_ids[i].residual = 0;
+        return (uint16_t)i;
+    }
+    return 0;
+}
+
+/* Free tombstones that nothing needs any more, up the forward chain.  A
+ * tombstone holds a reference on the id it forwards to, so a parent's id is
+ * never reused while a child's tombstone still points at it. */
+static void memcg_try_free_locked(uint16_t id) {
+    while (id && g_ids[id].used && !g_ids[id].cg && !g_ids[id].residual && !g_ids[id].refs) {
+        uint16_t nx = g_ids[id].fwd;
+        g_ids[id].used = 0;
+        if (nx && g_ids[nx].refs > 0) g_ids[nx].refs--;
+        id = nx;
+    }
+}
+
+/* The live node an id charges to now (a tombstone's nearest live ancestor),
+ * or NULL for the root.  Caller holds g_mc_lock. */
+static struct cgroup* memcg_live_locked(uint16_t id) {
+    for (int guard = 0; id && guard < MEMCG_IDS; guard++) {
+        if (!g_ids[id].used) return NULL;
+        if (g_ids[id].cg) return g_ids[id].cg;
+        id = g_ids[id].fwd;
+    }
+    return NULL;
+}
+
+static void charge_chain_locked(struct cgroup* cg, int64_t delta) {
+    for (struct cgroup* c = cg; c && !cg_is_root(c); c = c->parent) {
+        if (delta < 0 && c->mem_charged < (uint64_t)-delta) c->mem_charged = 0;
+        else c->mem_charged += (uint64_t)delta;
+        if (delta > 0 && c->mem_charged > c->mem_peak) c->mem_peak = c->mem_charged;
+    }
+}
+
+int cgroup_memcg_hold_current(void) {
+    struct task* me = task_current();
+    struct cgroup* cg = me ? (struct cgroup*)me->cgroup : NULL;
+    if (!cg || !cg->memcg_id) return 0;
+    uint32_t fl = spin_lock_irqsave(&g_mc_lock);
+    uint16_t id = cg->memcg_id;
+    g_ids[id].refs++;
+    spin_unlock_irqrestore(&g_mc_lock, fl);
+    return id;
+}
+
+void cgroup_memcg_put(int id) {
+    if (id <= 0 || id >= MEMCG_IDS) return;
+    uint32_t fl = spin_lock_irqsave(&g_mc_lock);
+    if (g_ids[id].refs > 0) g_ids[id].refs--;
+    memcg_try_free_locked((uint16_t)id);
+    spin_unlock_irqrestore(&g_mc_lock, fl);
+}
+
+void cgroup_mem_set_owner(pmm_phys_t f, int id) {
+    uint16_t* t = g_owner;
+    uint32_t pfn = (uint32_t)(f >> 12);
+    if (!t || id <= 0 || pfn < pmm_pfn_base || pfn - pmm_pfn_base >= g_owner_n) return;
+    __atomic_store_n(&t[pfn - pmm_pfn_base], (uint16_t)id, __ATOMIC_RELAXED);
+}
+
+void cgroup_mem_uncharge(int id) {
+    if (id <= 0) return;
+    uint32_t fl = spin_lock_irqsave(&g_mc_lock);
+    uint16_t i = (uint16_t)id;
+    for (int guard = 0; i && guard < MEMCG_IDS; guard++) {
+        struct memcg_slot* sl = &g_ids[i];
+        if (!sl->used) break;
+        if (sl->cg) { charge_chain_locked(sl->cg, -4096); break; }
+        /* A tombstone: its residual, then up to whoever counts it now. */
+        if (sl->residual >= 4096) sl->residual -= 4096; else sl->residual = 0;
+        uint16_t nx = sl->fwd;
+        memcg_try_free_locked(i);
+        i = nx;
+    }
+    spin_unlock_irqrestore(&g_mc_lock, fl);
+}
+
+void cgroup_mem_free_frame(pmm_phys_t f) {
+    uint16_t* t = g_owner;
+    if (!t) return;
+    uint32_t pfn = (uint32_t)(f >> 12);
+    if (pfn < pmm_pfn_base || pfn - pmm_pfn_base >= g_owner_n) return;
+    uint16_t id = __atomic_exchange_n(&t[pfn - pmm_pfn_base], (uint16_t)0, __ATOMIC_ACQ_REL);
+    if (id) cgroup_mem_uncharge(id);
+}
+
+/* A new node: the owner table on first use, and its charge id. */
+static void memcg_mkdir(struct cgroup* cg) {
+    memcg_table_init();
+    if (!g_owner) return;
+    uint32_t fl = spin_lock_irqsave(&g_mc_lock);
+    cg->memcg_id = memcg_id_new_locked(cg);
+    spin_unlock_irqrestore(&g_mc_lock, fl);
+    if (!cg->memcg_id && !g_ids_full_said) {
+        g_ids_full_said = 1;
+        klog(KLOG_WARN, "cgroup", "%d charge ids in use - new nodes are not memory-accounted\n",
+             MEMCG_IDS - 1);
+    }
+}
+
+/* A node retires its id (rmdir): its residual stays counted in the parent. */
+static void memcg_retire(struct cgroup* cg) {
+    if (!cg->memcg_id) return;
+    uint32_t fl = spin_lock_irqsave(&g_mc_lock);
+    struct memcg_slot* sl = &g_ids[cg->memcg_id];
+    sl->cg = NULL;
+    sl->fwd = (cg->parent && !cg_is_root(cg->parent)) ? cg->parent->memcg_id : 0;
+    if (sl->fwd) g_ids[sl->fwd].refs++;
+    sl->residual = cg->mem_charged;
+    memcg_try_free_locked(cg->memcg_id);
+    spin_unlock_irqrestore(&g_mc_lock, fl);
+    cg->memcg_id = 0;
+}
 
 int cgroup_oom_victim_self(void) {
     struct task* me = task_current();
@@ -796,69 +974,96 @@ static void oomall_fn(const struct task* t, int is_current, void* ctx) {
     o->tg[o->n++] = t->pid;
 }
 
-int cgroup_mem_charge(void) {
+/* Over the limit in `c`: kill.  Returns 1 when the CURRENT process is a
+ * victim (its charge must fail), 0 when it is not, -1 when nothing could be
+ * killed. */
+static int oom_kill_in(struct cgroup* c) {
     struct task* me = task_current();
-    if (!me || !me->cgroup) return 1;
-    if (cgroup_oom_victim_self()) return 0;
-    for (struct cgroup* c = (struct cgroup*)me->cgroup; c && !cg_is_root(c); c = c->parent) {
-        if (c->mem_max < 0) continue;
-        uint64_t est = __atomic_add_fetch(&c->mem_est, 4096, __ATOMIC_RELAXED);
-        if (!c->mem_stale && est <= (uint64_t)c->mem_max) continue;
-        if (c->oom_tgid) {
-            struct task* v = task_find(c->oom_tgid);
-            if (v && v->state != TASK_DEAD) continue;  /* the kill is still under way */
-            c->oom_tgid = 0;
-        }
-        struct tally a;
-        cg_tally(c, &a);
-        c->mem_stale = 0;
-        __atomic_store_n(&c->mem_est, a.mem + 4096, __ATOMIC_RELAXED);
-        if (a.mem + 4096 <= (uint64_t)c->mem_max) continue;
-
-        /* Over the limit, measured. */
-        c->mem_ev_max++;
-        char path[96];
-        cg_path(c, path, sizeof path);
-        int group = s_eq(c->val[K_MEM_OOM_GROUP], "1");
-        if (!group && !a.best_tgid) {
-            klog(KLOG_WARN, "cgroup", "%s: memory.max %lu reached, every member is "
-                 "oom_score_adj -1000 - allocation refused, nothing killed\n",
-                 path, (unsigned long)c->mem_max);
-            cg_changed(c, K_MEM_EVENTS);
-            return 0;
-        }
-        c->mem_ev_oom++;
-        int self_dies = 0;
-        if (group) {
-            struct oomall* o = (struct oomall*)kmalloc(sizeof *o);
-            if (o) {
-                o->cg = c; o->n = 0;
-                task_for_each(oomall_fn, o);
-                for (int i = 0; i < o->n; i++) {
-                    if (o->tg[i] == task_tgid(me)) self_dies = 1;
-                    task_kill_group_oom(o->tg[i], 137);
-                    c->mem_ev_oom_kill++;
-                }
-                if (o->n) c->oom_tgid = o->tg[0];
-                kfree(o);
+    struct tally a;
+    cg_tally(c, &a);
+    char path[96];
+    cg_path(c, path, sizeof path);
+    int group = s_eq(c->val[K_MEM_OOM_GROUP], "1");
+    if (!group && !a.best_tgid) {
+        klog(KLOG_WARN, "cgroup", "%s: memory.max %lu reached, nobody to kill "
+             "(no member, or every one oom_score_adj -1000)\n", path, (unsigned long)c->mem_max);
+        cg_changed(c, K_MEM_EVENTS);
+        return -1;
+    }
+    c->mem_ev_oom++;
+    int self_dies = 0;
+    if (group) {
+        struct oomall* o = (struct oomall*)kmalloc(sizeof *o);
+        if (o) {
+            o->cg = c; o->n = 0;
+            task_for_each(oomall_fn, o);
+            for (int i = 0; i < o->n; i++) {
+                if (me && o->tg[i] == task_tgid(me)) self_dies = 1;
+                task_kill_group_oom(o->tg[i], 137);
+                c->mem_ev_oom_kill++;
             }
-        } else {
-            struct task* v = task_find(a.best_tgid);
-            klog(KLOG_WARN, "cgroup", "%s: memory.max %lu reached (%lu in use) - OOM kill "
-                 "pid %d '%s' (%lu KiB)\n", path, (unsigned long)c->mem_max,
-                 (unsigned long)a.mem, a.best_tgid, v ? v->name : "?",
-                 (unsigned long)(a.best_mem / 1024));
-            task_kill_group_oom(a.best_tgid, 137);
-            c->mem_ev_oom_kill++;
-            c->oom_tgid = a.best_tgid;
-            self_dies = (a.best_tgid == task_tgid(me));
+            if (o->n) c->oom_tgid = o->tg[0];
+            kfree(o);
         }
-        /* Every ancestor's memory.events counts what happened below it. */
-        for (struct cgroup* p = c; p && !cg_is_root(p); p = p->parent) {
-            if (p != c) { p->mem_ev_oom++; p->mem_ev_oom_kill++; }
-            cg_changed(p, K_MEM_EVENTS);
+    } else {
+        struct task* v = task_find(a.best_tgid);
+        klog(KLOG_WARN, "cgroup", "%s: memory.max %lu reached (%lu charged) - OOM kill "
+             "pid %d '%s' (%lu KiB private)\n", path, (unsigned long)c->mem_max,
+             (unsigned long)c->mem_charged, a.best_tgid, v ? v->name : "?",
+             (unsigned long)(a.best_mem / 1024));
+        task_kill_group_oom(a.best_tgid, 137);
+        c->mem_ev_oom_kill++;
+        c->oom_tgid = a.best_tgid;
+        self_dies = me && a.best_tgid == task_tgid(me);
+    }
+    /* Every ancestor's memory.events counts what happened below it. */
+    for (struct cgroup* p = c; p && !cg_is_root(p); p = p->parent) {
+        if (p != c) { p->mem_ev_oom++; p->mem_ev_oom_kill++; }
+        cg_changed(p, K_MEM_EVENTS);
+    }
+    return self_dies;
+}
+
+int cgroup_mem_charge(int as, int* out_id) {
+    *out_id = 0;
+    if (!g_owner) return 1;                          /* no node exists: nothing to charge */
+    struct task* me = task_current();
+    uint16_t id;
+    if (as >= 0) {
+        id = (uint16_t)as;                           /* on behalf of a memfd's creator */
+    } else {
+        if (!me || !me->cgroup) return 1;
+        if (cgroup_oom_victim_self()) return 0;
+        id = ((struct cgroup*)me->cgroup)->memcg_id;
+    }
+    if (!id) return 1;
+    for (int round = 0; round < 3; round++) {
+        uint32_t fl = spin_lock_irqsave(&g_mc_lock);
+        struct cgroup* cg = memcg_live_locked(id);
+        if (!cg) { spin_unlock_irqrestore(&g_mc_lock, fl); return 1; }   /* the root: unaccounted */
+        struct cgroup* over = NULL;
+        if (round == 0)
+            for (struct cgroup* c = cg; c && !cg_is_root(c); c = c->parent)
+                if (c->mem_max >= 0 && c->mem_charged + 4096 > (uint64_t)c->mem_max) { over = c; break; }
+        if (!over) {
+            charge_chain_locked(cg, 4096);
+            *out_id = cg->memcg_id;
+            spin_unlock_irqrestore(&g_mc_lock, fl);
+            return 1;
         }
-        if (self_dies) return 0;
+        spin_unlock_irqrestore(&g_mc_lock, fl);
+        /* Over the limit.  Outside the lock: finding and killing a victim
+         * walks the task list and the address spaces. */
+        over->mem_ev_max++;
+        if (over->oom_tgid) {
+            struct task* v = task_find(over->oom_tgid);
+            if (v && v->state != TASK_DEAD) continue;      /* a kill under way: charge */
+            over->oom_tgid = 0;
+        }
+        int r = oom_kill_in(over);
+        if (r == 1) return 0;                               /* we are the victim */
+        if (r < 0 && as < 0 && me && cg_within(task_cg(me), over)) return 0;
+        /* someone else dies, or a charge on another node's behalf: charge */
     }
     return 1;
 }
@@ -1069,8 +1274,17 @@ static void cmd_cglimittest(const char* args) {
         CT(ct_read("/sys/fs/cgroup/lim/memory.events", buf, sizeof buf) == 0 &&
            ct_contains(buf, "oom_kill 1\n") && ct_contains(buf, "\noom 1\n"),
            "memory.events: oom 1, oom_kill 1");
-        CT(ct_read("/sys/fs/cgroup/lim/memory.peak", buf, sizeof buf) == 0, "memory.peak readable");
+        CT(ct_read("/sys/fs/cgroup/lim/memory.peak", buf, sizeof buf) == 0 &&
+           buf[0] >= '1' && buf[0] <= '9', "memory.peak readable");
         kprintf("cglimit: memory.peak %s", buf);
+        /* The CHARGE MODEL's other half: every frame the victim held went
+         * back through pmm_free_frame and uncharged the node.  A leak here
+         * would leave the container "full" after its processes are gone. */
+        task_msleep(200);
+        long cur = -1;
+        if (ct_read("/sys/fs/cgroup/lim/memory.current", buf, sizeof buf) == 0) parse_int(buf, &cur);
+        kprintf("cglimit: memory.current after the kill %ld\n", cur);
+        CT(cur >= 0 && cur < 262144, "the victim's frames were uncharged (memory.current < 256 KiB)");
     } else {
         kprintf("cglimit: no memhog embedded - memory.max not driven\n");
         ct_write("/sys/fs/cgroup/cgroup.procs", mypid);
