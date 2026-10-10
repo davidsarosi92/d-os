@@ -146,7 +146,7 @@ static void dump_and_halt(const char* what, struct trapframe* tf) {
             if (t && !t->is_idle && t->pid != 0) {
                 uart_early_puts("\n  kernel.fault_policy=kill — terminating the "
                                 "faulting kernel task (best-effort).\n");
-                task_exit_code(139);          /* 128 + SIGSEGV; noreturn */
+                task_exit_signal(11);         /* 128 + SIGSEGV; noreturn */
             }
             uart_early_puts("\n  kill policy: idle/pid0 context, not killable — halting.\n");
         }
@@ -341,6 +341,13 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
              * reaper frees its address space).  An EL1 (kernel) fault falls
              * through to dump_and_halt, which applies kernel.fault_policy
              * (halt / reboot / kill) — same knob as x86. */
+            /* §M90 — an EL0 read of a CPU-ID register is EMULATED, as Linux
+             * does (HWCAP_CPUID): Go's x/sys/cpu reads ID_AA64ISAR0_EL1
+             * directly and died of SIGILL without it (cpuid_emu.c). */
+            if ((tf->spsr & 0xF) == 0 && ((esr >> 26) == 0x00 || (esr >> 26) == 0x18)) {
+                extern int aarch64_emulate_el0_mrs(uint64_t esr, uint64_t* x, uint64_t* elr);
+                if (aarch64_emulate_el0_mrs(esr, tf->x, &tf->elr)) return;
+            }
             if ((tf->spsr & 0xF) == 0) {
                 extern void task_exit_code(int) __attribute__((noreturn));
                 uint64_t far, sp0;
@@ -372,7 +379,7 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
                     /* §M90 rung 3 — a fault that could not get a frame because the
                      * cgroup OOM killer chose THIS process: it ends with SIGKILL (137),
                      * not with a SIGSEGV and a crash record — a policy, not a bug. */
-                    if (cgroup_oom_victim_self()) task_exit_group(137);
+                    if (cgroup_oom_victim_self()) task_exit_group_signal(9);
                     if (lnx_fault_deliver_esr(tf, lsig, (uintptr_t)far, esr)) {
                         check_el0_return(tf, "signal");
                         return;
@@ -407,7 +414,7 @@ void aarch64_exception_handler(uint64_t type, struct trapframe* tf) {
                                  (uintptr_t)far, 11, "EL0 synchronous exception");
                 }
             user_excursion_fault(11);   /* an excursion returns to its caller */
-                task_exit_code(139);          /* 128 + SIGSEGV */
+                task_exit_signal(11);         /* 128 + SIGSEGV */
             }
             dump_and_halt("synchronous", tf);
             break;

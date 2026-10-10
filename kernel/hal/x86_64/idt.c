@@ -362,7 +362,7 @@ static void ring0_fault_policy(int sig) {
             kprintf("fault: kernel.fault_policy=kill — terminating kthread '%s' pid %d "
                     "(best-effort; may deadlock if it held a lock; M29 restarts a service)\n",
                     t->name, t->pid);
-            task_exit_code(128 + sig);
+            task_exit_signal(sig);
         }
         kprintf("fault: kill policy — faulting context is idle/pid0, not killable; halting\n");
     }
@@ -639,7 +639,7 @@ void isr_handler(struct int_frame* f) {
             /* §M90 rung 3 — a fault that could not get a frame because the
              * cgroup OOM killer chose THIS process: it ends with SIGKILL (137),
              * not with a SIGSEGV and a crash record — a policy, not a bug. */
-            if (cgroup_oom_victim_self()) task_exit_group(137);
+            if (cgroup_oom_victim_self()) task_exit_group_signal(9);
             if (lnx_fault_deliver(f, sig, (uintptr_t)ucr2)) return;
             /* cr2 names the address, cr3 the address space the CPU was in —
              * "a page is missing" and "the task ran in somebody else's space"
@@ -661,7 +661,7 @@ void isr_handler(struct int_frame* f) {
                          (uintptr_t)f->rip, f->int_no == 14 ? (uintptr_t)ucr2 : 0,
                          sig, exception_name[f->int_no]);
             user_excursion_fault(sig);   /* an excursion returns to its caller */
-            task_exit_code(128 + sig);   /* noreturn */
+            task_exit_signal(sig);   /* noreturn */
         }
         /* §M54 — a kernel #PF's fault ADDRESS is the most informative number
          * the machine has about it, and this record used to hard-code 0 for

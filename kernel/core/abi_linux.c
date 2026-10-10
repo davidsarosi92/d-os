@@ -80,6 +80,11 @@ static const struct abi_nument linux_i386_ents[] = {
     { 319, ABI_EPOLL_WAIT },        /* epoll_pwait */
     { 176, ABI_SIGPENDING },        /* rt_sigpending  */
     { 175, ABI_SIGPROCMASK },       /* rt_sigprocmask */
+    {  29, ABI_PAUSE },  { 179, ABI_SIGSUSPEND },   /* §M90 */
+    /* §M90 — waitpid/wait4 were per-arch cases with the OLD status encoding
+     * (no WIFSIGNALED, no WNOHANG, no pid-namespace translation): arm64 alone
+     * had the engine's.  waitpid's three arguments are wait4's first three. */
+    {   7, ABI_WAIT },   { 114, ABI_WAIT },
     { 326, ABI_TIMERFD_GETTIME },
     { 104, ABI_SETITIMER       },
     /* §M24 — sockets.  i386 has BOTH: these direct numbers (since 4.3) and the
@@ -220,6 +225,8 @@ static const struct abi_nument linux_amd64_ents[] = {
     { 281, ABI_EPOLL_WAIT },        /* epoll_pwait */
     { 127, ABI_SIGPENDING },        /* rt_sigpending  */
     {  14, ABI_SIGPROCMASK },       /* rt_sigprocmask */
+    {  34, ABI_PAUSE },  { 130, ABI_SIGSUSPEND },   /* §M90 */
+    {  61, ABI_WAIT },              /* wait4 — §M90, from the per-arch switch */
     { 287, ABI_TIMERFD_GETTIME },
     {  38, ABI_SETITIMER       },
     /* §M24 — sockets. */
@@ -328,6 +335,7 @@ static const struct abi_nument linux_arm64_ents[] = {
     {  96, ABI_SET_TID_ADDRESS },
     { 178, ABI_GETTID   },
     { 135, ABI_SIGPROCMASK },
+    { 133, ABI_SIGSUSPEND },        /* §M90 — arm64 has no pause (libc: ppoll) */
     { 260, ABI_WAIT     },          /* wait4 */
     { 221, ABI_EXECVE   },
     {  59, ABI_PIPE2    },          /* arm64 has only pipe2 */

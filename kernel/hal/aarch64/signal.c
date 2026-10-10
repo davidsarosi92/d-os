@@ -85,7 +85,7 @@ void signal_deliver(struct trapframe* f) {
         if (h == SIG_DFL) {
             /* Default: terminate on the fatal signals, ignore the rest. */
             if (sig == SIGINT || sig == SIGTERM || sig == SIGKILL || sig == SIGSEGV) {
-                if (t->user_task) { fd_close_all(); task_exit_code(128 + sig); }
+                if (t->user_task) { fd_close_all(); task_exit_signal(sig); }
             }
             continue;
         }
@@ -97,7 +97,7 @@ void signal_deliver(struct trapframe* f) {
         uint64_t frame = sp - (uint64_t)S_N * 8;
 
         if (!vmm_user_access_ok((uintptr_t)frame, (uintptr_t)S_N * 8, 1)) {
-            if (t->user_task) { fd_close_all(); task_exit_code(128 + SIGSEGV); }
+            if (t->user_task) { fd_close_all(); task_exit_signal(SIGSEGV); }
             continue;
         }
 
@@ -133,7 +133,7 @@ void signal_sigreturn(struct trapframe* f) {
     uint64_t frame = read_sp_el0();
     if (!vmm_user_access_ok((uintptr_t)frame, (uintptr_t)S_N * 8, 0)) {
         struct task* t = task_current();
-        if (t && t->user_task) task_exit_code(139);   /* 128 + SIGSEGV */
+        if (t && t->user_task) task_exit_signal(11);   /* 128 + SIGSEGV */
         return;
     }
     const uint64_t* sv = (const uint64_t*)(uintptr_t)frame;

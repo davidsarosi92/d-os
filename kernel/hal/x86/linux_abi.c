@@ -751,21 +751,7 @@ static void linux_syscall_body(struct int_frame* f) {
                                                (char* const*)f->edx);
             return;
 
-        case LNX_waitpid:
-        case LNX_wait4: {
-            /* waitpid(pid=ebx, status=ecx, options=edx[, rusage=esi]).  d-os
-             * task_wait returns the raw exit code; re-encode it into the Linux
-             * wait-status layout (WIFEXITED: code in bits 8..15) so musl's
-             * WEXITSTATUS() reads it correctly. */
-            int code = 0;
-            int pid = task_wait((int)f->ebx, &code);
-            if (f->ecx) {                       /* §1.1 — client status slot */
-                if (!lnx_w_ok(f->ecx, sizeof(int))) { f->eax = (uint32_t)-LNX_EFAULT; return; }
-                *(int*)f->ecx = (code & 0xFF) << 8;
-            }
-            f->eax = (uint32_t)pid;
-            return;
-        }
+        /* waitpid / wait4: the shared engine's ABI_WAIT since §M90. */
 
         case LNX_set_tid_address:
             /* musl records the clear-child-tid address for thread cleanup and

@@ -1172,6 +1172,17 @@ void modload_autoload(void) {
      * answerable from the boot log. */
     if (loaded || failed)
         kprintf("modules: %d loaded, %d refused\n", loaded, failed);
+
+    /* §M90 — and START what is present.  An autoloaded module is the boot's
+     * own driver, not one a user is about to `drv start`: before this the
+     * loopback (a module on every arch) was attached at boot and left down
+     * until the rescan poller happened by — so for the first stretch of every
+     * boot the machine had no 127.0.0.1, and a test that ran early read
+     * "no route" from a perfectly good ICMP socket.  A rescan probes every
+     * driver that is not running and brings up the ones whose device exists;
+     * one the user stopped (ADMIN_DOWN) or that misbehaved (quarantine) is
+     * left alone, so this decides nothing the rescan job would not. */
+    if (loaded) driver_rescan();
 }
 
 CONFIG_KEY(modules_autoload) = {

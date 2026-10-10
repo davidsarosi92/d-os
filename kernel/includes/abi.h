@@ -255,6 +255,10 @@ enum abi_op {
     ABI_SCHED_SETAFFINITY, ABI_SET_ROBUST_LIST, ABI_PPOLL,
     ABI_STATFS64, ABI_FSTATFS64,          /* i386's 64-bit-count statfs */
     ABI_LSTAT, ABI_SYMLINK, ABI_SYMLINKAT,   /* §M89 — symbolic links */
+    /* §M90 — waiting FOR a signal: pause and rt_sigsuspend (the job-control
+     * wait of every shell).  pause returned ENOSYS and a `for (;;) pause();`
+     * child spun at full speed. */
+    ABI_PAUSE, ABI_SIGSUSPEND,
 
     ABI_OP_MAX
 };

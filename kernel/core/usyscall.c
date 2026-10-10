@@ -33,6 +33,8 @@
  *      so a concurrent munmap turns into a short count or -EFAULT.
  * ============================================================================= */
 
+#include "version.h"
+#include "packet.h"
 #include "fsnotify.h"   /* §M90 — FD_INOTIFY */
 #include "syscall.h"
 #include "task.h"
@@ -367,6 +369,7 @@ long sys_write_k(int fd, const void* buf, size_t n) {
     if (o->kind == FD_NETSOCK) return netsock_write(o->nsock, buf, n);
     if (o->kind == FD_EVENT) return eventfd_write(o->efd, buf, n, !o->nonblock);   /* §M90 */
     if (o->kind == FD_NETLINK) return nl_send(o->nl, buf, n);                      /* §M90 */
+    if (o->kind == FD_PACKET) return packet_send(o->pkt, buf, n, 0, NULL, 0);      /* §M90 */
     if (o->kind == FD_FIFO) return fifo_write(o, buf, n, !o->nonblock);            /* §M90 */
     if (o->kind == FD_SHM && o->shm) {             /* §M90 — a memfd is written like a file */
         long w = shm_write(o->shm, o->shm_pos, buf, n);
@@ -459,6 +462,7 @@ long sys_read_k(int fd, void* buf, size_t n) {
      * the descriptor existing. */
     if (o->kind == FD_EVENT) return eventfd_read(o->efd, buf, n, block);   /* §M90 */
     if (o->kind == FD_NETLINK) return nl_recv(o->nl, buf, n, block, 0, 0); /* §M90 */
+    if (o->kind == FD_PACKET) return packet_recv(o->pkt, buf, n, block, NULL); /* §M90 */
     if (o->kind == FD_FIFO) return fifo_read(o, buf, n, block);           /* §M90 */
     if (o->kind == FD_INOTIFY) return inotify_read(o->ino, buf, n, block); /* §M90 */
     if (o->kind == FD_SHM && o->shm) {             /* §M90 — and read like one */
@@ -871,28 +875,33 @@ int sys_dupfd(int fd, int minfd) {
 /* M34 — kill(pid, sig): post `sig` to task `pid`.  Delivery happens when that
  * task next returns to user mode (hal/x86/signal.c).  A task blocked in a
  * syscall won't notice until it returns (no EINTR yet — a follow-up). */
+/* ONE rule for who may signal whom, used by sys_kill AND the Linux
+ * personality's kill/tkill/tgkill (lnx_signal.c) — the rule had a copy there,
+ * and fixing one copy is how the other one keeps the bug. */
+int task_may_signal(struct task* me, struct task* t) {
+    if (!me || !me->user_task) return 1;                   /* the kernel itself */
+    if (!t->user_task || t->pid == 0 || t->pid == task_reaper_pid()) return 0;
+    if (t == me || (t->mm && t->mm == me->mm)) return 1;   /* itself, its own threads */
+    if (cred_capable(&me->cred, 5 /* CAP_KILL */)) return 1;
+    int mu = cred_uid(&me->cred), tu = cred_uid(&t->cred);
+    return mu >= 0 && mu == tu;
+}
+
 int sys_kill(int pid, int sig) {
     if (sig <= 0 || sig >= NSIG) return -1;
     struct task* t = task_find(pid);
     if (!t) return -1;
-    /* §audit#6 — credential rule (pre-§M32, no uid/gid yet): a ring-3 caller may
-     * only signal a USER task that is itself or one of its descendants — never a
-     * kernel thread, pid 0, or init.  Without this, any package could kill the
-     * system's daemons (or another package) by pid. */
-    struct task* me = task_current();
-    if (me && me->user_task) {
-        if (!t->user_task || t->pid == 0 || t->pid == task_reaper_pid()) return -1;
-        if (t != me) {
-            int p = t->ppid, ok = 0;
-            for (int i = 0; i < 64 && p > 0; i++) {   /* walk t's ppid chain up */
-                if (p == me->pid) { ok = 1; break; }
-                struct task* pt = task_find(p);
-                if (!pt) break;
-                p = pt->ppid;
-            }
-            if (!ok) return -1;
-        }
-    }
+    /* §audit#6 — never a kernel thread, pid 0 or init, from ring 3.
+     *
+     * §M90 — and otherwise LINUX'S rule: the caller holds CAP_KILL, or its uid
+     * is the target's.  This used to be "only yourself or a descendant", a
+     * stand-in written before §M32 gave tasks identities — and it outlived its
+     * premise: `docker rm -f` failed "could not kill container: operation not
+     * permitted", because the container's init is reparented away from the
+     * shim that must signal it (a subreaper is not a parent).  A descendant
+     * check is a statement about the process TREE; permission to signal is a
+     * statement about IDENTITY, and the tree is the wrong evidence for it. */
+    if (!task_may_signal(task_current(), t)) return -1;
     /* §M72 — STOP and CONT are not DELIVERED, they are ACTED ON: neither
      * runs a handler (STOP cannot be caught or ignored, and CONT's effect is
      * the resumption itself), so they go straight to the scheduler.  They
@@ -1133,7 +1142,9 @@ int sys_uname(struct kutsname* out) {
     ustr(out->sysname,  "d-os");
     ustr(out->nodename, ns_hostname(task_current()));   /* §M90 — its UTS namespace */
     ustr(out->release,  "0.1");
-    ustr(out->version,  "M36 userland");
+    /* The build's milestone, not a constant from the milestone that wrote this
+     * line (it said "M36 userland" until §M90 — `uname -a` in a container). */
+    ustr(out->version,  "#1 SMP d-os " DOS_MILESTONE);
     /* The REAL architecture, from the one place that knows it.  This used to be
      * hardcoded "i386", so `uname -m` lied on x86_64 and aarch64 — and a libc
      * or build script that branches on it would have made the wrong choice. */
@@ -1447,6 +1458,12 @@ uint32_t fd_readiness_of(int fd, struct ofile* o) {
      * writable (a write to it is EINVAL on Linux too). */
     case FD_INOTIFY:
         if (inotify_can_read(o->ino)) r |= POLLIN;
+        break;
+    /* §M90 — a packet socket: readable while a frame waits; a send never
+     * waits for room. */
+    case FD_PACKET:
+        if (packet_can_read(o->pkt)) r |= POLLIN;
+        r |= POLLOUT;
         break;
     /* §M90 — a named pipe end: Linux pipe_poll's rules (fifo.c). */
     case FD_FIFO:
@@ -1821,9 +1838,15 @@ void fd_close_all(void) {
 
 struct ns_dgram {
     uint32_t src_ip; uint16_t src_port; uint16_t len; uint8_t data[NS_DGRAM_MAX];
+    uint8_t  is6, src6[16];             /* §M90 3a — an IPv6 sender */
 };
 struct netsock {
     int      type;
+    /* §M90 rung 5 — the namespace the socket was made in (Linux: a socket
+     * belongs to its creator's network namespace, whoever uses it later), and
+     * the protocol: 1 = ICMP for SOCK_RAW and the ping socket. */
+    int      netns;
+    int      proto;
     uint32_t local_ip;                  /* bind address; 0 = every address   */
     uint16_t local_port;
     int      bound;
@@ -1842,6 +1865,13 @@ struct netsock {
     int      rd_shut;                   /* shutdown(SHUT_RD): reads end here  */
     int      connected;
     uint32_t peer_ip; uint16_t peer_port;
+    /* §M90 3a — an AF_INET6 socket.  local6/peer6 are its IPv6 ends; an IPv4
+     * peer of a dual-stack socket is kept in peer_ip and SHOWN as
+     * ::ffff:a.b.c.d (peer_is4).  v6only = IPV6_V6ONLY; scope = the
+     * interface index of a link-local peer. */
+    int      fam6, v6only, peer_is4;
+    uint8_t  local6[16], peer6[16];
+    uint32_t scope;
 };
 
 static uint16_t g_ephem_port = 0xC000;
@@ -1908,22 +1938,73 @@ uint32_t netsock_readiness(struct netsock* ns) {
  * is full).  Runs on the poller task with the STACK LOCK HELD (§M55), which is
  * what makes this ring safe against the consumer below — and is also why it
  * must not block or allocate. */
+/* §M90 — an ICMP socket's share of an arriving packet: a RAW socket keeps
+ * the whole IP packet, a PING socket only echo replies carrying its id, from
+ * the ICMP header on (Linux's two shapes). */
+static void ns_icmp_cb(uint32_t src_ip, const uint8_t* ip, uint32_t total, void* ctx) {
+    struct netsock* ns = (struct netsock*)ctx;
+    uint32_t ihl = (ip[0] & 0x0F) * 4u;
+    if (ihl > total) return;
+    const uint8_t* data = ip; uint32_t len = total;
+    if (ns->type != 3 /* SOCK_RAW */) {
+        const uint8_t* ic = ip + ihl;
+        if (total - ihl < 8 || ic[0] != 0 /* echo reply */) return;
+        if ((uint16_t)(ic[4] << 8 | ic[5]) != ns->local_port) return;
+        data = ic; len = total - ihl;
+    }
+    int nx = (ns->rx_head + 1) % NS_RXSLOTS;
+    if (nx == ns->rx_tail) return;
+    struct ns_dgram* d = &ns->rx[ns->rx_head];
+    uint32_t n = len > NS_DGRAM_MAX ? NS_DGRAM_MAX : len;
+    for (uint32_t i = 0; i < n; i++) d->data[i] = data[i];
+    d->src_ip = src_ip; d->src_port = 0; d->len = (uint16_t)n;
+    ns->rx_head = nx;
+}
+
+/* §M90 3a — an ICMPv6 socket's share: RAW keeps every message, PING only
+ * echo replies with its id; both without the IP header (IPv6's rule). */
+static void ns_icmp6_cb(const uint8_t* src6, const uint8_t* m, uint32_t len, void* ctx) {
+    struct netsock* ns = (struct netsock*)ctx;
+    if (ns->type != 3) {
+        if (len < 8 || m[0] != 129 /* echo reply */) return;
+        if ((uint16_t)(m[4] << 8 | m[5]) != ns->local_port) return;
+    }
+    int nx = (ns->rx_head + 1) % NS_RXSLOTS;
+    if (nx == ns->rx_tail) return;
+    struct ns_dgram* d = &ns->rx[ns->rx_head];
+    uint32_t n = len > NS_DGRAM_MAX ? NS_DGRAM_MAX : len;
+    for (uint32_t i = 0; i < n; i++) d->data[i] = m[i];
+    d->src_ip = 0; d->src_port = 0; d->len = (uint16_t)n;
+    d->is6 = 1;
+    for (int i = 0; i < 16; i++) d->src6[i] = src6[i];
+    ns->rx_head = nx;
+}
+
 static void ns_udp_cb(uint32_t src_ip, uint16_t src_port,
                       const uint8_t* data, uint32_t len, void* ctx) {
     struct netsock* ns = (struct netsock*)ctx;
+    /* §M90 3a — which family the datagram came in: an IPv4 socket hears no
+     * IPv6 sender, a v6-only one no IPv4 sender (a dual-stack one hears both) */
+    const uint8_t* s6 = net_rx_src6();
+    if (s6 && !ns->fam6) return;
+    if (!s6 && ns->fam6 && ns->v6only) return;
     int nx = (ns->rx_head + 1) % NS_RXSLOTS;
     if (nx == ns->rx_tail) return;      /* full → drop */
     struct ns_dgram* d = &ns->rx[ns->rx_head];
     uint32_t n = len > NS_DGRAM_MAX ? NS_DGRAM_MAX : len;
     for (uint32_t i = 0; i < n; i++) d->data[i] = data[i];
     d->src_ip = src_ip; d->src_port = src_port; d->len = (uint16_t)n;
+    d->is6 = s6 ? 1 : 0;
+    if (s6) for (int i = 0; i < 16; i++) d->src6[i] = s6[i];
     ns->rx_head = nx;
 }
 
 /* Called from ofile_unref (fd.c) when the last descriptor closes. */
 void netsock_close(struct netsock* ns) {
     if (!ns) return;
-    if (ns->bound) net_udp_unbind(ns->local_port);
+    if (ns->proto == 1) net_icmp_unlisten(ns);
+    else if (ns->proto == 58) net6_icmp_unlisten(ns);            /* §M90 3a */
+    else if (ns->bound) net_udp_unbind_ns(ns->netns, ns->local_port);
     /* Both handles, and in this order: closing the listener refuses every peer
      * still sitting in its backlog, which is the right thing to do to a
      * connection whose server has gone away — leaving them established and
@@ -1936,18 +2017,33 @@ void netsock_close(struct netsock* ns) {
 static int ns_ensure_bound(struct netsock* ns, uint16_t port) {
     if (ns->bound) return 0;
     ns->local_port = port ? port : g_ephem_port++;
-    if (net_udp_bind(ns->local_port, ns_udp_cb, ns) != 0) return -1;
+    if (ns->proto == 1 || ns->proto == 58) { ns->bound = 1; return 0; }   /* ICMP: no port */
+    if (net_udp_bind_ns(ns->netns, ns->local_port, ns_udp_cb, ns) != 0) return -1;
     ns->bound = 1;
     return 0;
 }
 
 int sys_socket(int domain, int type, int proto) {
-    (void)proto;
     if (domain != AF_INET)  return -1;
-    if (type != SOCK_DGRAM && type != SOCK_STREAM) return -1;
+    /* §M90 — ICMP: SOCK_RAW (CAP_NET_RAW, the IP header comes with every
+     * packet) and the ping socket SOCK_DGRAM (echo only, the kernel keeps the
+     * id).  Other raw protocols are not offered. */
+    int icmp = proto == 1 && (type == 3 || type == SOCK_DGRAM);
+    if (type != SOCK_DGRAM && type != SOCK_STREAM && !icmp) return -1;
+    if (type == 3) {
+        struct task* me = task_current();
+        if (!me || !cred_capable(&me->cred, 13 /* CAP_NET_RAW */)) return -2;
+    }
     struct netsock* ns = (struct netsock*)kcalloc(1, sizeof *ns);
     if (!ns) return -1;
     ns->type = type;
+    ns->netns = net_cur_ns();
+    if (icmp) {
+        ns->proto = 1;
+        ns->local_port = g_ephem_port++;                /* the ping socket's echo id */
+        ns->bound = 1;
+        if (net_icmp_listen(ns->netns, ns_icmp_cb, ns) != 0) { kfree(ns); return -1; }
+    }
     struct ofile* o = ofile_from_netsock(ns);
     if (!o) { kfree(ns); return -1; }
     int fd = fd_install(o);
@@ -2083,7 +2179,7 @@ int sys_connect(int fd, uint32_t ip, int port) {
     }
     if (ns->type != SOCK_STREAM) return -1;
     if (ns->conn) return -1;                     /* already connected          */
-    struct tcp_conn* c = net_tcp_connect(ip, (uint16_t)port, 0);
+    struct tcp_conn* c = net_tcp_connect_ns(ns->netns, ip, (uint16_t)port, 0);
     if (!c) return -1;
     ns->conn = c;
     ns->connected = 1; ns->peer_ip = ip; ns->peer_port = (uint16_t)port;
@@ -2096,10 +2192,15 @@ int sys_listen(int fd, int backlog) {
     if (!o || o->kind != FD_NETSOCK) return -1;
     struct netsock* ns = o->nsock;
     if (ns->type != SOCK_STREAM || ns->conn || ns->lsock) return -1;
-    if (!ns->local_port) return -1;              /* listen without bind        */
-    struct tcp_conn* l = net_tcp_listen(ns->local_ip, ns->local_port, backlog);
+    /* port 0 / no bind: the stack picks an ephemeral port (Linux's autobind) */
+    struct tcp_conn* l;
+    if (ns->fam6 && !ns->local_ip)               /* §M90 3a — [::] or a v6 address */
+        l = net_tcp_listen6_ns(ns->netns, ns->local6, ns->local_port, backlog, ns->v6only);
+    else
+        l = net_tcp_listen_ns(ns->netns, ns->local_ip, ns->local_port, backlog);
     if (!l) return -1;
     ns->lsock = l;
+    if (!ns->local_port) { uint32_t ip; net_tcp_local(l, &ip, &ns->local_port); ns->bound = 1; }
     return 0;
 }
 
@@ -2122,6 +2223,7 @@ int sys_accept_k(int fd, uint32_t* ip_out, int* port_out) {
     struct netsock* ns = (struct netsock*)kcalloc(1, sizeof *ns);
     if (!ns) { net_tcp_close(c); return -1; }
     ns->type = SOCK_STREAM;
+    ns->netns = ls->netns;
     ns->conn = c;
     ns->connected = 1;
     net_tcp_peer(c, &ns->peer_ip, &ns->peer_port);
@@ -2170,8 +2272,7 @@ int sys_getsockname_k(int fd, uint32_t* ip_out, int* port_out) {
     /* §M90 — a connected datagram socket answers with the address it sends
      * from (Go asks right after connect, to know its own end). */
     if (!ns->conn && ns->type == SOCK_DGRAM && !ip && ns->connected) {
-        struct net_device* dev = net_route(ns->peer_ip);
-        if (!dev) dev = net_primary();
+        struct net_device* dev = net_route_ns(ns->netns, ns->peer_ip, NULL);
         if (dev) ip = dev->ip;
     }
     if (ip_out)   *ip_out   = ip;
@@ -2242,7 +2343,16 @@ static long ns_dgram_recv(struct netsock* ns, void* buf, size_t n, uint32_t* ip_
 static long netsock_write(struct netsock* ns, const void* buf, size_t n) {
     if (ns->type == SOCK_DGRAM) {                /* §M90 — a connected datagram socket */
         if (!ns->connected) return -1;
-        struct net_device* dev = net_primary();
+        if (ns->fam6 && !ns->peer_is4) {         /* §M90 3a */
+            if (n > 65487u) return -1;
+            struct net_device* sc = ns->scope ? net_by_index(ns->netns, (int)ns->scope) : NULL;
+            return net_udp_send6_ns(ns->netns, sc, ns->peer6, ns->local_port, ns->peer_port,
+                                    buf, (uint32_t)n) == 0 ? (long)n : -1;
+        }
+        /* §M90 — out of the ROUTE for the peer, in the socket's namespace
+         * (it used to be the "primary" device: a datagram to 127.0.0.1 went
+         * out on the wire). */
+        struct net_device* dev = net_route_ns(ns->netns, ns->peer_ip, NULL);
         if (!dev || n > 65507u) return -1;
         if (net_udp_send(dev, ns->peer_ip, ns->local_port, ns->peer_port, buf, n) != 0) return -1;
         return (long)n;
@@ -2269,8 +2379,26 @@ long sys_sendto_k(int fd, const void* buf, size_t n, uint32_t ip, int port) {
     if (!o || o->kind != FD_NETSOCK) return -1;
     struct netsock* ns = o->nsock;
     if (ns_ensure_bound(ns, 0) != 0) return -1;
-    struct net_device* dev = net_primary();
+    struct net_device* dev = net_route_ns(ns->netns, ip, NULL);
     if (!dev) return -1;
+    if (ns->proto == 1) {
+        /* §M90 — ICMP: the caller wrote the ICMP message; a ping socket's
+         * echo id is ours, so it is set and the checksum redone. */
+        if (n < 8 || n > 65507u) return -1;
+        uint8_t* m = (uint8_t*)kmalloc(n);
+        if (!m) return -1;
+        for (size_t i = 0; i < n; i++) m[i] = ((const uint8_t*)buf)[i];
+        if (ns->type != 3) {
+            if (m[0] != 8) { kfree(m); return -1; }            /* echo requests only */
+            m[4] = (uint8_t)(ns->local_port >> 8); m[5] = (uint8_t)ns->local_port;
+            m[2] = m[3] = 0;
+            uint16_t c = net_checksum(m, (uint32_t)n);
+            m[2] = (uint8_t)c; m[3] = (uint8_t)(c >> 8);
+        }
+        int r = net_ipv4_send(dev, ip, 1 /* ICMP */, m, (uint32_t)n);
+        kfree(m);
+        return r == 0 ? (long)n : -1;
+    }
     if (net_udp_send(dev, ip, ns->local_port, (uint16_t)port, buf, n) != 0) return -1;
     return (long)n;
 }
@@ -2305,7 +2433,13 @@ long sys_recvfrom_k(int fd, void* buf, size_t n, uint32_t* ip_out, int* port_out
 }
 /* One datagram (the body recvfrom always had; read() on a connected datagram
  * socket shares it since §M90). */
+static long ns_dgram_recv_ex(struct netsock* ns, void* buf, size_t n, uint32_t* ip_out, int* port_out,
+                             uint8_t* src6_out, int* is6_out);
 static long ns_dgram_recv(struct netsock* ns, void* buf, size_t n, uint32_t* ip_out, int* port_out) {
+    return ns_dgram_recv_ex(ns, buf, n, ip_out, port_out, NULL, NULL);
+}
+static long ns_dgram_recv_ex(struct netsock* ns, void* buf, size_t n, uint32_t* ip_out, int* port_out,
+                             uint8_t* src6_out, int* is6_out) {
     struct net_device* dev = net_primary();
     if (!dev) return -1;
 
@@ -2332,6 +2466,8 @@ static long ns_dgram_recv(struct netsock* ns, void* buf, size_t n, uint32_t* ip_
     for (uint32_t i = 0; i < cnt; i++) out[i] = d->data[i];
     if (ip_out)   *ip_out   = d->src_ip;
     if (port_out) *port_out = d->src_port;
+    if (is6_out)  *is6_out  = d->is6;
+    if (src6_out && d->is6) for (int i = 0; i < 16; i++) src6_out[i] = d->src6[i];
     ns->rx_tail = (ns->rx_tail + 1) % NS_RXSLOTS;
     net_unlock(f);
     return (long)cnt;
@@ -2531,6 +2667,228 @@ int sys_sock_peercred(int fd, int* pid, int* uid, int* gid) {
     if (!o || o->kind != FD_SOCK) return -1;
     return usock_peercred(o->sock, pid, uid, gid) == 0 ? 0 : 1;
 }
+/* ---- §M90 3a — AF_INET6 sockets ---------------------------------------------
+ *
+ * The same netsock, the same stack, a second address family.  An AF_INET6
+ * socket is DUAL-STACK unless IPV6_V6ONLY is set, as on Linux: bound to ::
+ * it accepts IPv4 connections and datagrams too, and connecting it to
+ * ::ffff:a.b.c.d is an IPv4 connection.  Such IPv4 ends are SHOWN in the
+ * mapped form; the connection underneath is an ordinary IPv4 one. */
+static int a6_mapped(const uint8_t* a) {
+    for (int i = 0; i < 10; i++) if (a[i]) return 0;
+    return a[10] == 0xff && a[11] == 0xff;
+}
+static uint32_t a6_to4(const uint8_t* a) {
+    return (uint32_t)a[12] << 24 | (uint32_t)a[13] << 16 | (uint32_t)a[14] << 8 | a[15];
+}
+static void a6_from4(uint8_t* a, uint32_t ip) {
+    for (int i = 0; i < 10; i++) a[i] = 0;
+    a[10] = a[11] = 0xff;
+    a[12] = (uint8_t)(ip >> 24); a[13] = (uint8_t)(ip >> 16); a[14] = (uint8_t)(ip >> 8); a[15] = (uint8_t)ip;
+}
+static int a6_zero(const uint8_t* a) { for (int i = 0; i < 16; i++) if (a[i]) return 0; return 1; }
+static void sa_set4(struct sockaddr_k* o, int fam6, uint32_t ip, uint16_t port) {
+    o->port = port; o->scope = 0;
+    if (fam6) { o->fam = 10; o->ip = 0; a6_from4(o->a6, ip); }
+    else      { o->fam = 2;  o->ip = ip; for (int i = 0; i < 16; i++) o->a6[i] = 0; }
+}
+static void sa_set6(struct sockaddr_k* o, const uint8_t* a6, uint16_t port, uint32_t scope) {
+    o->fam = 10; o->ip = 0; o->port = port; o->scope = scope;
+    for (int i = 0; i < 16; i++) o->a6[i] = a6[i];
+}
+static struct netsock* nsock_of(int fd) {
+    struct ofile* o = fd_lookup(fd);
+    return o && o->kind == FD_NETSOCK ? o->nsock : NULL;
+}
+
+int sys_socket6(int type, int proto) {
+    if (proto == 1) return -1;                     /* ICMP (v4) on an AF_INET6 socket: no */
+    if (proto == 58) {                             /* ICMPv6: raw (CAP_NET_RAW) or ping */
+        if (type != 3 && type != SOCK_DGRAM) return -1;
+        if (type == 3) {
+            struct task* me = task_current();
+            if (!me || !cred_capable(&me->cred, 13 /* CAP_NET_RAW */)) return -2;
+        }
+        int fd = sys_socket(2, type == 3 ? SOCK_DGRAM : type, 0);   /* a plain object ... */
+        if (fd < 0) return fd;
+        struct netsock* ns = nsock_of(fd);
+        ns->type = type; ns->proto = 58; ns->fam6 = 1; ns->bound = 1;
+        ns->local_port = g_ephem_port++;           /* the ping socket's echo id */
+        if (net6_icmp_listen(ns->netns, ns_icmp6_cb, ns) != 0) { sys_close(fd); return -1; }
+        return fd;
+    }
+    int fd = sys_socket(2, type, proto);           /* the same object ... */
+    if (fd < 0) return fd;
+    struct netsock* ns = nsock_of(fd);
+    if (ns) ns->fam6 = 1;                          /* ... in the other family */
+    return fd;
+}
+int sys_netsock_fam(int fd) {
+    struct netsock* ns = nsock_of(fd);
+    return ns ? (ns->fam6 ? 10 : 2) : -1;
+}
+int sys_netsock_v6only(int fd, int set) {
+    struct netsock* ns = nsock_of(fd);
+    if (!ns || !ns->fam6) return -1;
+    if (set >= 0) {
+        if (ns->lsock || ns->conn) return -22;     /* EINVAL once in use (Linux) */
+        ns->v6only = set ? 1 : 0;
+    }
+    return ns->v6only;
+}
+
+int sys_bind_sa(int fd, const struct sockaddr_k* a) {
+    struct netsock* ns = nsock_of(fd);
+    if (!ns) return -1;
+    if (!ns->fam6) return a->fam == 2 ? sys_bind(fd, a->ip, a->port) : -97;   /* EAFNOSUPPORT */
+    if (a->fam != 10) return -22;
+    if (a6_mapped(a->a6)) {                        /* bound to an IPv4 address */
+        if (ns->v6only) return -22;
+        return sys_bind(fd, a6_to4(a->a6), a->port);
+    }
+    for (int i = 0; i < 16; i++) ns->local6[i] = a->a6[i];
+    ns->local_ip = 0;
+    ns->scope = a->scope;
+    if (ns->type == SOCK_STREAM) { ns->local_port = a->port; ns->bound = 1; return 0; }
+    return ns_ensure_bound(ns, a->port);
+}
+
+int sys_connect_sa(int fd, const struct sockaddr_k* a) {
+    struct netsock* ns = nsock_of(fd);
+    if (!ns) return -1;
+    if (!ns->fam6) return a->fam == 2 ? sys_connect(fd, a->ip, a->port) : -97;
+    if (a->fam != 10) return -97;
+    if (a6_mapped(a->a6) || a6_zero(a->a6)) {      /* an IPv4 peer (or AF_UNSPEC-like) */
+        if (ns->v6only && !a6_zero(a->a6)) return -101;    /* ENETUNREACH */
+        int r = sys_connect(fd, a6_to4(a->a6), a->port);
+        if (r == 0) ns->peer_is4 = 1;
+        return r;
+    }
+    struct net_device* sc = a->scope ? net_by_index(ns->netns, (int)a->scope) : NULL;
+    if (a->scope && !sc) return -19;               /* ENODEV */
+    ns->peer_is4 = 0;
+    for (int i = 0; i < 16; i++) ns->peer6[i] = a->a6[i];
+    ns->peer_port = a->port;
+    ns->scope = a->scope;
+    if (ns->type == SOCK_DGRAM) {
+        if (ns_ensure_bound(ns, 0) != 0) return -1;
+        ns->connected = 1;
+        return 0;
+    }
+    if (ns->type != SOCK_STREAM || ns->conn) return -1;
+    struct tcp_conn* c = net_tcp_connect6_ns(ns->netns, sc, a->a6, a->port, 0);
+    if (!c) return -111;                           /* ECONNREFUSED */
+    ns->conn = c;
+    ns->connected = 1;
+    return 0;
+}
+
+int sys_accept_sa(int fd, struct sockaddr_k* peer) {
+    struct netsock* ls = nsock_of(fd);
+    if (!ls) return -1;
+    uint32_t ip = 0; int port = 0;
+    int nfd = sys_accept_k(fd, &ip, &port);
+    if (nfd < 0) return nfd;
+    struct netsock* ns = nsock_of(nfd);
+    if (ns) { ns->fam6 = ls->fam6; ns->v6only = ls->v6only; }
+    if (peer) {
+        uint8_t a6[16]; uint16_t p = 0;
+        if (ns && ns->conn && net_tcp_peer6(ns->conn, a6, &p) == 1) {
+            sa_set6(peer, a6, p, 0);
+            for (int i = 0; i < 16; i++) ns->peer6[i] = a6[i];
+        } else {
+            sa_set4(peer, ls->fam6, ip, (uint16_t)port);
+            if (ns) ns->peer_is4 = 1;
+        }
+    }
+    return nfd;
+}
+
+int sys_getsockname_sa(int fd, struct sockaddr_k* a) {
+    struct netsock* ns = nsock_of(fd);
+    if (!ns) return -1;
+    uint8_t a6[16]; uint16_t p = 0;
+    if (ns->conn && net_tcp_local6(ns->conn, a6, &p) == 1) { sa_set6(a, a6, p, 0); return 0; }
+    uint32_t ip = 0; int port = 0;
+    if (sys_getsockname_k(fd, &ip, &port) != 0) return -1;
+    if (ns->fam6 && !ns->conn && !ip && !ns->peer_is4) { sa_set6(a, ns->local6, (uint16_t)port, ns->scope); return 0; }
+    sa_set4(a, ns->fam6, ip, (uint16_t)port);
+    return 0;
+}
+
+int sys_getpeername_sa(int fd, struct sockaddr_k* a) {
+    struct netsock* ns = nsock_of(fd);
+    if (!ns) return -1;
+    uint8_t a6[16]; uint16_t p = 0;
+    if (ns->conn && net_tcp_peer6(ns->conn, a6, &p) == 1) { sa_set6(a, a6, p, 0); return 0; }
+    if (ns->fam6 && ns->type == SOCK_DGRAM && ns->connected && !ns->peer_is4) {
+        sa_set6(a, ns->peer6, ns->peer_port, ns->scope); return 0;
+    }
+    uint32_t ip = 0; int port = 0;
+    if (sys_getpeername_k(fd, &ip, &port) != 0) return -107;   /* ENOTCONN */
+    sa_set4(a, ns->fam6, ip, (uint16_t)port);
+    return 0;
+}
+
+long sys_sendto_sa_k(int fd, const void* buf, size_t n, const struct sockaddr_k* to) {
+    struct netsock* ns = nsock_of(fd);
+    if (!ns) return -1;
+    if (!to) return sys_write_k(fd, buf, n);
+    if (!ns->fam6) return to->fam == 2 ? sys_sendto_k(fd, buf, n, to->ip, to->port) : -97;
+    if (to->fam != 10) return -97;
+    if (a6_mapped(to->a6)) {
+        if (ns->v6only) return -101;
+        return sys_sendto_k(fd, buf, n, a6_to4(to->a6), to->port);
+    }
+    if (ns->proto == 58) {                         /* §M90 3a — ICMPv6 */
+        if (n < 4 || n > 1452) return -90;
+        uint8_t* m = (uint8_t*)kmalloc(n);
+        if (!m) return -12;
+        for (size_t i = 0; i < n; i++) m[i] = ((const uint8_t*)buf)[i];
+        if (ns->type != 3) {                       /* ping: echo requests, our id */
+            if (n < 8 || m[0] != 128) { kfree(m); return -22; }
+            m[4] = (uint8_t)(ns->local_port >> 8); m[5] = (uint8_t)ns->local_port;
+        }
+        struct net_device* sc6 = to->scope ? net_by_index(ns->netns, (int)to->scope) : NULL;
+        int r6 = net6_icmp_send(ns->netns, sc6, to->a6, m, (uint32_t)n);
+        kfree(m);
+        return r6 == 0 ? (long)n : r6;
+    }
+    if (ns->type != SOCK_DGRAM) return -95;        /* EOPNOTSUPP */
+    if (ns_ensure_bound(ns, 0) != 0) return -1;
+    if (n > 65487u) return -90;
+    struct net_device* sc = to->scope ? net_by_index(ns->netns, (int)to->scope) : NULL;
+    int r = net_udp_send6_ns(ns->netns, sc, to->a6, ns->local_port, to->port, buf, (uint32_t)n);
+    return r == 0 ? (long)n : r;
+}
+
+long sys_recvfrom_sa_u(int fd, uintptr_t ubuf, size_t n, struct sockaddr_k* from) {
+    struct netsock* ns = nsock_of(fd);
+    if (!ns) return -1;
+    if (ns->type == SOCK_STREAM || !ns->fam6) {
+        uint32_t ip = 0; int port = 0;
+        long r = sys_recvfrom_u(fd, ubuf, n, &ip, &port);
+        if (r >= 0 && from) {
+            if (ns->type == SOCK_STREAM) sys_getpeername_sa(fd, from);
+            else sa_set4(from, ns->fam6, ip, (uint16_t)port);
+        }
+        return r;
+    }
+    if (n > 65536) n = 65536;
+    if (n && !vmm_user_access_ok(ubuf, n, 1)) return -14;
+    uint8_t* k = (uint8_t*)kmalloc(n ? n : 1);
+    if (!k) return -12;
+    uint32_t ip = 0; int port = 0, is6 = 0; uint8_t s6[16];
+    long r = ns_dgram_recv_ex(ns, k, n, &ip, &port, s6, &is6);
+    if (r > 0 && copy_to_user(ubuf, k, (size_t)r) != 0) r = -14;
+    kfree(k);
+    if (r >= 0 && from) {
+        if (is6) sa_set6(from, s6, (uint16_t)port, 0);
+        else sa_set4(from, 1, ip, (uint16_t)port);
+    }
+    return r;
+}
+
 int sys_socket_info(int fd, int* family, int* type, int* listening) {
     struct ofile* o = fd_lookup(fd);
     if (!o) return -1;
@@ -2541,12 +2899,16 @@ int sys_socket_info(int fd, int* family, int* type, int* listening) {
         return 0;
     }
     if (o->kind == FD_NETSOCK && o->nsock) {
-        *family = 2; *type = o->nsock->type;
+        *family = o->nsock->fam6 ? 10 : 2; *type = o->nsock->type;
         *listening = o->nsock->lsock != NULL;
         return 0;
     }
     if (o->kind == FD_NETLINK) {                  /* §M90 — AF_NETLINK, SOCK_RAW */
         *family = 16; *type = 3; *listening = 0;
+        return 0;
+    }
+    if (o->kind == FD_PACKET) {                   /* §M90 — AF_PACKET */
+        *family = 17; *type = 3; *listening = 0;
         return 0;
     }
     return -1;
@@ -2626,6 +2988,21 @@ int sys_fsync(int fd) {
 
 /* §M90 — socket(AF_NETLINK, …, proto).  -93 EPROTONOSUPPORT for a protocol
  * other than NETLINK_ROUTE (see netlink.c for what it answers). */
+/* §M90 — socket(AF_PACKET, type, htons(proto)).  CAP_NET_RAW, as on Linux. */
+int sys_packet_socket(int type, int proto_net, int nonblock) {
+    struct task* me = task_current();
+    if (!me || !cred_capable(&me->cred, 13 /* CAP_NET_RAW */)) return -1;     /* EPERM */
+    uint16_t p = (uint16_t)(((proto_net & 0xFF) << 8) | ((proto_net >> 8) & 0xFF));
+    struct pktsock* s = packet_create(type, p);
+    if (!s) return type == 2 || type == 3 ? -12 : -94;          /* ESOCKTNOSUPPORT */
+    struct ofile* o = ofile_from_packet(s);
+    if (!o) { packet_close(s); return -12; }
+    o->nonblock = nonblock ? 1 : 0;
+    int fd = fd_install(o);
+    if (fd < 0) { ofile_unref(o); return -24; }
+    return fd;
+}
+
 int sys_netlink_socket(int proto, int nonblock) {
     struct nlsock* s = nl_create(proto);
     if (!s) return -93;
@@ -2749,7 +3126,7 @@ int sys_fd_link_of(struct task* t, int fd, char* out, size_t cap) {
         id = usock_is_pipe(f->sock) ? 4026540000u + usock_pipe_id(f->sock)
                                     : (uintptr_t)f->sock >> 3;
         tag = usock_is_pipe(f->sock) ? "pipe:[" : "socket:["; break;
-    case FD_NETSOCK: case FD_NETLINK: tag = "socket:["; break;
+    case FD_NETSOCK: case FD_NETLINK: case FD_PACKET: tag = "socket:["; break;
     case FD_SHM:     tag = "/memfd: (deleted)"; break;
     case FD_EVENT:   tag = "anon_inode:[eventfd]"; break;
     case FD_EPOLL:   tag = "anon_inode:[eventpoll]"; break;

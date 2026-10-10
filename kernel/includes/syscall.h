@@ -285,6 +285,23 @@ int  sys_epoll_wait_k(int epfd, uint64_t* out, int maxevents, int timeout_ms);
 int  sys_epoll_wait_u(int epfd, uintptr_t uout, int maxevents, int timeout_ms);
 long sys_sigaction(int sig, long handler, long restorer);  /* → old handler    */
 int  sys_socket(int domain, int type, int proto);          /* M24 socket API   */
+int  sys_packet_socket(int type, int proto_net, int nonblock);   /* §M90 AF_PACKET */
+/* §M90 3a — AF_INET6 sockets.  A socket ADDRESS of either family, so one set
+ * of calls serves both: fam 2 (ip) or 10 (a6 + scope); port host order.
+ * An AF_INET6 socket shows an IPv4 peer as ::ffff:a.b.c.d. */
+struct sockaddr_k { int fam; uint32_t ip; uint8_t a6[16]; uint16_t port; uint32_t scope; };
+struct task;
+int  task_may_signal(struct task* me, struct task* t);   /* §M90 — the one kill rule */
+int  sys_socket6(int type, int proto);
+int  sys_netsock_fam(int fd);                 /* 2, 10, or -1: not an AF_INET(6) socket */
+int  sys_netsock_v6only(int fd, int set);     /* set < 0: query */
+int  sys_bind_sa(int fd, const struct sockaddr_k* a);
+int  sys_connect_sa(int fd, const struct sockaddr_k* a);
+int  sys_accept_sa(int fd, struct sockaddr_k* peer);
+int  sys_getsockname_sa(int fd, struct sockaddr_k* a);
+int  sys_getpeername_sa(int fd, struct sockaddr_k* a);
+long sys_sendto_sa_k(int fd, const void* buf, size_t n, const struct sockaddr_k* to);
+long sys_recvfrom_sa_u(int fd, uintptr_t ubuf, size_t n, struct sockaddr_k* from);
 int  sys_bind(int fd, uint32_t ip, int port);
 int  sys_listen(int fd, int backlog);
 /* accept/getsockname/getpeername take KERNEL out-pointers; a personality layer

@@ -419,7 +419,7 @@ static void ring0_fault_policy(int sig) {
             kprintf("fault: kernel.fault_policy=kill — terminating kthread '%s' pid %d "
                     "(best-effort; may deadlock if it held a lock; M29 restarts a service)\n",
                     t->name, t->pid);
-            task_exit_code(128 + sig);       /* noreturn: reschedules to another task */
+            task_exit_signal(sig);       /* noreturn: reschedules to another task */
         }
         kprintf("fault: kill policy — faulting context is idle/pid0, not killable; halting\n");
     }
@@ -743,7 +743,7 @@ void isr_handler(struct int_frame* f) {
             /* §M90 rung 3 — a fault that could not get a frame because the
              * cgroup OOM killer chose THIS process: it ends with SIGKILL (137),
              * not with a SIGSEGV and a crash record — a policy, not a bug. */
-            if (cgroup_oom_victim_self()) task_exit_group(137);
+            if (cgroup_oom_victim_self()) task_exit_group_signal(9);
             if (lnx_fault_deliver(f, sig, (uintptr_t)_cr2)) return;
             kprintf("\nfault: user EXCEPTION %d (%s) pid %d '%s' "
                     "cs:eip=%x:%p err=%x cr2=%p — killing process\n",
@@ -755,7 +755,7 @@ void isr_handler(struct int_frame* f) {
                          (uintptr_t)f->eip, (uintptr_t)_cr2, sig,
                          exception_name[f->int_no]);
             user_excursion_fault(sig);   /* an excursion returns to its caller */
-            task_exit_code(128 + sig);   /* noreturn: reschedules; reaper frees mm */
+            task_exit_signal(sig);   /* noreturn: reschedules; reaper frees mm */
         }
 
         /* Ring-0 (kernel) exception.  Dump, then apply the configured policy

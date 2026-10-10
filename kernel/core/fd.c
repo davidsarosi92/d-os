@@ -4,6 +4,7 @@
  * bookkeeping.
  * ============================================================================= */
 
+#include "packet.h"
 #include "cgroupfs.h"   /* §M90 — memfd pages charged to their creator */
 #include "fsnotify.h"   /* §M90 — FD_INOTIFY */
 #include "fd.h"
@@ -109,6 +110,12 @@ struct ofile* ofile_from_netlink(struct nlsock* s) {
     return o;
 }
 
+struct ofile* ofile_from_packet(struct pktsock* s) {      /* §M90 — takes ownership */
+    struct ofile* o = ofile_alloc(FD_PACKET);
+    if (o) o->pkt = s;
+    return o;
+}
+
 struct ofile* ofile_from_epoll(struct epoll* e) {
     struct ofile* o = ofile_alloc(FD_EPOLL);
     if (o) o->ep = e;
@@ -165,6 +172,7 @@ void ofile_unref(struct ofile* o) {
         case FD_FIFO:    fifo_detach(o); if (o->file) vfs_close(o->file); break;
         case FD_BPF:     bpf_prog_put(o->bpf); break;
         case FD_INOTIFY: inotify_close(o->ino); break;
+        case FD_PACKET:  packet_close(o->pkt); break;
     }
     o->kind = (enum fd_kind)0x0DEAD;     /* the poison, see above */
     kfree(o);

@@ -9,6 +9,8 @@
  * that it does not fit is the design telling you something.
  * ============================================================================= */
 
+#include "packet.h"
+#include "net.h"
 #include "fsnotify.h"   /* §M90 rung 3 — inotify */
 #include "lnx_signal.h"   /* §M89 */
 #include "abi.h"
@@ -431,33 +433,44 @@ static int guest_gid(void) {
 }
 static long h_getuid(struct abi_ctx* c) { (void)c; return guest_uid(); }
 static long h_getgid(struct abi_ctx* c) { (void)c; return guest_gid(); }
-static long h_setuid(struct abi_ctx* c) { return (int)c->a[0] == guest_uid() ? 0 : -ABI_EPERM; }
-static long h_setgid(struct abi_ctx* c) { return (int)c->a[0] == guest_gid() ? 0 : -ABI_EPERM; }
-/* §M90 — the set*id family.  An identity here has ONE uid and ONE gid (no
- * separate real / effective / saved ids), so these succeed exactly when every
- * id named is that one (or -1, "unchanged") — the same rule setuid has, and
- * the case of every container whose user is root.  Becoming ANOTHER user is
- * cred_become_user's (§M32), which these do not reach: EPERM, as before. */
-static int same_or_keep(unsigned long v, int cur) {
-    return (uint32_t)v == 0xFFFFFFFFu || (int)(uint32_t)v == cur;
+/* §M90 — the set*id family through cred_set_ids: any id with CAP_SETUID /
+ * CAP_SETGID, else only the current one (EPERM).  An identity has ONE uid and
+ * ONE gid, so a call naming DIFFERENT real/effective/saved ids is refused —
+ * the everyday shape (a runtime or a daemon dropping to one user: all three
+ * the same, or -1) is exactly representable. */
+static int one_id(const unsigned long* v, int n, int* out) {
+    int id = -1;
+    for (int i = 0; i < n; i++) {
+        if ((uint32_t)v[i] == 0xFFFFFFFFu) continue;
+        int x = (int)(uint32_t)v[i];
+        if (id >= 0 && x != id) return -1;
+        id = x;
+    }
+    *out = id;
+    return 0;
 }
+static long set_ids(int uid, int gid) {
+    struct task* t = task_current();
+    if (!t) return -ABI_EPERM;
+    return cred_set_ids(&t->cred, uid, gid) == 0 ? 0 : -ABI_EPERM;
+}
+static long h_setuid(struct abi_ctx* c) { return set_ids((int)(uint32_t)c->a[0], -1); }
+static long h_setgid(struct abi_ctx* c) { return set_ids(-1, (int)(uint32_t)c->a[0]); }
 static long h_setresuid(struct abi_ctx* c) {
-    int u = guest_uid();
-    return same_or_keep(c->a[0], u) && same_or_keep(c->a[1], u) && same_or_keep(c->a[2], u)
-           ? 0 : -ABI_EPERM;
+    int u; if (one_id(c->a, 3, &u)) return -ABI_EPERM;
+    return set_ids(u, -1);
 }
 static long h_setresgid(struct abi_ctx* c) {
-    int g = guest_gid();
-    return same_or_keep(c->a[0], g) && same_or_keep(c->a[1], g) && same_or_keep(c->a[2], g)
-           ? 0 : -ABI_EPERM;
+    int g; if (one_id(c->a, 3, &g)) return -ABI_EPERM;
+    return set_ids(-1, g);
 }
 static long h_setreuid(struct abi_ctx* c) {
-    int u = guest_uid();
-    return same_or_keep(c->a[0], u) && same_or_keep(c->a[1], u) ? 0 : -ABI_EPERM;
+    int u; if (one_id(c->a, 2, &u)) return -ABI_EPERM;
+    return set_ids(u, -1);
 }
 static long h_setregid(struct abi_ctx* c) {
-    int g = guest_gid();
-    return same_or_keep(c->a[0], g) && same_or_keep(c->a[1], g) ? 0 : -ABI_EPERM;
+    int g; if (one_id(c->a, 2, &g)) return -ABI_EPERM;
+    return set_ids(-1, g);
 }
 static int abi_w_ok(unsigned long p, unsigned long n);
 static long abi_put_three(unsigned long a, unsigned long b, unsigned long c3, int v) {
@@ -891,6 +904,11 @@ static long abi_rename(unsigned long uold, unsigned long unew, int noreplace) {
     if (r == -4) return -39;                             /* ENOTEMPTY */
     if (r == -5) return -13;                             /* EACCES */
     if (r == -30) return -30;                            /* EROFS */
+    /* §M90 — a filesystem's own EXDEV (overlayfs: a lower directory, no
+     * redirect_dir) is the answer, not "no such file".  It was folded into
+     * ENOENT, and dockerd's overlay2 probe logged that it could not find the
+     * very directory it had just created. */
+    if (r == -18) return -18;
     if (r != -3) return -ABI_ENOENT;
     if ((k.mode & KS_IFMT) == KS_IFDIR) return -18;      /* EXDEV */
     if (exists && (kt.mode & KS_IFMT) == KS_IFDIR) return -21;
@@ -1293,6 +1311,23 @@ static long h_uname(struct abi_ctx* c) {
     uintptr_t u = (uintptr_t)c->a[0];
     if (!abi_w_ok(u, 6 * 65)) return -ABI_EFAULT;
     if (sys_uname((struct kutsname*)u) != 0) return -ABI_EFAULT;      /* the first five */
+    /* §M90 — a GUEST asks for the kernel whose ABI it is talking to.  The
+     * native answer ("d-os" / "0.1") stays for d-os programs, but a Linux
+     * program PARSES the release: Go's runtime, containerd and runc gate
+     * features on it, and "0.1" read as a pre-4.11 kernel (containerd refused
+     * its CRI plugin: "unprivileged_icmp ... require kernel version >= 4.11").
+     * The personality targets the Linux 6.1 system-call ABI, so it says so,
+     * and the "-d-os" suffix keeps the truth visible to anyone who looks. */
+    {
+        static const char sysn[] = "Linux", rel[] = "6.1.0-d-os";
+        char* f = (char*)u;
+        int i = 0;
+        for (; sysn[i]; i++) f[i] = sysn[i];
+        for (; i < 65; i++) f[i] = 0;
+        f += 2 * 65;
+        for (i = 0; rel[i]; i++) f[i] = rel[i];
+        for (; i < 65; i++) f[i] = 0;
+    }
     const char* d = ns_domainname(task_current());
     char* dst = (char*)u + 5 * 65;
     int i = 0;
@@ -1444,6 +1479,39 @@ static long abi_sleep(struct abi_ctx* c, int which, int abs, unsigned long ureq)
     return r < 0 ? -4 /* EINTR */ : 0;
 }
 static long h_nanosleep(struct abi_ctx* c)       { return abi_sleep(c, 1, 0, c->a[0]); }
+
+/* §M90 — wait until a signal is DELIVERABLE (pending and not blocked), then
+ * EINTR: the return to user mode runs its handler (or its default action).
+ * A signal post wakes a sleeper (task_signal_wake), so the 1 s sleeps here
+ * are a backstop, not a poll interval. */
+static long wait_for_signal(struct task* t) {
+    while (!lnx_sig_deliverable(t)) {
+        if (task_should_stop()) break;
+        sys_clock_nanosleep_ns(1, 0, 1000000000ull);
+    }
+    return -4;                                           /* EINTR, always */
+}
+static long h_pause(struct abi_ctx* c) {
+    (void)c;
+    struct task* t = task_current();
+    return t ? wait_for_signal(t) : -4;
+}
+/* rt_sigsuspend(mask, sigsetsize): replace the mask and wait, as ONE step —
+ * the classic "block SIGCHLD, check, then wait with it unblocked" is only
+ * race-free because no signal can slip between the unblock and the wait.
+ * The old mask comes back when the handler returns (it is in the frame,
+ * lnx_signal.c), not here: the handler must run under the suspend's mask. */
+static int abi_sigset_read(struct abi_ctx* c, unsigned long p, uint64_t* out);
+static long h_sigsuspend(struct abi_ctx* c) {
+    struct task* t = task_current();
+    if (!t) return -4;
+    uint64_t m = 0;
+    if (!abi_sigset_read(c, c->a[0], &m)) return -ABI_EFAULT;
+    t->sigsusp_saved = lnx_sig_blocked64(t);
+    t->sigsusp_armed = 1;
+    lnx_sig_set_blocked64(t, m);
+    return wait_for_signal(t);
+}
 static long h_clock_nanosleep(struct abi_ctx* c) {
     long r = abi_sleep(c, (int)c->a[0], (c->a[1] & 1) ? 1 : 0, c->a[2]);   /* TIMER_ABSTIME */
     return r < 0 ? -r : 0;                    /* clock_nanosleep returns the error, not -1 */
@@ -2018,8 +2086,8 @@ static long h_wait(struct abi_ctx* c) {
         want = ns_pid_resolve(task_current(), want);
         if (want <= 0) return -10;                        /* ECHILD */
     }
-    int vnr = 0;
-    int pid = task_wait_ex2(want, &code, (int)(c->a[2] & 1), &vnr);
+    int vnr = 0, sig = 0;
+    int pid = task_wait_ex3(want, &code, (int)(c->a[2] & 1), &vnr, &sig);
     if (pid < 0) return -10;                              /* ECHILD */
     if (pid == 0) return 0;                               /* WNOHANG, nobody yet */
     pid = vnr ? vnr : pid;                                /* the number WE know it by */
@@ -2027,7 +2095,9 @@ static long h_wait(struct abi_ctx* c) {
         /* The status slot is the GUEST's pointer — validate it here, where its
          * origin is known.  (§M46's lesson, three times over.) */
         if (!abi_user_w_ok(c->a[1], sizeof(int))) return -ABI_EFAULT;
-        *(int*)(uintptr_t)c->a[1] = (code & 0xFF) << 8;   /* WIFEXITED form */
+        /* WIFSIGNALED (the signal in the low 7 bits) or WIFEXITED (the code
+         * in the second byte) — §M90: a SIGKILL'd child read as exit(137) */
+        *(int*)(uintptr_t)c->a[1] = sig ? (sig & 0x7F) : (code & 0xFF) << 8;
     }
     return pid;
 }
@@ -2776,6 +2846,48 @@ static void abi_addr_out(unsigned long uaddr, unsigned long ulen,
         *(uint32_t*)(uintptr_t)ulen = (uint32_t)sizeof sa;
 }
 
+/* §M90 3a — AF_INET6.  sockaddr_in6 = { u16 family = 10, be16 port, u32
+ * flowinfo, u8 addr[16], u32 scope_id }: 28 bytes, the same on every guest.
+ * Parsed into, and written from, the kernel's two-family sockaddr_k; an
+ * AF_INET address is accepted where a v6 socket takes one (Linux refuses it
+ * with EAFNOSUPPORT for bind/connect on a v6 socket, which sockaddr_k's
+ * consumers do). */
+#define ABI_AF_INET6 10
+static int abi_fd_is_inet6(int fd) { return sys_netsock_fam(fd) == 10; }
+static int abi_sa_in(unsigned long ua, unsigned long len, struct sockaddr_k* k) {
+    if (len < 2 || !abi_user_r_ok(ua, 2)) return -1;
+    const uint8_t* sa = (const uint8_t*)(uintptr_t)ua;
+    int fam = sa[0] | sa[1] << 8;
+    if (fam == ABI_AF_INET) {
+        uint32_t ip; int port;
+        if (len < 8 || abi_addr_in(ua, &ip, &port) != 0) return -1;
+        k->fam = 2; k->ip = ip; k->port = (uint16_t)port; k->scope = 0;
+        for (int i = 0; i < 16; i++) k->a6[i] = 0;
+        return 0;
+    }
+    if (fam != ABI_AF_INET6) return -2;
+    if (len < 24 || !abi_user_r_ok(ua, len < 28 ? 24 : 28)) return -1;
+    k->fam = 10; k->ip = 0;
+    k->port = (uint16_t)(sa[2] << 8 | sa[3]);
+    for (int i = 0; i < 16; i++) k->a6[i] = sa[8 + i];
+    k->scope = len >= 28 ? (uint32_t)sa[24] | (uint32_t)sa[25] << 8 | (uint32_t)sa[26] << 16 | (uint32_t)sa[27] << 24 : 0;
+    return 0;
+}
+static void abi_sa_out(unsigned long ua, unsigned long ulen, const struct sockaddr_k* k) {
+    if (k->fam == 2) { abi_addr_out(ua, ulen, k->ip, k->port); return; }
+    if (!ua || !ulen || !abi_user_r_ok(ulen, sizeof(uint32_t))) return;
+    uint32_t room = *(uint32_t*)(uintptr_t)ulen;
+    uint8_t sa[28] = { ABI_AF_INET6, 0, (uint8_t)(k->port >> 8), (uint8_t)k->port };
+    for (int i = 0; i < 16; i++) sa[8 + i] = k->a6[i];
+    sa[24] = (uint8_t)k->scope; sa[25] = (uint8_t)(k->scope >> 8);
+    sa[26] = (uint8_t)(k->scope >> 16); sa[27] = (uint8_t)(k->scope >> 24);
+    uint32_t w = room < 28 ? room : 28;
+    if (w && abi_user_w_ok(ua, w))
+        for (uint32_t i = 0; i < w; i++) ((uint8_t*)(uintptr_t)ua)[i] = sa[i];
+    if (abi_user_w_ok(ulen, sizeof(uint32_t))) *(uint32_t*)(uintptr_t)ulen = 28;
+}
+static long abi_sa_err(int r) { return r == -1 ? -ABI_EFAULT : -ABI_EAFNOSUPPORT; }
+
 /* §M90 — AF_UNIX: a sockaddr_un is family (2 bytes) + a path of up to 108,
  * NUL-terminated unless it fills the space; sun_path[0] == 0 is the ABSTRACT
  * namespace (kept as "@name", no file).  A relative path is made absolute
@@ -2866,6 +2978,76 @@ static long abi_nl_recv(int fd, unsigned long ubuf, unsigned long len, int flags
     return r;
 }
 
+/* §M90 — AF_PACKET (packet.c).  sockaddr_ll = { u16 family = 17, be16
+ * protocol, s32 ifindex, u16 hatype, u8 pkttype, u8 halen, u8 addr[8] }, 20
+ * bytes.  Payloads are bounced through kernel memory like every other path. */
+#define ABI_AF_PACKET 17
+static struct pktsock* abi_pkt(int fd) {
+    struct ofile* o = fd_lookup(fd);
+    return o && o->kind == FD_PACKET ? o->pkt : NULL;
+}
+/* 0, -1 fault, -2 wrong family. */
+static int abi_addr_ll(unsigned long ua, unsigned long len, uint16_t* proto, int* ifindex, uint8_t mac[6]) {
+    if (len < 12 || !abi_user_r_ok(ua, len < 20 ? len : 20)) return -1;
+    const uint8_t* sa = (const uint8_t*)(uintptr_t)ua;
+    if ((sa[0] | sa[1] << 8) != ABI_AF_PACKET) return -2;
+    *proto = (uint16_t)(sa[2] << 8 | sa[3]);                 /* network order on the wire */
+    *ifindex = (int)((uint32_t)sa[4] | (uint32_t)sa[5] << 8 | (uint32_t)sa[6] << 16 | (uint32_t)sa[7] << 24);
+    for (int i = 0; i < 6; i++) mac[i] = len >= 20 && sa[11] >= 6 ? sa[12 + i] : 0;
+    return 0;
+}
+static void abi_ll_out(unsigned long uaddr, unsigned long ulen, uint16_t proto, int ifindex,
+                       uint8_t pkttype, const uint8_t mac[6]) {
+    if (!uaddr || !ulen || !abi_user_r_ok(ulen, sizeof(uint32_t))) return;
+    uint32_t room = *(uint32_t*)(uintptr_t)ulen;
+    struct net_device* d = net_by_index(-1, ifindex);
+    uint16_t hatype = d && (d->flags & NETDEV_F_LOOPBACK) ? 772 : 1;   /* ARPHRD_LOOPBACK / ETHER */
+    uint8_t sa[20] = { ABI_AF_PACKET, 0, (uint8_t)(proto >> 8), (uint8_t)proto,
+                       (uint8_t)ifindex, (uint8_t)(ifindex >> 8), (uint8_t)(ifindex >> 16), (uint8_t)(ifindex >> 24),
+                       (uint8_t)hatype, (uint8_t)(hatype >> 8), pkttype, 6,
+                       mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 0, 0 };
+    uint32_t w = room < 20 ? room : 20;
+    if (w && abi_user_w_ok(uaddr, w))
+        for (uint32_t i = 0; i < w; i++) ((uint8_t*)(uintptr_t)uaddr)[i] = sa[i];
+    if (abi_user_w_ok(ulen, sizeof(uint32_t))) *(uint32_t*)(uintptr_t)ulen = 20;
+}
+static long abi_pkt_send(int fd, const uint8_t* k, size_t n, unsigned long ua, unsigned long alen) {
+    struct pktsock* p = abi_pkt(fd);
+    if (!p) return -ABI_EBADF;
+    uint16_t proto = 0; int ifx = 0; uint8_t mac[6] = {0};
+    if (ua) {
+        int a = abi_addr_ll(ua, alen, &proto, &ifx, mac);
+        if (a == -1) return -ABI_EFAULT;
+        if (a == -2) return -ABI_EINVAL;
+    }
+    return packet_send(p, k, n, ifx, ua ? mac : NULL, proto);
+}
+static long abi_pkt_sendto_u(int fd, unsigned long ubuf, unsigned long len, unsigned long ua, unsigned long alen) {
+    if (len > 65536) return -90;
+    if (len && !abi_user_r_ok(ubuf, len)) return -ABI_EFAULT;
+    uint8_t* k = (uint8_t*)kmalloc(len ? len : 1);
+    if (!k) return -12;
+    for (unsigned long i = 0; i < len; i++) k[i] = ((const uint8_t*)(uintptr_t)ubuf)[i];
+    long r = abi_pkt_send(fd, k, len, ua, alen);
+    kfree(k);
+    return r;
+}
+static long abi_pkt_recv_u(int fd, unsigned long ubuf, unsigned long len, int flags,
+                           unsigned long ua, unsigned long ualen) {
+    struct ofile* o = fd_lookup(fd);
+    if (!o || o->kind != FD_PACKET) return -ABI_EBADF;
+    if (len > 65536) len = 65536;
+    if (len && !abi_user_w_ok(ubuf, len)) return -ABI_EFAULT;
+    uint8_t* k = (uint8_t*)kmalloc(len ? len : 1);
+    if (!k) return -12;
+    struct packet_from fr;
+    long r = packet_recv(o->pkt, k, len, !o->nonblock && !(flags & 0x40), &fr);
+    if (r > 0) for (long i = 0; i < r; i++) ((uint8_t*)(uintptr_t)ubuf)[i] = k[i];
+    kfree(k);
+    if (r >= 0 && ua) abi_ll_out(ua, ualen, fr.proto, fr.ifindex, fr.pkttype, fr.addr);
+    return r;
+}
+
 static long h_socket(struct abi_ctx* c) {
     int domain = (int)c->a[0];
     int type   = (int)c->a[1];
@@ -2873,12 +3055,25 @@ static long h_socket(struct abi_ctx* c) {
         if ((type & 0xF) != 3 && (type & 0xF) != 2) return -94;   /* ESOCKTNOSUPPORT */
         return abi_cx(sys_netlink_socket((int)c->a[2], type & ABI_SOCK_NONBLOCK), (unsigned long)type);
     }
+    if (domain == ABI_AF_PACKET) {                        /* §M90 */
+        int fd = sys_packet_socket(type & 0xF, (int)c->a[2], type & ABI_SOCK_NONBLOCK);
+        if (fd == -1) return -ABI_EPERM;                  /* CAP_NET_RAW */
+        return abi_cx(fd, (unsigned long)type);
+    }
     if (domain == ABI_AF_UNIX) {
         if ((type & 0xF) != 1) return -ABI_EAFNOSUPPORT;   /* SOCK_STREAM only */
         return abi_cx(sys_unix_socket(type & ABI_SOCK_NONBLOCK), (unsigned long)type);
     }
+    if (domain == ABI_AF_INET6) {                         /* §M90 3a */
+        int fd6 = sys_socket6(type & 0xFF, (int)c->a[2]);
+        if (fd6 == -2) return -ABI_EPERM;
+        if (fd6 < 0) return -ABI_EOPNOTSUPP;
+        if (type & ABI_SOCK_NONBLOCK) sys_socket_setnonblock(fd6, 1);
+        return abi_cx(fd6, (unsigned long)type);
+    }
     if (domain != ABI_AF_INET) return -ABI_EAFNOSUPPORT;
     int fd = sys_socket(domain, type & 0xFF, (int)c->a[2]);
+    if (fd == -2) return -ABI_EPERM;                  /* SOCK_RAW without CAP_NET_RAW */
     if (fd < 0) return -ABI_EOPNOTSUPP;
     /* SOCK_NONBLOCK is not decoration: musl's resolver drains its socket with
      * `while (recvmsg(...) >= 0)` and needs the EAGAIN only a non-blocking
@@ -2888,6 +3083,14 @@ static long h_socket(struct abi_ctx* c) {
 }
 
 static long h_bind(struct abi_ctx* c) {
+    if (abi_pkt((int)c->a[0])) {                          /* §M90 — sockaddr_ll */
+        uint16_t proto = 0; int ifx = 0; uint8_t mac[6];
+        int a = abi_addr_ll(c->a[1], c->a[2], &proto, &ifx, mac);
+        if (a) return a == -1 ? -ABI_EFAULT : -ABI_EINVAL;
+        uint16_t cur = 0;
+        packet_name(abi_pkt((int)c->a[0]), &cur, NULL, mac);
+        return packet_bind(abi_pkt((int)c->a[0]), proto ? proto : cur, ifx);
+    }
     if (abi_fd_is_netlink((int)c->a[0])) {               /* §M90 — sockaddr_nl */
         if (c->a[2] < 12 || !abi_user_r_ok(c->a[1], 12)) return -ABI_EINVAL;
         const uint8_t* sa = (const uint8_t*)(uintptr_t)c->a[1];
@@ -2902,6 +3105,13 @@ static long h_bind(struct abi_ctx* c) {
         if (r == -2) return -ABI_EAFNOSUPPORT;
         if (r) return -ABI_EINVAL;
         return sys_unix_bind((int)c->a[0], nm);
+    }
+    if (abi_fd_is_inet6((int)c->a[0])) {                  /* §M90 3a */
+        struct sockaddr_k k;
+        int e = abi_sa_in(c->a[1], c->a[2], &k);
+        if (e) return abi_sa_err(e);
+        int r6 = sys_bind_sa((int)c->a[0], &k);
+        return r6 == 0 ? 0 : r6 < -1 ? r6 : -ABI_EINVAL;
     }
     uint32_t ip; int port;
     int r = abi_addr_in(c->a[1], &ip, &port);
@@ -2918,6 +3128,13 @@ static long h_connect(struct abi_ctx* c) {
         if (r == -2) return -ABI_EAFNOSUPPORT;
         if (r) return -ABI_EINVAL;
         return sys_unix_connect((int)c->a[0], nm);
+    }
+    if (abi_fd_is_inet6((int)c->a[0])) {                  /* §M90 3a */
+        struct sockaddr_k k;
+        int e = abi_sa_in(c->a[1], c->a[2], &k);
+        if (e) return abi_sa_err(e);
+        int r6 = sys_connect_sa((int)c->a[0], &k);
+        return r6 == 0 ? 0 : r6 < -1 ? r6 : -111;
     }
     uint32_t ip; int port;
     int r = abi_addr_in(c->a[1], &ip, &port);
@@ -2942,6 +3159,15 @@ static long h_accept_common(struct abi_ctx* c, int flags) {
         if (nfd >= 0) abi_un_out(c->a[1], c->a[2], "");      /* the peer is unnamed */
         return abi_cx(nfd, (unsigned long)flags);
     }
+    if (abi_fd_is_inet6((int)c->a[0])) {                  /* §M90 3a */
+        struct sockaddr_k k;
+        int nfd = sys_accept_sa((int)c->a[0], &k);
+        if (nfd == -ABI_EAGAIN) return -ABI_EAGAIN;
+        if (nfd < 0) return -ABI_EINVAL;
+        abi_sa_out(c->a[1], c->a[2], &k);
+        if (flags & ABI_SOCK_NONBLOCK) sys_socket_setnonblock(nfd, 1);
+        return abi_cx(nfd, (unsigned long)flags);
+    }
     uint32_t ip = 0; int port = 0;
     int fd = sys_accept_k((int)c->a[0], &ip, &port);
     if (fd == -ABI_EAGAIN) return -ABI_EAGAIN;
@@ -2954,11 +3180,23 @@ static long h_accept (struct abi_ctx* c) { return h_accept_common(c, 0); }
 static long h_accept4(struct abi_ctx* c) { return h_accept_common(c, (int)c->a[3]); }
 
 static long h_getsockname(struct abi_ctx* c) {
+    if (abi_pkt((int)c->a[0])) {                          /* §M90 */
+        uint16_t proto; int ifx; uint8_t mac[6];
+        packet_name(abi_pkt((int)c->a[0]), &proto, &ifx, mac);
+        abi_ll_out(c->a[1], c->a[2], proto, ifx, 0, mac);
+        return 0;
+    }
     if (abi_fd_is_netlink((int)c->a[0])) {
         abi_nl_out(c->a[1], c->a[2], nl_portid(fd_lookup((int)c->a[0])->nl));
         return 0;
     }
     if (abi_fd_is_unix((int)c->a[0])) { abi_un_out(c->a[1], c->a[2], sys_unix_name((int)c->a[0])); return 0; }
+    if (abi_fd_is_inet6((int)c->a[0])) {                  /* §M90 3a */
+        struct sockaddr_k k;
+        if (sys_getsockname_sa((int)c->a[0], &k) != 0) return -ABI_EINVAL;
+        abi_sa_out(c->a[1], c->a[2], &k);
+        return 0;
+    }
     uint32_t ip = 0; int port = 0;
     if (sys_getsockname_k((int)c->a[0], &ip, &port) != 0) return -ABI_EINVAL;
     abi_addr_out(c->a[1], c->a[2], ip, port);
@@ -2967,6 +3205,12 @@ static long h_getsockname(struct abi_ctx* c) {
 
 static long h_getpeername(struct abi_ctx* c) {
     if (abi_fd_is_unix((int)c->a[0])) { abi_un_out(c->a[1], c->a[2], ""); return 0; }
+    if (abi_fd_is_inet6((int)c->a[0])) {                  /* §M90 3a */
+        struct sockaddr_k k;
+        if (sys_getpeername_sa((int)c->a[0], &k) != 0) return -ABI_ENOTCONN;
+        abi_sa_out(c->a[1], c->a[2], &k);
+        return 0;
+    }
     uint32_t ip = 0; int port = 0;
     if (sys_getpeername_k((int)c->a[0], &ip, &port) != 0) return -ABI_ENOTCONN;
     abi_addr_out(c->a[1], c->a[2], ip, port);
@@ -2984,8 +3228,24 @@ static long h_recv(struct abi_ctx* c) {
 }
 
 static long h_sendto(struct abi_ctx* c) {
+    if (abi_pkt((int)c->a[0]))                            /* §M90 */
+        return abi_pkt_sendto_u((int)c->a[0], c->a[1], c->a[2], c->a[4], c->a[5]);
     if (abi_fd_is_netlink((int)c->a[0])) return abi_nl_send((int)c->a[0], c->a[1], c->a[2]);
     if (!c->a[4]) return sys_write((int)c->a[0], (const void*)c->a[1], (size_t)c->a[2]);
+    if (abi_fd_is_inet6((int)c->a[0])) {                  /* §M90 3a */
+        struct sockaddr_k k;
+        int e = abi_sa_in(c->a[4], c->a[5], &k);
+        if (e) return abi_sa_err(e);
+        unsigned long len = c->a[2];
+        if (len > 65536) return -90;
+        if (len && !abi_user_r_ok(c->a[1], len)) return -ABI_EFAULT;
+        uint8_t* kb = (uint8_t*)kmalloc(len ? len : 1);
+        if (!kb) return -12;
+        for (unsigned long i = 0; i < len; i++) kb[i] = ((const uint8_t*)(uintptr_t)c->a[1])[i];
+        long r6 = sys_sendto_sa_k((int)c->a[0], kb, len, &k);
+        kfree(kb);
+        return r6;
+    }
     uint32_t ip; int port;
     int r = abi_addr_in(c->a[4], &ip, &port);
     if (r == -1) return -ABI_EFAULT;
@@ -2994,6 +3254,8 @@ static long h_sendto(struct abi_ctx* c) {
 }
 
 static long h_recvfrom(struct abi_ctx* c) {
+    if (abi_pkt((int)c->a[0]))                            /* §M90 */
+        return abi_pkt_recv_u((int)c->a[0], c->a[1], c->a[2], (int)c->a[3], c->a[4], c->a[5]);
     if (abi_fd_is_netlink((int)c->a[0])) {
         long r = abi_nl_recv((int)c->a[0], c->a[1], c->a[2], (int)c->a[3]);
         if (r >= 0 && c->a[4]) abi_nl_out(c->a[4], c->a[5], 0);   /* from the kernel */
@@ -3007,6 +3269,12 @@ static long h_recvfrom(struct abi_ctx* c) {
         if (r >= 0 && c->a[4] && c->a[5] && abi_w_ok(c->a[5], 4))
             *(uint32_t*)(uintptr_t)c->a[5] = 0;          /* no source address */
         return r;
+    }
+    if (abi_fd_is_inet6((int)c->a[0])) {                  /* §M90 3a */
+        struct sockaddr_k k;
+        long r6 = sys_recvfrom_sa_u((int)c->a[0], (uintptr_t)c->a[1], (size_t)c->a[2], &k);
+        if (r6 >= 0 && c->a[4]) abi_sa_out(c->a[4], c->a[5], &k);
+        return r6;
     }
     uint32_t ip = 0; int port = 0;
     long n = sys_recvfrom_u((int)c->a[0], (uintptr_t)c->a[1], (size_t)c->a[2],
@@ -3060,6 +3328,8 @@ static long h_sendmsg(struct abi_ctx* c) {
     if (abi_fd_is_netlink(fd)) {
         struct ofile* o = fd_lookup(fd);
         r = o ? nl_send(o->nl, k, (size_t)total) : -ABI_EBADF;
+    } else if (abi_pkt(fd)) {                                 /* §M90 */
+        r = abi_pkt_send(fd, k, (size_t)total, name, name ? *(uint32_t*)(uintptr_t)(um + 8) : 0);
     } else if (abi_fd_is_unix(fd)) {
         /* one descriptor in SCM_RIGHTS: cmsg_len(8) level(4) type(4) fd(4) */
         int passfd = -1;
@@ -3070,6 +3340,10 @@ static long h_sendmsg(struct abi_ctx* c) {
                 passfd = *(const int32_t*)(cm + 16);
         }
         r = passfd >= 0 ? sys_send_k(fd, k, (size_t)total, passfd) : sys_write_k(fd, k, (size_t)total);
+    } else if (name && abi_fd_is_inet6(fd)) {               /* §M90 3a */
+        struct sockaddr_k ka;
+        int e = abi_sa_in(name, *(uint32_t*)(uintptr_t)(um + 8), &ka);
+        r = e ? abi_sa_err(e) : sys_sendto_sa_k(fd, k, (size_t)total, &ka);
     } else if (name) {
         uint32_t ip; int port;
         int a = abi_addr_in(name, &ip, &port);
@@ -3111,6 +3385,9 @@ static long h_recvmsg(struct abi_ctx* c) {
             if (name) abi_nl_out(name, um + 8, 0);
         }
         *(uint64_t*)(uintptr_t)(um + 40) = 0;                  /* no control data */
+    } else if (abi_pkt(fd)) {                                  /* §M90 — first iovec */
+        r = n ? abi_pkt_recv_u(fd, v[0].base, v[0].len, flags, name, name ? um + 8 : 0) : 0;
+        *(uint64_t*)(uintptr_t)(um + 40) = 0;
     } else if (abi_fd_is_unix(fd)) {
         int passfd = -1;
         /* straight into the first iovec (these cores take USER buffers and
@@ -3129,6 +3406,11 @@ static long h_recvmsg(struct abi_ctx* c) {
         }
         *(uint64_t*)(uintptr_t)(um + 40) = used;
         if (name && abi_user_w_ok(um + 8, 4)) *(uint32_t*)(uintptr_t)(um + 8) = 0;
+    } else if (abi_fd_is_inet6(fd)) {                         /* §M90 3a */
+        struct sockaddr_k k;
+        r = n ? sys_recvfrom_sa_u(fd, (uintptr_t)v[0].base, (size_t)v[0].len, &k) : 0;
+        if (r >= 0 && name && n) abi_sa_out(name, um + 8, &k);
+        *(uint64_t*)(uintptr_t)(um + 40) = 0;
     } else {
         uint32_t ip = 0; int port = 0;
         r = n ? sys_recvfrom_u(fd, (uintptr_t)v[0].base, (size_t)v[0].len, &ip, &port) : 0;
@@ -3165,7 +3447,19 @@ static long h_shutdown(struct abi_ctx* c) {
  * getaddrinfo and every TLS setup set SO_RCVTIMEO / TCP_NODELAY and treat a
  * failure as fatal, while ignoring them costs at most a timeout that never
  * fires.  The day one of them changes behaviour, it stops being a stub. */
-static long h_setsockopt(struct abi_ctx* c) { (void)c; return 0; }
+/* setsockopt: accepted and ignored — except IPV6_V6ONLY (level IPPROTO_IPV6
+ * 41, option 26), which changes what a v6 socket ACCEPTS and therefore must
+ * not be a no-op: Go sets it on every "tcp6" listener, and Docker's proxy
+ * opens [::]:P beside 0.0.0.0:P relying on it. */
+static long h_setsockopt(struct abi_ctx* c) {
+    if ((int)c->a[1] == 41 && (int)c->a[2] == 26) {
+        if (c->a[4] < 4 || !abi_user_r_ok(c->a[3], 4)) return -ABI_EINVAL;
+        int on = *(const int32_t*)(uintptr_t)c->a[3];
+        int r = sys_netsock_v6only((int)c->a[0], on ? 1 : 0);
+        return r < 0 ? (r == -1 ? -92 : r) : 0;       /* ENOPROTOOPT on a non-v6 socket */
+    }
+    return 0;
+}
 /* §M90 — getsockopt(fd, level, name, val, len*).  It used to succeed and write
  * NOTHING — the "accept and forget" shape this tree keeps paying for: Go's
  * net.FileListener asks SO_TYPE, read back whatever its stack held (0), found
@@ -3189,6 +3483,11 @@ static long h_getsockopt(struct abi_ctx* c) {
     int family, type, listening;
     if (sys_socket_info(fd, &family, &type, &listening) != 0) return -88;   /* ENOTSOCK */
     int v = 0;
+    if (level == 41 && name == 26) {                     /* §M90 3a — IPV6_V6ONLY */
+        int r = sys_netsock_v6only(fd, -1);
+        if (r < 0) return -92;
+        v = r;
+    }
     if (level == ABI_SOL_SOCKET) {
         switch (name) {
         case ABI_SO_TYPE:       v = type; break;
@@ -3265,6 +3564,8 @@ static const struct {
     [ABI_MMAP_PGOFF] = { "mmap2",  h_mmap_pgoff },
     [ABI_SET_TID_ADDRESS] = { "set_tid_address", h_settid },
     [ABI_SIGPROCMASK]     = { "sigprocmask",     h_sigprocmask },
+    [ABI_PAUSE]           = { "pause",           h_pause },
+    [ABI_SIGSUSPEND]      = { "sigsuspend",      h_sigsuspend },
     [ABI_TIMERFD_CREATE]  = { "timerfd_create",  h_timerfd_create  },
     [ABI_EVENTFD]         = { "eventfd2",        h_eventfd         },
     [ABI_UMASK]           = { "umask",           h_umask           },

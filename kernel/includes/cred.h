@@ -257,6 +257,10 @@ int cred_become_user(int pid, int uid, int gid,
  * to a sign-in.  Starts at 1: CRED_SESSION_NONE is 0. */
 int cred_session_alloc(void);
 
+/* §M90 — set*id: any id with CAP_SETUID / CAP_SETGID, else only the current
+ * one; -1 keeps.  0 / -1 (EPERM). */
+int cred_set_ids(struct cred* c, int uid, int gid);
+
 /* ---------------------------------------------------------------------------
  * Predicates.  Every privilege gate in the tree asks through these.
  * ------------------------------------------------------------------------- */

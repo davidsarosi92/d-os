@@ -30,7 +30,8 @@ struct usock;                   /* unix socket endpoint (stage 5)          */
 enum fd_kind { FD_VFS, FD_SHM, FD_SOCK, FD_NETSOCK, FD_TIMER, FD_EPOLL, FD_CONSOLE, FD_EVENT,
                FD_NETLINK /* §M90 */, FD_FIFO /* §M90 — a named pipe end, fifo.c */,
                FD_BPF /* §M90 — an eBPF program, bpf.c */,
-               FD_INOTIFY /* §M90 — an inotify instance, inotify.c */ };
+               FD_INOTIFY /* §M90 — an inotify instance, inotify.c */,
+               FD_PACKET /* §M90 — an AF_PACKET socket, packet.c */ };
 
 struct netsock;                 /* network (AF_INET) socket — usyscall.c        */
 struct timerfd;                 /* §M53 stage 3 — a deadline behind a descriptor */
@@ -77,6 +78,8 @@ struct ofile {
     struct bpf_prog* bpf;
     /* §M90 — APPENDED.  FD_INOTIFY: the instance (inotify.c), owned. */
     struct inotify*  ino;
+    /* §M90 — APPENDED.  FD_PACKET: the link-layer socket (packet.c), owned. */
+    struct pktsock*  pkt;
 };
 struct ofile* ofile_from_bpf(struct bpf_prog* p);   /* §M90 — takes a reference */
 struct inotify;
@@ -93,6 +96,8 @@ struct ofile* ofile_from_timerfd(struct timerfd* t);
 struct ofile* ofile_from_epoll(struct epoll* e);
 struct ofile* ofile_from_eventfd(struct eventfd* e);
 struct ofile* ofile_from_netlink(struct nlsock* s);   /* §M90 */
+struct pktsock;
+struct ofile* ofile_from_packet(struct pktsock* s);   /* §M90 — takes ownership */
 
 /* Resolve a descriptor of the CURRENT task to its open file description, or
  * NULL if it is not open.  A live table read, not a cached pointer — which is

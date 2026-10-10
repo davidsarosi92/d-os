@@ -144,7 +144,7 @@ void lnx_signal_deliver(void* frame) {
         kprintf("signal: pid %d cannot take signal %d (no usable stack or restorer) - killed\n",
                 t->pid, d.sig);
         fd_close_all();
-        task_exit_code(128 + 11);
+        task_exit_signal(11);
     }
 }
 
@@ -174,7 +174,7 @@ void lnx_rt_sigreturn(void* frame) {
     uintptr_t uc = (uintptr_t)f->rsp;
     if (!t || !vmm_user_access_ok(uc, UC_SIZE, 0)) {
         fd_close_all();
-        task_exit_code(128 + 11);
+        task_exit_signal(11);
     }
     uintptr_t g = uc + UC_MCTX;
     f->r8  = rd64(g + G_R8 * 8);  f->r9  = rd64(g + G_R9 * 8);

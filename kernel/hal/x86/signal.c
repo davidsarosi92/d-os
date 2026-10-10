@@ -69,7 +69,7 @@ void signal_deliver(struct int_frame* f) {
         if (h == SIG_DFL) {
             /* Default: terminate on the fatal signals, ignore the rest. */
             if (sig == SIGINT || sig == SIGTERM || sig == SIGKILL || sig == SIGSEGV) {
-                if (t->user_task) { fd_close_all(); task_exit_code(128 + sig); }
+                if (t->user_task) { fd_close_all(); task_exit_signal(sig); }
                 /* (excursion tasks can't self-terminate cleanly here — ignore) */
             }
             continue;
@@ -83,7 +83,7 @@ void signal_deliver(struct int_frame* f) {
          * first; if not, terminate the process (SIGSEGV) rather than fault. */
         uintptr_t frame_lo = (uintptr_t)f->user_esp - (uintptr_t)(S_N * 4 + 8);
         if (!vmm_user_access_ok(frame_lo, (uintptr_t)(S_N * 4 + 8), 1)) {
-            if (t->user_task) { fd_close_all(); task_exit_code(128 + SIGSEGV); }
+            if (t->user_task) { fd_close_all(); task_exit_signal(SIGSEGV); }
             continue;
         }
 
@@ -114,7 +114,7 @@ void signal_sigreturn(struct int_frame* f) {
      * can't fault the kernel (→ halt); a bad frame kills the process instead. */
     if (!vmm_user_access_ok(frame, (uintptr_t)S_N * 4, 0)) {
         struct task* t = task_current();
-        if (t && t->user_task) task_exit_code(139);   /* 128 + SIGSEGV */
+        if (t && t->user_task) task_exit_signal(11);   /* 128 + SIGSEGV */
         return;
     }
     uint32_t* sv = (uint32_t*)frame;

@@ -1,4 +1,4 @@
-# RESUME HERE (updated 2026-10-08)
+# RESUME HERE (updated 2026-10-10)
 
 **§M90 Docker, ~80 %.**  `docker run --network host busybox:musl echo hi`
 prints `hi` on aarch64 (rungs 1-2 done); cgroup limits and inotify done (rung 3); overlayfs + Docker's overlay2 done (rung 4); container networking done (rung 5: bridge, NAT, `-p`).  Next, in order — details and the
@@ -6,7 +6,9 @@ test recipe in PLAN.md §M90 "RESUME HERE":
 
 1. ~~cgroup v2 limits enforced (`memory.max`, `cpu.max`, `pids.max`) + `inotify`~~ — DONE 2026-10-08; memory.max on a Linux-style charge model 2026-10-09 (`--memory 8m` works, OOMKilled true/137)
 2. ~~overlayfs~~ — DONE 2026-10-09 (overlay2 driver: run, diff, commit)
-3. ~~networking (net namespace, veth, bridge, NAT, `-p`)~~ — DONE 2026-10-10
+3. ~~networking (net namespace, veth, bridge, NAT, `-p`)~~ — DONE 2026-10-10; its gaps closed the same day (ICMP ping/raw sockets, AF_PACKET, sockets keep their namespace, ARP hold queue, FDB ageing, connections reset when their device goes)
+3a. IPv6 — stages a-d DONE 2026-10-10 (addresses, NDP, ICMPv6, routes, TCP/UDP, AF_INET6 sockets); left: rtnetlink AF_INET6 + v6 forwarding (`docker network create --ipv6`) — PLAN §M90 3a
+3b. netfilter (conntrack, hooks, nf_tables over netlink, DNAT) — PLAN §M90 3b
 4. `docker run -it` (pty), `docker build`, volumes
 5. x86_64 after the higher-half kernel move
 

@@ -2209,7 +2209,7 @@ void task_force_kill_point(int from_user) {
          * to see that afterwards rather than just watching it vanish. */
         crash_report(CRASH_FORCED_KILL, self->pid, self->name, 0, 0, 137,
                      "unresponsive task reclaimed by force");
-        task_exit_code(137);                 /* 128 + SIGKILL, conventional */
+        task_exit_signal(9);                 /* 128 + SIGKILL, and killed BY it */
     }
     /* A PLAIN kill of a program (2026-09-27).  The cooperative kill was
      * honoured only in task_yield — and a ring-3 program never calls that: it
@@ -2223,7 +2223,7 @@ void task_force_kill_point(int from_user) {
      * not a crash.  143 = 128 + SIGTERM, the signal `kill` sends by default. */
     if (self && self->kill_pending && self->user_task && !self->is_idle &&
         self->state != TASK_DEAD)
-        task_exit_code(143);
+        task_exit_signal(15);                /* SIGTERM */
 }
 
 int task_reap(int pid) {
@@ -2655,7 +2655,9 @@ static void wait_scan_locked(int parent_pid, int want,
                 !(c->tgid && c->tgid != c->pid)) {
                 if (c->state == TASK_DEAD) {
                     if (*dead_pid < 0) {
-                        *dead_pid = c->pid; *dead_code = c->exit_code;
+                        *dead_pid = c->pid;
+                        /* §M90 — a death BY A SIGNAL rides along in bits 16+ */
+                        *dead_code = (c->exit_code & 0xFFFF) | (c->exit_sig << 16);
                         if (dead_vnr) *dead_vnr = ns_vnr(viewer, c);   /* §M90 */
                     }
                 } else {
@@ -2677,7 +2679,13 @@ int task_wait(int pid, int* code) { return task_wait_ex(pid, code, 0); }
  * threads running.  Every other thread of the group is told to die (the
  * ordinary kill: woken if asleep, honoured at its next safe point) carrying
  * the group's code, then the caller exits.  Kernel threads have no group. */
-void task_exit_group(int code) {
+static void exit_group_common(int code, int sig) __attribute__((noreturn));
+void task_exit_group(int code) { exit_group_common(code, 0); }
+/* §M90 — the whole process ends BY a signal (the cgroup OOM killer's SIGKILL
+ * from a fault path): every thread records it, so the parent's wait4 sees
+ * WIFSIGNALED whichever thread was the leader. */
+void task_exit_group_signal(int sig) { exit_group_common(128 + (sig & 0x7F), sig & 0x7F); }
+static void exit_group_common(int code, int sig) {
     struct task* self = task_current();
     if (!self) for (;;) hal_cpu_halt();
     int g = task_tgid(self);
@@ -2689,6 +2697,7 @@ void task_exit_group(int code) {
         do {
             if (c != self && c->state != TASK_DEAD && task_tgid(c) == g && n < 64) {
                 c->group_exit_plus1 = code + 1;
+                c->exit_sig = sig;
                 pids[n++] = c->pid;
             }
             c = c->next;
@@ -2697,6 +2706,7 @@ void task_exit_group(int code) {
     spin_unlock_irqrestore(&master_lock, fl);
     for (int i = 0; i < n; i++) task_kill(pids[i]);
     self->group_exit_plus1 = code + 1;
+    self->exit_sig = sig;
     fd_close_all();
     task_exit_code(code);
 }
@@ -2718,6 +2728,9 @@ void task_kill_group_oom(int tgid, int code) {
         do {
             if (c->state != TASK_DEAD && !c->is_idle && task_tgid(c) == tgid && n < 64) {
                 c->group_exit_plus1 = code + 1;
+                /* a kernel kill IS a signal death (137 = SIGKILL): the parent's
+                 * wait4 must say WIFSIGNALED, which is what Docker reads */
+                c->exit_sig = code > 128 && code < 160 ? code - 128 : 0;
                 /* NOT kill_forced: that path files a "stopped responding"
                  * crash record (task_force_kill_point), and an OOM kill is a
                  * policy decision, not an unresponsive program.  The plain
@@ -2748,6 +2761,12 @@ int task_wait_ex(int pid, int* code, int nohang) { return task_wait_ex2(pid, cod
 /* §M90 — the same, also giving the child's number as the caller's PID
  * NAMESPACE sees it (computed while the child still exists). */
 int task_wait_ex2(int pid, int* code, int nohang, int* vnr_out) {
+    return task_wait_ex3(pid, code, nohang, vnr_out, NULL);
+}
+/* §M90 — `sig_out` gets the signal that killed the child (0 = it exited).
+ * Callers that ask for it see the plain exit code beside it; the others keep
+ * seeing 128 + signal, the number a shell prints. */
+int task_wait_ex3(int pid, int* code, int nohang, int* vnr_out, int* sig_out) {
     struct task* self = task_current();
     if (!self) return -1;
     int me = task_tgid(self);                /* §M90 — the process waits */
@@ -2764,7 +2783,8 @@ int task_wait_ex2(int pid, int* code, int nohang, int* vnr_out) {
              * us for the struct — whoever loses gets task_reap() == -1,
              * but we already hold the exit code, so we still return it. */
             waitq_unlock(&child_exit_wq, f);
-            if (code) *code = dead_code;
+            if (code) *code = dead_code & 0xFFFF;
+            if (sig_out) *sig_out = dead_code >> 16;
             if (vnr_out) *vnr_out = dead_vnr;
             /* §M73 — task_reap REFUSES while the child is still on its CPU
              * (DEAD is published just before its last context switch) and says
@@ -2839,6 +2859,16 @@ void task_finish_first_switch(void) {
 }
 
 void task_exit(void) { task_exit_code(0); }
+
+/* §M90 — death BY A SIGNAL: the code everyone prints is 128 + sig, and the
+ * signal itself is recorded so a Linux parent's wait4 can say WIFSIGNALED
+ * (Docker turns that into "exit 137 / killed", a shell into "Killed"); an
+ * exit(137) and a SIGKILL used to be the same thing to the parent. */
+void task_exit_signal(int sig) {
+    struct task* self = task_current();
+    if (self && !self->group_exit_plus1) self->exit_sig = sig & 0x7F;
+    task_exit_code(128 + (sig & 0x7F));
+}
 
 void task_exit_code(int code) {
     /* WHO IS EXITING, READ AS ONE OBSERVATION (§M73, 2026-09-28).  This was

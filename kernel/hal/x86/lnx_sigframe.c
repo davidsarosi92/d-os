@@ -170,7 +170,7 @@ void lnx_signal_deliver(void* frame) {
         kprintf("signal: pid %d cannot take signal %d (no usable stack or restorer) - killed\n",
                 t->pid, d.sig);
         fd_close_all();
-        task_exit_code(128 + 11);
+        task_exit_signal(11);
     }
 }
 
@@ -215,7 +215,7 @@ void lnx_sigreturn_old(void* frame) {
     uintptr_t fr = (uintptr_t)f->user_esp - 8;
     if (!t || !vmm_user_access_ok(fr, OLD_SIZE, 0)) {
         fd_close_all();
-        task_exit_code(128 + 11);
+        task_exit_signal(11);
     }
     uintptr_t sc = fr + OLD_SC;
     lnx_sig_restore_mask(t, (uint64_t)rd32(sc + G_OLDMASK * 4) | ((uint64_t)rd32(fr + OLD_EXTRAMASK) << 32));
@@ -231,7 +231,7 @@ void lnx_rt_sigreturn(void* frame) {
     uintptr_t uc = fr + UC_OFF;
     if (!t || !vmm_user_access_ok(fr, FRAME_SIZE, 0)) {
         fd_close_all();
-        task_exit_code(128 + 11);
+        task_exit_signal(11);
     }
     lnx_sig_restore_mask(t, (uint64_t)rd32(uc + UC_SIGMASK) | ((uint64_t)rd32(uc + UC_SIGMASK + 4) << 32));
     get_sigcontext(f, t, uc + UC_MCTX);

@@ -247,7 +247,7 @@ int lnx_sig_next(struct task* t, uintptr_t user_sp, struct lnx_delivery* d) {
         if (act.handler == SIG_DFL) {
             if (default_action(sig) == D_IGN) continue;
             fd_close_all();
-            task_exit_code(128 + sig);               /* does not return */
+            task_exit_signal(sig);                   /* does not return */
         }
         d->sig = sig;
         d->act = act;
@@ -255,9 +255,17 @@ int lnx_sig_next(struct task* t, uintptr_t user_sp, struct lnx_delivery* d) {
         else { d->info.signo = sig; d->info.code = LNX_SI_USER; d->info.pid = d->info.uid = 0; d->info.addr = 0; }
         d->info.signo = sig;
         d->old_mask = lnx_sig_blocked64(t);
+        if (t->sigsusp_armed) {              /* §M90 — the frame keeps the PRE-suspend mask */
+            d->old_mask = t->sigsusp_saved;
+            t->sigsusp_armed = 0;
+        }
         d->sp = s ? pick_stack(s, act.flags, user_sp, &d->on_altstack) : user_sp;
         if (!s) d->on_altstack = 0;
         return 1;
+    }
+    if (t->sigsusp_armed) {                  /* §M90 — nothing ran: back to the old mask */
+        t->sigsusp_armed = 0;
+        lnx_sig_set_blocked64(t, t->sigsusp_saved);
     }
     return 0;
 }
@@ -438,22 +446,11 @@ long lnx_h_sigaltstack(struct abi_ctx* c) {
     return 0;
 }
 
-/* Who may signal whom: the §audit#6 rule, plus the other THREADS of the
- * caller's own process (same address space).  pthread_kill is exactly that,
- * and the ancestry rule alone refused it. */
-static int may_signal(struct task* me, struct task* t) {
-    if (!me || !me->user_task) return 1;
-    if (!t->user_task || t->pid == 0 || t->pid == task_reaper_pid()) return 0;
-    if (t == me || (t->mm && t->mm == me->mm)) return 1;
-    int p = t->ppid;
-    for (int i = 0; i < 64 && p > 0; i++) {
-        if (p == me->pid) return 1;
-        struct task* pt = task_find(p);
-        if (!pt) break;
-        p = pt->ppid;
-    }
-    return 0;
-}
+/* Who may signal whom: usyscall.c's task_may_signal, the one copy of the
+ * rule (Linux's: the target itself, a thread of the caller's process,
+ * CAP_KILL, or the same uid; never a kernel thread, pid 0 or init). */
+int task_may_signal(struct task* me, struct task* t);
+static int may_signal(struct task* me, struct task* t) { return task_may_signal(me, t); }
 
 static long send_to(int tid, int sig, int code) {
     struct task* me = task_current();

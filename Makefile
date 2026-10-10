@@ -73,7 +73,8 @@ MUSL_PROG_BLOBS := user/muslhello_muslblob.o user/netmusl_muslblob.o \
                    user/wedgewin_muslblob.o user/pthreadtest_muslblob.o \
                    user/epollmusl_muslblob.o user/netmuslserv_muslblob.o \
                    user/nxtest_muslblob.o user/mmaptest_muslblob.o \
-                   user/sigmusl_muslblob.o
+                   user/sigmusl_muslblob.o user/cpuidmusl_muslblob.o \
+                   user/sock6musl_muslblob.o user/killmusl_muslblob.o
 # §M37 dynamic-linking artifacts — the ld.so blob + the dynamically linked tests.
 MUSL_DYN_BLOBS  := user/ldmusl_blob.o user/muslhellodyn_dynblob.o \
                    user/libgreet_blob.o user/solibtest_dynblob.o \
@@ -556,7 +557,7 @@ else ifeq ($(ARCH),aarch64)
   # phases add the GIC, generic timer, context switch, and the console/shell.
   ARCH_C_SRCS := \
       kernel/hal/aarch64/uart.c \
-      kernel/hal/aarch64/exceptions.c \
+      kernel/hal/aarch64/exceptions.c kernel/hal/aarch64/cpuid_emu.c \
       kernel/hal/aarch64/mmu.c \
       kernel/hal/aarch64/gic.c \
       kernel/hal/aarch64/timer.c \
@@ -619,6 +620,9 @@ else ifeq ($(ARCH),aarch64)
                      user/nxtest_muslblob.o \
                      user/mmaptest_muslblob.o \
                      user/sigmusl_muslblob.o \
+                     user/cpuidmusl_muslblob.o \
+                     user/sock6musl_muslblob.o \
+                     user/killmusl_muslblob.o \
                      user/pthreadtest_muslblob.o \
                      $(MUSL_COREUTIL_BLOBS)
 
@@ -852,6 +856,8 @@ CORE_C_SRCS := \
     kernel/core/bpf.c \
     kernel/core/flock.c \
     kernel/core/netlink.c \
+    kernel/core/packet.c \
+    kernel/core/net6.c \
     kernel/core/itimer.c \
     kernel/core/epoll.c \
     kernel/core/abi_engine.c \
@@ -912,6 +918,8 @@ CORE_C_SRCS := \
     kernel/core/bpf.c \
     kernel/core/flock.c \
     kernel/core/netlink.c \
+    kernel/core/packet.c \
+    kernel/core/net6.c \
     kernel/core/itimer.c \
     kernel/core/epoll.c \
     kernel/core/abi_engine.c \
@@ -1233,6 +1241,8 @@ CORE_C_SRCS := \
     kernel/core/bpf.c \
     kernel/core/flock.c \
     kernel/core/netlink.c \
+    kernel/core/packet.c \
+    kernel/core/net6.c \
     kernel/core/itimer.c \
     kernel/core/epoll.c \
     kernel/core/abi_engine.c \

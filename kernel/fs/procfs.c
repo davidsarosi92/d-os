@@ -859,6 +859,21 @@ static long write_timens(struct task* t, const char* buf, size_t n) {
 }
 static struct procfs_node nd_timens = { .name = "self/timens_offsets", .gen = gen_timens,
                                         .write = write_timens };
+/* §M90 — /proc/<pid>/auxv: the auxiliary vector the process was started
+ * with, as Linux gives it — native-width (key, value) words in the
+ * machine's byte order, AT_NULL-terminated.  Go's x/sys/cpu reads it for
+ * AT_HWCAP; without it Go decided the kernel was new enough to emulate the
+ * CPU-ID registers and read one (it is now emulated too — exceptions.c on
+ * arm64). */
+static void gen_auxv(struct procfs_writer* w) {
+    struct task* t = procfs_target();
+    if (!t) return;
+    for (int i = 0; i < t->auxv_n; i++) {
+        uintptr_t v = t->auxv[i];
+        for (unsigned b = 0; b < sizeof v; b++) pw_putc(w, (char)(v >> (8 * b)));
+    }
+}
+static struct procfs_node nd_auxv = { .name = "self/auxv", .gen = gen_auxv };
 static struct procfs_node nd_mountinfo  = { .name = "self/mountinfo", .gen = gen_mountinfo };
 static struct procfs_node nd_selfmounts = { .name = "self/mounts",    .gen = gen_mounts };
 /* §M90 — /proc/self/ns/<kind>: namespace HANDLES.  A program opens one to
@@ -1045,6 +1060,7 @@ void procfs_init(void) {
     attach_node(&nd_oomadj);
     attach_node(&nd_oomscore);
     attach_node(&nd_timens);
+    attach_node(&nd_auxv);
     attach_fd_dir();
     attach_ns_dir();
     attach_node(&nd_selfmounts);

@@ -612,16 +612,7 @@ static void linux_syscall_body(struct int_frame* f) {
             f->rax = (uint64_t)(long)proc_execve_env((const char*)a0, (char* const*)a1,
                                                      (char* const*)a2);
             return;
-        case LNX_wait4: {
-            int code = 0;
-            int pid = task_wait((int)a0, &code);
-            if (a1) {                            /* §1.1 — client status slot */
-                if (!lnx_w_ok(a1, sizeof(int))) { f->rax = (uint64_t)-LNX_EFAULT; return; }
-                *(int*)a1 = (code & 0xFF) << 8;  /* WIFEXITED: code in 8..15 */
-            }
-            f->rax = (uint64_t)pid;
-            return;
-        }
+        /* wait4: the shared engine's ABI_WAIT since §M90. */
         /* pipe / pipe2 moved to the shared engine (§M59, abi_engine.c). */
         /* kill / tkill / tgkill are engine operations (§M89, lnx_signal.c). */
         case 15:                                  /* rt_sigreturn (§M89) */

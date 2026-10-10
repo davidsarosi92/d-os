@@ -12,7 +12,8 @@
  * synchronously, its replies queued as ONE datagram on the socket, read back
  * by recv/recvfrom/read:
  *   RTM_GETLINK  dump, or one device by index / IFLA_IFNAME
- *   RTM_GETADDR  dump (IPv4; an AF_INET6 dump is empty — there is no IPv6)
+ *   RTM_GETADDR  dump, IPv4 and (§M90 3a) IPv6: each device's link-local and
+ *                configured addresses; NEW/DELADDR for both families
  *   RTM_GETROUTE dump (the connected route of every configured device and
  *                the default route via its gateway — net_route's own table)
  *   RTM_GETNEIGH / GETRULE / GETQDISC dumps: empty (DONE)
@@ -202,6 +203,50 @@ static void put_addr(struct nlb* b, const struct net_device* d, uint32_t seq, ui
     nl_end(b, at);
 }
 
+/* §M90 3a stage e — IPv6 addresses: the link-local of every non-loopback
+ * device (scope link) and each configured one (scope universe; ::1 host). */
+static void put_addr6_one(struct nlb* b, const struct net_device* d, const uint8_t* a, int plen,
+                          int scope, uint32_t seq, uint32_t pid) {
+    uint32_t at = nl_begin(b, RTM_NEWADDR, F_MULTI, seq, pid);
+    uint8_t* ifa = (uint8_t*)nlb_put(b, 8);
+    if (ifa) {
+        ifa[0] = AF_INET6_; ifa[1] = (uint8_t)plen;
+        ifa[2] = 0x80;                                /* IFA_F_PERMANENT */
+        ifa[3] = (uint8_t)scope;
+        w32(ifa + 4, (uint32_t)d->ifindex);
+    }
+    nl_attr(b, 1 /* IFA_ADDRESS */, a, 16);
+    nl_end(b, at);
+}
+static void put_addr6(struct nlb* b, const struct net_device* d, uint32_t seq, uint32_t pid) {
+    if (!is_lo(d)) put_addr6_one(b, d, d->ip6_ll, 64, 253 /* RT_SCOPE_LINK */, seq, pid);
+    for (int i = 0; i < d->n_ip6; i++)
+        put_addr6_one(b, d, d->ip6[i], d->ip6_plen[i], is_lo(d) ? 254 : 0, seq, pid);
+}
+static void put_route6(struct nlb* b, const uint8_t* dst, int dst_len, const uint8_t* gw,
+                       int oif, int scope, uint32_t seq, uint32_t pid) {
+    uint32_t at = nl_begin(b, RTM_NEWROUTE, F_MULTI, seq, pid);
+    uint8_t* rt = (uint8_t*)nlb_put(b, 12);
+    int has_gw = 0;
+    if (gw) for (int i = 0; i < 16; i++) if (gw[i]) has_gw = 1;
+    if (rt) {
+        rt[0] = AF_INET6_; rt[1] = (uint8_t)dst_len;
+        rt[4] = 254; rt[5] = has_gw ? 3 : 2; rt[6] = (uint8_t)scope; rt[7] = 1;
+    }
+    nl_attr32(b, 15 /* RTA_TABLE */, 254);
+    if (dst_len) nl_attr(b, 1 /* RTA_DST */, dst, 16);
+    if (has_gw) nl_attr(b, 5 /* RTA_GATEWAY */, gw, 16);
+    nl_attr32(b, 4 /* RTA_OIF */, (uint32_t)oif);
+    nl_attr32(b, 6 /* RTA_PRIORITY */, 256);
+    nl_end(b, at);
+}
+static void prefix6(const uint8_t* a, int plen, uint8_t* out) {
+    for (int i = 0; i < 16; i++) {
+        int bits = plen - 8 * i;
+        out[i] = bits >= 8 ? a[i] : bits <= 0 ? 0 : (uint8_t)(a[i] & (0xff << (8 - bits)));
+    }
+}
+
 static void put_route(struct nlb* b, uint32_t dst, int dst_len, uint32_t gw, uint32_t src,
                       int oif, int scope, uint32_t seq, uint32_t pid) {
     uint32_t at = nl_begin(b, RTM_NEWROUTE, F_MULTI, seq, pid);
@@ -383,7 +428,18 @@ static int link_create(int ns, uint32_t ifl, const uint8_t* attrs, uint32_t alen
 
 static int addr_change(int ns, int add, const uint8_t* m, uint32_t len, uint16_t nlflags) {
     if (len < 24) return -22;
-    if (m[16] != AF_INET_) return m[16] == AF_INET6_ ? -95 : -97;   /* no IPv6 here */
+    if (m[16] == AF_INET6_) {                         /* §M90 3a stage e */
+        struct net_device* d6 = net_by_index(ns, (int)r32(m + 20));
+        if (!d6) return -19;
+        uint16_t l6 = 0;
+        const uint8_t* v6 = find_attr(m + 24, len - 24, 2 /* IFA_LOCAL */, &l6);
+        if (!v6) v6 = find_attr(m + 24, len - 24, 1 /* IFA_ADDRESS */, &l6);
+        if (!v6 || l6 < 16) return -22;
+        int r6 = add ? net6_addr_add(d6, v6, m[17]) : net6_addr_del(d6, v6);
+        if (r6 == -17 && add && !(nlflags & 0x200)) r6 = 0;   /* not EXCL: replacing is fine */
+        return r6;
+    }
+    if (m[16] != AF_INET_) return -97;
     int plen = m[17];
     struct net_device* d = net_by_index(ns, (int)r32(m + 20));
     if (!d) return -19;
@@ -408,7 +464,34 @@ static int addr_change(int ns, int add, const uint8_t* m, uint32_t len, uint16_t
 
 static int route_change(int ns, int add, const uint8_t* m, uint32_t len) {
     if (len < 28) return -22;
-    if (m[16] != AF_INET_) return m[16] == AF_INET6_ ? -95 : -97;
+    if (m[16] == AF_INET6_) {                         /* §M90 3a stage e */
+        uint8_t dst6[16] = {0}, gw6[16] = {0};
+        int oif6 = 0;
+        uint16_t l6 = 0;
+        const uint8_t* v6;
+        const uint8_t* a6 = m + 28; uint32_t al6 = len - 28;
+        if ((v6 = find_attr(a6, al6, 1, &l6)) && l6 >= 16) for (int i = 0; i < 16; i++) dst6[i] = v6[i];
+        if ((v6 = find_attr(a6, al6, 5, &l6)) && l6 >= 16) for (int i = 0; i < 16; i++) gw6[i] = v6[i];
+        if ((v6 = find_attr(a6, al6, 4, &l6)) && l6 >= 4) oif6 = (int)r32(v6);
+        struct net_device* d6 = oif6 ? net_by_index(ns, oif6) : NULL;
+        if (oif6 && !d6) return -19;
+        int has_gw = 0;
+        for (int i = 0; i < 16; i++) if (gw6[i]) has_gw = 1;
+        if (!d6 && has_gw && !net6_is_linklocal(gw6)) d6 = net6_route(ns, gw6, NULL);
+        if (!add) return net6_route_del(ns, dst6, m[17]) == 0 ? 0 : -3;
+        if (!d6) return has_gw ? -101 : -22;
+        /* a connected prefix of the device exists already */
+        if (!has_gw) for (int i = 0; i < d6->n_ip6; i++) {
+            uint8_t p1[16], p2[16];
+            prefix6(d6->ip6[i], d6->ip6_plen[i], p1); prefix6(dst6, m[17], p2);
+            int same = d6->ip6_plen[i] == m[17];
+            for (int k = 0; k < 16 && same; k++) if (p1[k] != p2[k]) same = 0;
+            if (same) return 0;
+        }
+        int r6 = net6_route_add(ns, dst6, m[17], gw6, d6);
+        return r6 == 0 ? 0 : r6;
+    }
+    if (m[16] != AF_INET_) return -97;
     int dlen = m[17];
     uint32_t dst = 0, gw = 0, metric = 0;
     int oif = 0;
@@ -478,6 +561,8 @@ static void handle(struct nlsock* s, const uint8_t* m, uint32_t len, struct nlb*
     case RTM_GETADDR:
         if (family != AF_INET6_)
             for (int i = 0; i < l.n; i++) put_addr(b, l.d[i], seq, pid);
+        if (family != AF_INET_)                          /* §M90 3a stage e */
+            for (int i = 0; i < l.n; i++) put_addr6(b, l.d[i], seq, pid);
         put_done(b, seq, pid);
         return;
     case RTM_GETROUTE:
@@ -486,6 +571,26 @@ static void handle(struct nlsock* s, const uint8_t* m, uint32_t len, struct nlb*
          * kernel would send the packet.  Answering it with the whole table
          * made Docker take the FIRST entry's device — the loopback's — for a
          * container's default gateway ("default via 172.17.0.1 dev lo"). */
+        if (!dump && family == AF_INET6_) {             /* §M90 3a stage e — a v6 lookup */
+            uint8_t dst6[16] = {0}, nh6[16];
+            uint16_t al = 0;
+            const uint8_t* v = len > 28 ? find_attr(m + 28, len - 28, 1, &al) : NULL;
+            if (v && al >= 16) for (int i = 0; i < 16; i++) dst6[i] = v[i];
+            struct net_device* d = net6_route(s->netns, dst6, nh6);
+            if (!d) { put_error(b, -101, m, pid); return; }
+            uint32_t at = nl_begin(b, RTM_NEWROUTE, 0, seq, pid);
+            uint8_t* rt = (uint8_t*)nlb_put(b, 12);
+            if (rt) { rt[0] = AF_INET6_; rt[1] = 128; rt[4] = 254; rt[5] = 2; rt[7] = is_lo(d) ? 2 : 1; }
+            nl_attr32(b, 15, 254);
+            nl_attr(b, 1, dst6, 16);
+            nl_attr32(b, 4, (uint32_t)d->ifindex);
+            int same = 1;
+            for (int i = 0; i < 16; i++) if (nh6[i] != dst6[i]) same = 0;
+            if (!same) nl_attr(b, 5, nh6, 16);
+            nl_end(b, at);
+            if (flags & F_ACK) put_error(b, 0, m, pid);
+            return;
+        }
         if (!dump) {
             uint32_t dst = 0;
             uint16_t al = 0;
@@ -531,6 +636,23 @@ static void handle(struct nlsock* s, const uint8_t* m, uint32_t len, struct nlb*
                     put_route(b, 0, 0, l.d[i]->gateway, 0, l.d[i]->ifindex, 0, seq, pid);
                     break;
                 }
+        }
+        if (family != AF_INET_) {                        /* §M90 3a stage e */
+            static const uint8_t ll[16] = { 0xfe, 0x80 };
+            for (int i = 0; i < l.n; i++) {
+                struct net_device* d = l.d[i];
+                if (d->admin_down) continue;
+                if (!is_lo(d)) put_route6(b, ll, 64, NULL, d->ifindex, 0, seq, pid);
+                for (int k = 0; k < d->n_ip6; k++) {
+                    uint8_t p[16];
+                    prefix6(d->ip6[k], d->ip6_plen[k], p);
+                    put_route6(b, p, d->ip6_plen[k], NULL, d->ifindex, 0, seq, pid);
+                }
+            }
+            struct net6_rt r6;
+            for (int i = 0; net6_route_at(i, &r6) == 0; i++)
+                if (r6.used && r6.ns == s->netns && r6.dev)
+                    put_route6(b, r6.pfx, r6.plen, r6.gw, r6.dev->ifindex, 0, seq, pid);
         }
         put_done(b, seq, pid);
         return;
@@ -783,6 +905,66 @@ static void cmd_nltest(const char* args) {
         kprintf("nltest: bridge create %d, again %d (want -17), address %d, up+addressed %s, delete %d, gone %s\n",
                 mk, again, ad, up ? "yes" : "NO", del, gone ? "yes" : "NO");
         if (mk != 0 || again != -17 || ad != 0 || !up || del != 0 || !gone) ok = 0;
+    }
+
+    /* §M90 3a stage e — IPv6 over rtnetlink: an address added with NEWADDR
+     * appears in an AF_INET6 dump; a default route added with NEWROUTE is
+     * what a v6 RouteGet answers with. */
+    {
+        int ln = net_ns_create();                         /* a scratch namespace ... */
+        struct net_device* d = ln > 0 ? net_find_ns(ln, "lo") : NULL;   /* ... and its loopback */
+        struct nlsock* s6 = NULL;
+        int ad = -999, found = 0, rt = -999, gwok = 0;
+        if (d) {
+            s6 = nl_create(0);
+            if (s6) s6->netns = ln;                       /* a socket made in that namespace */
+        }
+        uint8_t* q = (uint8_t*)kmalloc(128);
+        if (s6 && q && d) {
+            d->admin_down = 0;
+            for (int i = 0; i < 128; i++) q[i] = 0;
+            q[16] = AF_INET6_; q[17] = 64; w32(q + 20, (uint32_t)d->ifindex);
+            w16(q + 24, 20); w16(q + 26, 2 /* IFA_LOCAL */);
+            q[28] = 0xfd; q[29] = 0x00; q[30] = 0x00; q[31] = 0x42; q[43] = 0x01;   /* fd00:42::1 */
+            w32(q, 44); w16(q + 4, RTM_NEWADDR); w16(q + 6, 1 | F_ACK | 0x400); w32(q + 8, 96);
+            n = (nl_send(s6, q, 44) == 44) ? (int)nl_recv(s6, rx, NL_DGRAM, 0, 0, 0) : -1;
+            ad = (n >= 20 && r16(rx + 4) == NLMSG_ERROR) ? (int)r32(rx + 16) : -999;
+            n = nlt_ask(s6, 22 /* RTM_GETADDR */, F_DUMP, AF_INET6_, rx, NL_DGRAM);
+            for (int off = 0; n > 0 && off + 16 <= n; ) {
+                uint32_t len2 = r32(rx + off);
+                if (len2 < 16) break;
+                if (r16(rx + off + 4) == RTM_NEWADDR && rx[off + 16] == AF_INET6_) {
+                    uint16_t al; const uint8_t* a = find_attr(rx + off + 24, len2 - 24, 1, &al);
+                    if (a && al == 16 && a[0] == 0xfd && a[3] == 0x42 && a[15] == 1 && rx[off + 17] == 64) found = 1;
+                }
+                off += (len2 + 3) & ~3u;
+            }
+            /* NEWROUTE ::/0 via fd00:42::fe dev d */
+            for (int i = 0; i < 128; i++) q[i] = 0;
+            q[16] = AF_INET6_; q[17] = 0; q[20] = 254; q[21] = 3; q[23] = 1;
+            w16(q + 28, 20); w16(q + 30, 5 /* RTA_GATEWAY */);
+            q[32] = 0xfd; q[35] = 0x42; q[47] = 0xfe;
+            w16(q + 48, 8); w16(q + 50, 4 /* RTA_OIF */); w32(q + 52, (uint32_t)d->ifindex);
+            w32(q, 56); w16(q + 4, RTM_NEWROUTE); w16(q + 6, 1 | F_ACK | 0x400); w32(q + 8, 97);
+            n = (nl_send(s6, q, 56) == 56) ? (int)nl_recv(s6, rx, NL_DGRAM, 0, 0, 0) : -1;
+            rt = (n >= 20 && r16(rx + 4) == NLMSG_ERROR) ? (int)r32(rx + 16) : -999;
+            /* RouteGet 2001:db8::1 */
+            for (int i = 0; i < 128; i++) q[i] = 0;
+            w32(q, 48); w16(q + 4, 26); w16(q + 6, 1); w32(q + 8, 98);
+            q[16] = AF_INET6_; q[17] = 128;
+            w16(q + 28, 20); w16(q + 30, 1); q[32] = 0x20; q[33] = 0x01; q[34] = 0x0d; q[35] = 0xb8; q[47] = 1;
+            n = (nl_send(s6, q, 48) == 48) ? (int)nl_recv(s6, rx, NL_DGRAM, 0, 0, 0) : -1;
+            if (n > 16 && r16(rx + 4) == RTM_NEWROUTE) {
+                uint16_t al; const uint8_t* g = find_attr(rx + 28, r32(rx) - 28, 5, &al);
+                gwok = g && al == 16 && g[0] == 0xfd && g[15] == 0xfe;
+            }
+        }
+        if (q) kfree(q);
+        if (s6) nl_close(s6);
+        if (ln > 0) net_ns_destroy(ln);
+        kprintf("nltest: v6 NEWADDR %d, in the AF_INET6 dump %s, NEWROUTE default %d, RouteGet via the gateway %s\n",
+                ad, found ? "yes" : "NO", rt, gwok ? "yes" : "NO");
+        if (ad != 0 || !found || rt != 0 || !gwok) ok = 0;
     }
 
     /* §M90 rung 5 — RouteGet: a non-dump GETROUTE answers ONE route. */

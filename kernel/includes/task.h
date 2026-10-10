@@ -105,6 +105,7 @@ enum task_state {
     TASK_STOPPED,
 };
 
+#define TASK_AUXV_MAX 18
 struct task {
     char     name[TASK_NAME_MAX + 1];
 
@@ -602,6 +603,21 @@ struct task {
      * it), the switch charges the remainder; this mark stops the two from
      * charging the same milliseconds twice. */
     uint64_t    cg_cpu_mark_ms;
+    /* §M90 — the auxiliary vector this process was started with, kept for
+     * /proc/<pid>/auxv (Linux's saved_auxv): Go's x/sys/cpu reads it to learn
+     * the CPU's features and, when it cannot, falls back to probing them in
+     * ways that need more of the kernel.  Pairs, AT_NULL included; inherited
+     * by a fork (same image), replaced by an exec. */
+    uintptr_t   auxv[2 * TASK_AUXV_MAX];
+    uint8_t     auxv_n;                 /* WORDS used */
+    /* §M90 — the signal that killed it (0 = it exited), task_exit_signal. */
+    int         exit_sig;
+    /* §M90 — rt_sigsuspend's "saved_sigmask" (Linux's): the mask in force
+     * BEFORE the suspend.  The handler that ends the suspend runs under the
+     * suspend's mask and its frame records THIS one, so sigreturn restores
+     * it; if no handler runs, the next delivery check restores it. */
+    uint64_t    sigsusp_saved;
+    uint8_t     sigsusp_armed;
 };
 
 /* §M90 — the process a task belongs to: its own pid unless it is a thread. */
@@ -782,6 +798,9 @@ int task_wait(int pid, int* code);
  * none has exited.  Waits are by PROCESS (task_tgid) and never count threads. */
 int task_wait_ex(int pid, int* code, int nohang);
 int task_wait_ex2(int pid, int* code, int nohang, int* vnr_out);   /* §M90 */
+int task_wait_ex3(int pid, int* code, int nohang, int* vnr_out, int* sig_out);
+void task_exit_signal(int sig) __attribute__((noreturn));          /* §M90 — killed by `sig` */
+void task_exit_group_signal(int sig) __attribute__((noreturn));    /* §M90 — the whole process */
 struct vmm_space;
 int task_space_handoff(struct task* owner, struct vmm_space* s);   /* §M90 */
 

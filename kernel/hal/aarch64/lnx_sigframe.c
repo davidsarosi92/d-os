@@ -163,7 +163,7 @@ void lnx_signal_deliver(void* frame) {
         vma_explain(d.sp - 4096);
         vma_explain(d.sp - 8192);
         fd_close_all();
-        task_exit_code(128 + 11);
+        task_exit_signal(11);
     }
 }
 
@@ -206,7 +206,7 @@ void lnx_rt_sigreturn(void* frame) {
     uintptr_t uc = fr + UC_OFF;
     if (!t || !vmm_user_access_ok(fr, FRAME_SIZE, 0)) {
         fd_close_all();
-        task_exit_code(128 + 11);
+        task_exit_signal(11);
     }
     uintptr_t mc = uc + UC_MCTX;
     for (int i = 0; i < 31; i++) f->x[i] = rd64(mc + MC_REGS + (uintptr_t)i * 8);

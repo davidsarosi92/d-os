@@ -80,6 +80,7 @@
 #include "config.h"
 #include "settings.h"
 #include "net.h"
+#include "packet.h"
 #include "hal.h"
 #include "hal_api.h"
 #include "printf.h"
@@ -250,6 +251,9 @@ void net_ns_destroy(int ns) {
 
 int net_register(struct net_device* dev) {
     dev->next = NULL;
+    net6_dev_init(dev);                          /* §M90 3a — link-local / ::1 */
+    /* Linked INSIDE the stack lock: the pump walks the list under it. */
+    uint32_t rf = net_lock();
     if (!dev->ifindex) dev->ifindex = g_next_ifindex++;
     if (!g_head) { g_head = dev; }
     else {
@@ -257,6 +261,7 @@ int net_register(struct net_device* dev) {
         while (n->next) n = n->next;
         n->next = dev;
     }
+    net_unlock(rf);
     char ipb[16], macb[18];
     net_fmt_ip(dev->ip, ipb); net_fmt_mac(dev->mac, macb);
     kprintf("net: registered %s mac=%s ip=%s\n", dev->name, macb, ipb);
@@ -276,17 +281,30 @@ int net_register(struct net_device* dev) {
  * delivered before the unlink or never starts.  A DMA-capable NIC would need
  * the audio treatment, and the driver that tries should be made to add it
  * rather than to copy this comment. */
+static void tcp_dev_gone_locked(struct net_device* dev);   /* below, with the table */
 int net_unregister(struct net_device* dev) {
     if (!dev) return -1;
     uint32_t lf = net_lock();
     net_routes_drop_dev(dev);
     arp_drop_dev_locked(dev);                 /* a pointer that must not outlive it */
-    net_unlock(lf);
+    /* §M90 — every TCP connection on it ends HERE, as a reset.  A connection
+     * holds `dev` for its whole life; one still closing when its device went
+     * (FIN_WAIT, LAST_ACK, an unacknowledged FIN after `docker rm` or a
+     * namespace's end) used to retransmit 200 ms later through the freed
+     * device — a jump through whatever the allocator had put there (x86_64:
+     * `invalid opcode at rip 3` in the idle task, after `netnstest`).  Linux
+     * loses the route and the connection then times out; here the device
+     * pointer would dangle, so the end is immediate. */
+    tcp_dev_gone_locked(dev);
+    net6_dev_gone_locked(dev);                   /* neighbours, routes, held packets */
+    /* Off the device list INSIDE the lock: the pump walks g_head under it,
+     * and an unlink racing that walk hands it a device about to be freed. */
     struct net_device** pp = &g_head;
     while (*pp && *pp != dev) pp = &(*pp)->next;
-    if (!*pp) return -1;                         /* not registered */
-    *pp = dev->next;
-    dev->next = NULL;
+    int found = *pp != NULL;
+    if (found) { *pp = dev->next; dev->next = NULL; }
+    net_unlock(lf);
+    if (!found) return -1;                       /* not registered */
     kprintf("net: unregistered %s\n", dev->name);
     return 0;
 }
@@ -881,9 +899,48 @@ static int arp_cache_get(struct net_device* dev, uint32_t ip, uint8_t* mac) {
         if (g_arp[i].valid && g_arp[i].ip == ip && g_arp[i].dev == dev) { mac_copy(mac, g_arp[i].mac); return 0; }
     return -1;
 }
+static void arp_hold_drop_dev(struct net_device* dev);
 /* A device moved or destroyed: what it learned is no longer true. */
 static void arp_drop_dev_locked(struct net_device* dev) {
     for (int i = 0; i < ARP_CACHE_SIZE; i++) if (g_arp[i].dev == dev) g_arp[i].valid = 0;
+    arp_hold_drop_dev(dev);                        /* held packets for it too */
+}
+
+/* §M90 rung 5 — packets FORWARDED to a next hop whose MAC is being asked for:
+ * held until the ARP reply (arp_input releases them) or until they are 3 s
+ * old.  A few slots, as Linux's per-neighbour queue is a few packets. */
+#define ARP_HOLD_SLOTS 8
+#define ARP_HOLD_MS    3000
+static struct { int used; struct net_device* dev; uint32_t nh; uint32_t len; uint64_t ms;
+                uint8_t data[ETH_MTU]; } g_arp_hold[ARP_HOLD_SLOTS];
+static uint32_t g_arp_held, g_arp_released;
+
+static int arp_hold_locked(struct net_device* dev, uint32_t nh, const uint8_t* pkt, uint32_t len) {
+    if (len > ETH_MTU) return -1;
+    uint64_t now = timer_ticks_ms();
+    int slot = -1;
+    for (int i = 0; i < ARP_HOLD_SLOTS; i++) {
+        if (g_arp_hold[i].used && now - g_arp_hold[i].ms > ARP_HOLD_MS) g_arp_hold[i].used = 0;
+        if (!g_arp_hold[i].used && slot < 0) slot = i;
+    }
+    if (slot < 0) return -1;                       /* full: dropped (counted) */
+    g_arp_hold[slot].used = 1; g_arp_hold[slot].dev = dev; g_arp_hold[slot].nh = nh;
+    g_arp_hold[slot].len = len; g_arp_hold[slot].ms = now;
+    for (uint32_t i = 0; i < len; i++) g_arp_hold[slot].data[i] = pkt[i];
+    g_arp_held++;
+    return 0;
+}
+static void arp_hold_drop_dev(struct net_device* dev) {
+    for (int i = 0; i < ARP_HOLD_SLOTS; i++) if (g_arp_hold[i].dev == dev) g_arp_hold[i].used = 0;
+}
+/* `ip` on `dev` just became known: send what waited for it. */
+static void arp_release_locked(struct net_device* dev, uint32_t ip, const uint8_t* mac) {
+    for (int i = 0; i < ARP_HOLD_SLOTS; i++) {
+        if (!g_arp_hold[i].used || g_arp_hold[i].dev != dev || g_arp_hold[i].nh != ip) continue;
+        g_arp_hold[i].used = 0;
+        eth_send_locked(dev, mac, ETHERTYPE_IPV4, g_arp_hold[i].data, g_arp_hold[i].len);
+        g_arp_released++;
+    }
 }
 
 int net_dev_set_ns(struct net_device* dev, int ns) {
@@ -924,6 +981,7 @@ static void arp_input(struct net_device* dev, const uint8_t* p, uint32_t len) {
 
     /* Learn the sender either way. */
     arp_cache_put(dev, spa, a->sha);
+    arp_release_locked(dev, spa, a->sha);          /* §M90 — packets waiting for it */
 
     if (ntohs(a->oper) == ARP_OP_REQUEST && tpa == dev->ip) {
         /* Somebody wants our MAC → reply to the sender.  We already hold the
@@ -1172,6 +1230,33 @@ static void udp_input(struct net_device* dev, uint32_t src_ip,
             g_udp[i].fn(src_ip, sport, data, dlen, g_udp[i].ctx);
             return;
         }
+}
+
+/* ----------------------- §M90 — ICMP sockets ------------------------------- */
+
+/* A copy of every ICMP packet for a local address goes to each listener of
+ * the receiving device's namespace: SOCK_RAW/IPPROTO_ICMP and the ping socket
+ * (SOCK_DGRAM/IPPROTO_ICMP) of usyscall.c filter what they keep.  The kernel's
+ * own echo replies and its `ping` are unaffected. */
+#define ICMP_LISTENERS 32
+static struct { int used, ns; icmp_recv_fn fn; void* ctx; } g_icmpl[ICMP_LISTENERS];
+
+int net_icmp_listen(int ns, icmp_recv_fn fn, void* ctx) {
+    uint32_t f = net_lock();
+    int r = -1;
+    for (int i = 0; i < ICMP_LISTENERS; i++)
+        if (!g_icmpl[i].used) { g_icmpl[i].used = 1; g_icmpl[i].ns = ns; g_icmpl[i].fn = fn; g_icmpl[i].ctx = ctx; r = 0; break; }
+    net_unlock(f);
+    return r;
+}
+void net_icmp_unlisten(void* ctx) {
+    uint32_t f = net_lock();
+    for (int i = 0; i < ICMP_LISTENERS; i++) if (g_icmpl[i].used && g_icmpl[i].ctx == ctx) g_icmpl[i].used = 0;
+    net_unlock(f);
+}
+static void icmp_deliver_locked(struct net_device* dev, uint32_t src, const uint8_t* ip, uint32_t total) {
+    for (int i = 0; i < ICMP_LISTENERS; i++)
+        if (g_icmpl[i].used && g_icmpl[i].ns == dev->netns) g_icmpl[i].fn(src, ip, total, g_icmpl[i].ctx);
 }
 
 /* ----------------------- DNS stub resolver -------------------------------- */
@@ -1432,9 +1517,34 @@ struct tcp_conn {
      * asserts on `retrans`, which is the only way to tell a recovery from a
      * link that never lost anything. */
     uint32_t tx_segs, rx_segs, retrans;
+
+    /* §M90 3a — IPv6.  `fam6` = the connection runs over IPv6 and its ends
+     * are l6/p6 (local_ip/peer_ip stay 0).  On a LISTENER, fam6 means it was
+     * opened on an IPv6 socket, and `v6only` = 0 makes it DUAL-STACK: it also
+     * accepts IPv4 (the child is then an ordinary IPv4 connection; the socket
+     * layer shows its addresses as ::ffff:a.b.c.d). */
+    uint8_t  fam6, v6only;
+    uint8_t  l6[16], p6[16];
 };
 
 static struct tcp_conn g_conns[TCP_MAX_CONNS];
+
+/* §M90 — a device is going: the connections on it end as resets (see
+ * net_unregister).  Stack lock held. */
+static void tcp_dev_gone_locked(struct net_device* dev) {
+    int gone = 0;
+    for (int i = 0; i < TCP_MAX_CONNS; i++) {
+        struct tcp_conn* c = &g_conns[i];
+        if (!c->used || c->dev != dev) continue;
+        c->dev = NULL;
+        c->reset = 1;
+        c->peer_fin = 1;
+        if (!c->listener) c->state = TCP_ST_CLOSED;
+        c->rto_deadline_ns = 0;
+        gone++;
+    }
+    if (gone) waitq_wake_all(&g_netwq);         /* their readers see the reset */
+}
 static uint32_t g_tcp_ephem = 0;
 static uint32_t g_tcp_isn   = 0x2000;
 static uint32_t g_tcp_rst_sent, g_tcp_rst_rcvd, g_tcp_dropped;
@@ -1474,6 +1584,8 @@ static struct tcp_conn* tcp_alloc_locked(void) {
         c->aq_head = c->aq_tail = c->backlog = 0;
         c->parent = NULL;
         c->tx_segs = c->rx_segs = c->retrans = 0;
+        c->fam6 = c->v6only = 0;
+        for (int k = 0; k < 16; k++) c->l6[k] = c->p6[k] = 0;
         return c;
     }
     return NULL;
@@ -1485,6 +1597,32 @@ static void tcp_free_locked(struct tcp_conn* c) {
     c->used  = 0;
 }
 
+/* §M90 3a — the IPv6 addresses of the segment being handled, set by
+ * net_l4_input6 for the length of ONE delivery (the RX path holds the stack
+ * lock throughout, so nothing else can see them); NULL = an IPv4 segment.
+ * This is what lets tcp_input/udp_input serve both families unchanged. */
+static const uint8_t* g_in6_src;
+static const uint8_t* g_in6_dst;
+const uint8_t* net_rx_src6(void) { return g_in6_src; }
+const uint8_t* net_rx_dst6(void) { return g_in6_dst; }
+static int a6z(const uint8_t* a) { for (int i = 0; i < 16; i++) if (a[i]) return 0; return 1; }
+static int a6e(const uint8_t* a, const uint8_t* b) { for (int i = 0; i < 16; i++) if (a[i] != b[i]) return 0; return 1; }
+static void a6c(uint8_t* d, const uint8_t* s_) { for (int i = 0; i < 16; i++) d[i] = s_[i]; }
+
+/* Which families a connection-table entry holds its port in: bit 0 = IPv4,
+ * bit 1 = IPv6.  A dual-stack listener holds both — so an IPv4 listener and
+ * a v6-only one may share a port (Docker's proxy opens 0.0.0.0:P and [::]:P),
+ * while two listeners in one family may not. */
+static int tcp_fam_mask(const struct tcp_conn* c) {
+    if (!c->fam6) return 1;
+    return c->listener && !c->v6only ? 3 : 2;
+}
+static int tcp_port_clash_locked(int ns, uint16_t port, int mask) {
+    for (int i = 0; i < TCP_MAX_CONNS; i++)
+        if (g_conns[i].used && g_conns[i].netns == ns && g_conns[i].local_port == port &&
+            (tcp_fam_mask(&g_conns[i]) & mask)) return 1;
+    return 0;
+}
 static int tcp_port_taken_locked(int ns, uint16_t port) {
     for (int i = 0; i < TCP_MAX_CONNS; i++)
         if (g_conns[i].used && g_conns[i].netns == ns && g_conns[i].local_port == port) return 1;
@@ -1506,20 +1644,30 @@ static uint16_t tcp_ephem_port_locked(int ns) {
  * into the accept queue. */
 static struct tcp_conn* tcp_lookup_locked(int ns, uint32_t local_ip, uint16_t local_port,
                                           uint32_t peer_ip, uint16_t peer_port) {
+    const uint8_t* s6 = g_in6_src;                /* §M90 3a — an IPv6 segment? */
+    const uint8_t* d6 = g_in6_dst;
     for (int i = 0; i < TCP_MAX_CONNS; i++) {
         struct tcp_conn* c = &g_conns[i];
         if (!c->used || c->listener || c->netns != ns) continue;
-        if (c->local_port == local_port && c->peer_port == peer_port &&
-            c->peer_ip == peer_ip &&
-            (c->local_ip == local_ip || c->local_ip == 0)) return c;
+        if (c->local_port != local_port || c->peer_port != peer_port) continue;
+        if (s6) {
+            if (c->fam6 && a6e(c->p6, s6) && (a6e(c->l6, d6) || a6z(c->l6))) return c;
+        } else if (!c->fam6 && c->peer_ip == peer_ip &&
+                   (c->local_ip == local_ip || c->local_ip == 0)) return c;
     }
+    /* listeners: an exact family match first, then a dual-stack v6 one for v4 */
+    struct tcp_conn* dual = NULL;
     for (int i = 0; i < TCP_MAX_CONNS; i++) {
         struct tcp_conn* c = &g_conns[i];
         if (!c->used || !c->listener || c->state != TCP_ST_LISTEN || c->netns != ns) continue;
         if (c->local_port != local_port) continue;
-        if (c->local_ip == 0 || c->local_ip == local_ip) return c;   /* 0.0.0.0 */
+        if (s6) {
+            if (c->fam6 && (a6z(c->l6) || a6e(c->l6, d6))) return c;
+        } else if (!c->fam6) {
+            if (c->local_ip == 0 || c->local_ip == local_ip) return c;   /* 0.0.0.0 */
+        } else if (!c->v6only && a6z(c->l6)) dual = c;
     }
-    return NULL;
+    return dual;
 }
 
 /* ----------------------- output ------------------------------------------- */
@@ -1569,8 +1717,13 @@ static int tcp_emit_locked(struct tcp_conn* c, uint32_t seq, uint8_t flags,
     th->checksum = 0;
     th->urgent   = 0;
     for (uint32_t i = 0; i < len; i++) seg[sizeof(struct tcp_hdr) + i] = data[i];
-    th->checksum = tcp_checksum(c->local_ip, c->peer_ip, seg, total);
     c->tx_segs++;
+    if (c->fam6) {                                /* §M90 3a */
+        uint16_t cs = net6_csum(c->l6, c->p6, IP_PROTO_TCP, seg, total);
+        seg[16] = (uint8_t)(cs >> 8); seg[17] = (uint8_t)cs;
+        return net6_emit_locked(c->dev, c->peer_mac, c->l6, c->p6, IP_PROTO_TCP, seg, total);
+    }
+    th->checksum = tcp_checksum(c->local_ip, c->peer_ip, seg, total);
     return ipv4_emit_locked(c->dev, c->peer_mac, c->local_ip, c->peer_ip,
                             IP_PROTO_TCP, seg, total);
 }
@@ -1607,8 +1760,14 @@ static void tcp_send_rst_locked(struct net_device* dev, const uint8_t* via_mac,
         r->ack   = htonl(ntohl(th->seq) + dlen);
         r->flags = TCP_RST | TCP_ACK;
     }
-    r->checksum = tcp_checksum(local_ip, peer_ip, seg, sizeof(seg));
     g_tcp_rst_sent++;
+    if (g_in6_src) {                              /* §M90 3a — answering a v6 segment */
+        uint16_t cs = net6_csum(g_in6_dst, g_in6_src, IP_PROTO_TCP, seg, sizeof(seg));
+        seg[16] = (uint8_t)(cs >> 8); seg[17] = (uint8_t)cs;
+        net6_emit_locked(dev, via_mac, g_in6_dst, g_in6_src, IP_PROTO_TCP, seg, sizeof(seg));
+        return;
+    }
+    r->checksum = tcp_checksum(local_ip, peer_ip, seg, sizeof(seg));
     ipv4_emit_locked(dev, via_mac, local_ip, peer_ip, IP_PROTO_TCP, seg, sizeof(seg));
 }
 
@@ -1648,6 +1807,7 @@ static void tcp_output_locked(struct tcp_conn* c) {
         c->state != TCP_ST_FIN_WAIT_1  && c->state != TCP_ST_LAST_ACK) return;
 
     uint32_t mss = c->dev->mtu - sizeof(struct ipv4_hdr) - sizeof(struct tcp_hdr);
+    if (c->fam6) mss -= 20;                        /* §M90 3a — the v6 header is 40 */
     if (mss > TCP_MSS_CAP) mss = TCP_MSS_CAP;
 
     for (;;) {
@@ -1760,6 +1920,7 @@ static void tcp_input(struct net_device* dev, const uint8_t* src_mac,
         n->local_port = dport;
         n->peer_ip    = src_ip;
         n->peer_port  = sport;
+        if (g_in6_src) { n->fam6 = 1; a6c(n->l6, g_in6_dst); a6c(n->p6, g_in6_src); }
         mac_copy(n->peer_mac, src_mac);         /* the correct next hop, free  */
         n->parent     = c;
         n->rcv_nxt    = seq + 1;                /* their SYN consumes a seq    */
@@ -1927,6 +2088,7 @@ static void tcp_sweep_locked(void) {
             uint32_t mss = c->dev ? c->dev->mtu - sizeof(struct ipv4_hdr)
                                                 - sizeof(struct tcp_hdr) : TCP_MSS_CAP;
             if (mss > TCP_MSS_CAP) mss = TCP_MSS_CAP;
+            if (c->fam6) mss -= 20;                    /* §M90 3a */
 
             if (c->state == TCP_ST_SYN_SENT) {
                 tcp_emit_locked(c, c->snd_una, TCP_SYN, NULL, 0);
@@ -2128,7 +2290,12 @@ struct tcp_conn* net_tcp_listen(uint32_t local_ip, uint16_t port, int backlog) {
 struct tcp_conn* net_tcp_listen_ns(int ns, uint32_t local_ip, uint16_t port, int backlog) {
     tcp_sweeper_ensure();
     uint32_t f = net_lock();
-    if (tcp_port_taken_locked(ns, port)) { net_unlock(f); return NULL; }
+    /* §M90 — port 0 (or a listen with no bind) asks for an EPHEMERAL port, as
+     * on Linux: containerd's CRI streaming server listens on 127.0.0.1:0 and
+     * died "listen: invalid argument" — unseen until the personality's
+     * version let that plugin load.  The caller reads the port back. */
+    if (!port) port = tcp_ephem_port_locked(ns);
+    if (!port || tcp_port_clash_locked(ns, port, 1)) { net_unlock(f); return NULL; }
     struct tcp_conn* l = tcp_alloc_locked();
     if (!l) { net_unlock(f); return NULL; }
     l->netns      = ns;
@@ -2277,6 +2444,111 @@ void net_tcp_peer(struct tcp_conn* c, uint32_t* ip, uint16_t* port) {
     if (ip)   *ip   = c->peer_ip;
     if (port) *port = c->peer_port;
     net_unlock(f);
+}
+
+/* ---- §M90 3a stage c — the IPv6 side of the transport --------------------- */
+
+void net_l4_input6(struct net_device* dev, const uint8_t* src_mac, const uint8_t* src,
+                   const uint8_t* dst, uint8_t nh, const uint8_t* l4, uint32_t len) {
+    /* IPv6 has no header checksum, so the upper layer's is mandatory — a UDP
+     * checksum of 0 is invalid over v6 (RFC 8200 §8.1). */
+    if (net6_csum(src, dst, nh, l4, len) != 0) { g_tcp_dropped++; return; }
+    g_in6_src = src; g_in6_dst = dst;
+    if (nh == IP_PROTO_TCP) tcp_input(dev, src_mac, 0, 0, l4, len);
+    else if (nh == IP_PROTO_UDP) udp_input(dev, 0, l4, len);
+    g_in6_src = g_in6_dst = NULL;
+}
+
+struct tcp_conn* net_tcp_connect6_ns(int ns, struct net_device* scope, const uint8_t dst[16],
+                                     uint16_t port, uint32_t timeout_ms) {
+    struct net_device* dev = NULL;
+    uint8_t mac[ETH_ALEN], src[16];
+    if (net6_prepare(ns, scope, dst, &dev, mac, src) != 0) return NULL;   /* blocks: unlocked */
+    tcp_sweeper_ensure();
+    uint32_t f = net_lock();
+    struct tcp_conn* c = tcp_alloc_locked();
+    if (!c) { net_unlock(f); return NULL; }
+    c->dev = dev; c->netns = ns; c->fam6 = 1;
+    a6c(c->l6, src); a6c(c->p6, dst);
+    c->local_port = tcp_ephem_port_locked(ns);
+    c->peer_port  = port;
+    mac_copy(c->peer_mac, mac);
+    c->snd_una = c->snd_nxt = (g_tcp_isn += 0x10000);
+    c->snd_wnd = 1440;
+    c->state   = TCP_ST_SYN_SENT;
+    tcp_emit_locked(c, c->snd_nxt, TCP_SYN, NULL, 0);
+    c->snd_nxt += 1;
+    tcp_arm_rto_locked(c);
+    net_unlock(f);
+    struct tcp_wait w = { c };
+    net_wait_cond(tcp_estab_cond, &w, timeout_ms ? timeout_ms : TCP_CONNECT_MS);
+    f = net_lock();
+    int ok = (c->state == TCP_ST_ESTABLISHED);
+    if (!ok) { tcp_free_locked(c); c = NULL; }
+    net_unlock(f);
+    return c;
+}
+
+struct tcp_conn* net_tcp_listen6_ns(int ns, const uint8_t local[16], uint16_t port,
+                                    int backlog, int v6only) {
+    tcp_sweeper_ensure();
+    uint32_t f = net_lock();
+    if (!port) port = tcp_ephem_port_locked(ns);
+    int mask = v6only || (local && !a6z(local)) ? 2 : 3;
+    if (!port || tcp_port_clash_locked(ns, port, mask)) { net_unlock(f); return NULL; }
+    struct tcp_conn* l = tcp_alloc_locked();
+    if (!l) { net_unlock(f); return NULL; }
+    l->netns = ns; l->listener = 1; l->state = TCP_ST_LISTEN;
+    l->fam6 = 1; l->v6only = (uint8_t)(mask == 2);
+    if (local) a6c(l->l6, local);
+    l->local_port = port;
+    l->backlog = (uint8_t)(backlog <= 0 || backlog > TCP_ACCEPTQ - 1 ? TCP_ACCEPTQ - 1 : backlog);
+    net_unlock(f);
+    return l;
+}
+
+int net_tcp_peer6(struct tcp_conn* c, uint8_t a6[16], uint16_t* port) {
+    if (!c || !c->used) return -1;
+    uint32_t f = net_lock();
+    int is6 = c->fam6;
+    if (is6 && a6) a6c(a6, c->p6);
+    if (port) *port = c->peer_port;
+    net_unlock(f);
+    return is6;
+}
+int net_tcp_local6(struct tcp_conn* c, uint8_t a6[16], uint16_t* port) {
+    if (!c || !c->used) return -1;
+    uint32_t f = net_lock();
+    int is6 = c->fam6;
+    if (is6 && a6) a6c(a6, c->l6);
+    if (port) *port = c->local_port;
+    net_unlock(f);
+    return is6;
+}
+
+int net_udp_send6_ns(int ns, struct net_device* scope, const uint8_t dst[16],
+                     uint16_t sport, uint16_t dport, const void* data, uint32_t len) {
+    static uint8_t buf[ETH_MTU];
+    uint32_t total = sizeof(struct udp_hdr) + len;
+    if (total + 40 > ETH_MTU) return -90;                         /* EMSGSIZE */
+    struct net_device* dev = NULL;
+    uint8_t mac[ETH_ALEN], src[16];
+    int pr = net6_prepare(ns, scope, dst, &dev, mac, src);
+    if (pr) return pr == -1 ? -101 : -113;                        /* ENETUNREACH / EHOSTUNREACH */
+    uint32_t f = net_lock();
+    struct udp_hdr* uh = (struct udp_hdr*)buf;
+    uh->src_port = htons(sport);
+    uh->dst_port = htons(dport);
+    uh->len      = htons((uint16_t)total);
+    uh->checksum = 0;
+    const uint8_t* p = (const uint8_t*)data;
+    for (uint32_t i = 0; i < len; i++) buf[sizeof(struct udp_hdr) + i] = p[i];
+    uint16_t cs = net6_csum(src, dst, IP_PROTO_UDP, buf, total);
+    if (!cs) cs = 0xffff;                                        /* 0 means "none": not allowed */
+    buf[6] = (uint8_t)(cs >> 8); buf[7] = (uint8_t)cs;
+    int rc = net6_emit_locked(dev, mac, src, dst, IP_PROTO_UDP, buf, total);
+    net_unlock(f);
+    return rc;
 }
 
 void net_tcp_local(struct tcp_conn* c, uint32_t* ip, uint16_t* port) {
@@ -2494,8 +2766,9 @@ int net_ipv4_send(struct net_device* dev, uint32_t dst_ip, uint8_t proto,
  * namespace, off by default as on Linux — Docker turns it on): routed in the
  * same namespace, TTL decremented, out of the route's device.  The next hop's
  * MAC must already be known: the RX path cannot wait, so a miss sends an ARP
- * request and DROPS this packet (TCP's retransmit and every resolver's retry
- * then find the answer).  Linux queues the packet instead.
+ * request and HOLDS the packet (ARP_HOLD_SLOTS, ARP_HOLD_MS) until the reply
+ * arrives, as Linux queues it — dropping it made every first SYN through the
+ * host cost a full retransmit timeout.
  *
  * MASQUERADE.  Docker's default network relies on an iptables rule —
  * MASQUERADE for its subnet leaving through anything but docker0 — and this
@@ -2684,8 +2957,11 @@ static void fwd_emit_locked(int ns, struct net_device* in, uint32_t ihl, uint32_
     ip_fix(ip, ihl);
     uint8_t mac[ETH_ALEN];
     if (arp_cache_get(out, nh, mac) != 0) {
+        /* Not known yet: ask, and HOLD the packet until the answer (Linux's
+         * neighbour queue) — dropping it cost every new flow its first
+         * packet, i.e. a TCP SYN retransmit (a second) per connection. */
         arp_send_locked(out, ARP_OP_REQUEST, BCAST_MAC, nh);
-        g_fwd_noarp++;
+        if (arp_hold_locked(out, nh, ip, total) != 0) g_fwd_noarp++;
         return;
     }
     eth_send_locked(out, mac, ETHERTYPE_IPV4, ip, total);
@@ -2720,6 +2996,7 @@ static int net_unmasq_locked(struct net_device* dev, const uint8_t* p, uint32_t 
     return 1;
 }
 
+uint32_t net_arp_released(void) { return g_arp_released; }
 void net_fwd_stats(uint32_t* fwd, uint32_t* noarp, uint32_t* noroute, uint32_t* nat_out,
                    uint32_t* nat_in, uint32_t* nat_full) {
     if (fwd) *fwd = g_fwd_count;
@@ -2728,6 +3005,12 @@ void net_fwd_stats(uint32_t* fwd, uint32_t* noarp, uint32_t* noroute, uint32_t* 
     if (nat_out) *nat_out = g_nat_out;
     if (nat_in) *nat_in = g_nat_in;
     if (nat_full) *nat_full = g_nat_full;
+}
+
+/* §M90 3a — the L2 send, for net6.c. */
+int net_eth_send_locked(struct net_device* dev, const uint8_t* dst_mac,
+                        uint16_t ethertype, const void* payload, uint32_t len) {
+    return eth_send_locked(dev, dst_mac, ethertype, payload, len);
 }
 
 static void ipv4_input(struct net_device* dev, const uint8_t* src_mac,
@@ -2761,7 +3044,10 @@ static void ipv4_input(struct net_device* dev, const uint8_t* src_mac,
     uint32_t l4len = total - ihl;
 
     switch (ih->proto) {
-        case IP_PROTO_ICMP: icmp_input(dev, src_mac, src, l4, l4len); break;
+        case IP_PROTO_ICMP:
+            icmp_input(dev, src_mac, src, l4, l4len);
+            icmp_deliver_locked(dev, src, p, total);       /* §M90 — ICMP sockets */
+            break;
         case IP_PROTO_UDP:  udp_input (dev, src, l4, l4len); break;
         case IP_PROTO_TCP:  tcp_input (dev, src_mac, src, dst, l4, l4len); break;
         default: break;
@@ -2788,17 +3074,23 @@ void net_rx(struct net_device* dev, const uint8_t* frame, uint32_t len) {
         return;
     }
 
-    /* Accept frames addressed to us or broadcast. */
-    if (!mac_eq(eh->dst, dev->mac) && !mac_eq(eh->dst, BCAST_MAC)) return;
+    /* Accept frames addressed to us or broadcast — and IPv6 multicast
+     * (33:33:…): neighbour discovery is multicast, so a device that drops it
+     * never learns a neighbour.  Not filtered per group: an interface here is
+     * a member of every group it might be asked about. */
+    if (!mac_eq(eh->dst, dev->mac) && !mac_eq(eh->dst, BCAST_MAC)
+        && !(eh->dst[0] == 0x33 && eh->dst[1] == 0x33)) return;
 
     dev->rx_packets++; dev->rx_bytes += len;
     g_rx_frames++;                            /* what net_pump_locked counts */
     const uint8_t* payload = frame + ETH_HLEN;
     uint32_t plen = len - ETH_HLEN;
+    packet_tap_locked(dev, frame, len);       /* §M90 — AF_PACKET sockets */
 
     switch (ntohs(eh->ethertype)) {
         case ETHERTYPE_ARP:  arp_input (dev, payload, plen); break;
         case ETHERTYPE_IPV4: ipv4_input(dev, eh->src, payload, plen); break;
+        case ETHERTYPE_IPV6: ipv6_input(dev, eh->src, payload, plen); break;   /* §M90 3a */
         default: break;
     }
 }
@@ -2984,6 +3276,8 @@ static void gen_net_fwd(struct procfs_writer* w) {
     pw_puts(w, " masq-out "); pw_put_uint(w, no);
     pw_puts(w, " masq-in ");  pw_put_uint(w, ni);
     pw_puts(w, " masq-full "); pw_put_uint(w, nf);
+    pw_puts(w, " arp-held "); pw_put_uint(w, g_arp_held);
+    pw_puts(w, " arp-released "); pw_put_uint(w, g_arp_released);
     pw_putc(w, '\n');
 }
 
@@ -3016,6 +3310,7 @@ void net_procfs_init(void) {
     procfs_register(&nd_net_stat);
     procfs_register(&nd_net_fwd);
     procfs_register(&nd_ip_forward);
+    net6_procfs_init();                         /* §M90 3a — conf/all/{forwarding,disable_ipv6} */
 }
 
 CONFIG_KEY(ck_net_masq) = {

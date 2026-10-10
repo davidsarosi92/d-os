@@ -33,9 +33,8 @@
  *              transmit switches the same way.
  *
  * WHAT IT IS NOT: no STP, no VLANs, no hairpin mode, no IGMP snooping, no MTU
- * enforcement between ports (all are 1500 here), and forwarding DATABASE
- * entries never age (a container's MAC is gone with its veth, which flushes
- * them).
+ * enforcement between ports (all are 1500 here).  Forwarding database entries
+ * age out after 300 s, as Linux's default.
  * ============================================================================= */
 
 #include "net.h"
@@ -57,7 +56,7 @@ struct vdev {
     struct vdev*      peer;             /* veth */
     struct vframe*    q;                /* frames delivered TO this device   */
     uint32_t          qh, qt, qdrop;
-    struct { uint8_t mac[ETH_ALEN]; struct net_device* port; int used; } fdb[FDB_MAX];
+    struct { uint8_t mac[ETH_ALEN]; struct net_device* port; int used; uint64_t ms; } fdb[FDB_MAX];
     struct vdev*      vnext;            /* every virtual device */
 };
 
@@ -130,20 +129,34 @@ static int veth_tx(struct net_device* d, const void* frame, uint32_t len) {
 
 /* ---- bridge -------------------------------------------------------------------- */
 
+/* Entries AGE OUT after 300 s without traffic from that MAC (Linux's default
+ * ageing_time): a station that moved to another port is then flooded and
+ * relearned instead of being sent to its old port forever, and a full table
+ * reuses its oldest entry. */
+#define FDB_AGE_MS 300000u
 static void fdb_learn(struct vdev* br, const uint8_t* mac, struct net_device* port) {
     if (mac_bcast(mac)) return;
+    uint64_t now = timer_ticks_ms();
     for (int i = 0; i < FDB_MAX; i++)
-        if (br->fdb[i].used && mac_eq(br->fdb[i].mac, mac)) { br->fdb[i].port = port; return; }
-    for (int i = 0; i < FDB_MAX; i++)
-        if (!br->fdb[i].used) {
-            br->fdb[i].used = 1; br->fdb[i].port = port;
-            for (int k = 0; k < ETH_ALEN; k++) br->fdb[i].mac[k] = mac[k];
-            return;
-        }
+        if (br->fdb[i].used && mac_eq(br->fdb[i].mac, mac)) { br->fdb[i].port = port; br->fdb[i].ms = now; return; }
+    int slot = -1;
+    uint64_t oldest = ~0ull;
+    for (int i = 0; i < FDB_MAX; i++) {
+        if (br->fdb[i].used && now - br->fdb[i].ms > FDB_AGE_MS) br->fdb[i].used = 0;
+        if (!br->fdb[i].used) { slot = i; break; }
+        if (br->fdb[i].ms < oldest) { oldest = br->fdb[i].ms; slot = i; }
+    }
+    if (slot < 0) return;
+    br->fdb[slot].used = 1; br->fdb[slot].port = port; br->fdb[slot].ms = now;
+    for (int k = 0; k < ETH_ALEN; k++) br->fdb[slot].mac[k] = mac[k];
 }
 static struct net_device* fdb_find(struct vdev* br, const uint8_t* mac) {
-    for (int i = 0; i < FDB_MAX; i++)
-        if (br->fdb[i].used && mac_eq(br->fdb[i].mac, mac)) return br->fdb[i].port;
+    uint64_t now = timer_ticks_ms();
+    for (int i = 0; i < FDB_MAX; i++) {
+        if (!br->fdb[i].used || !mac_eq(br->fdb[i].mac, mac)) continue;
+        if (now - br->fdb[i].ms > FDB_AGE_MS) { br->fdb[i].used = 0; return NULL; }   /* aged out */
+        return br->fdb[i].port;
+    }
     return NULL;
 }
 static void fdb_forget_port(struct vdev* br, struct net_device* port) {
@@ -389,6 +402,29 @@ static void cmd_netnstest(const char* args) {
     NT(l127 && t_talk(A, IPV4(127, 0, 0, 1), 7100, l127), "A's own loopback works");
     NT(net_tcp_connect_ns(B, IPV4(127, 0, 0, 1), 7100, 800) == NULL, "B's 127.0.0.1 is not A's");
     if (l127) net_tcp_close(l127);
+    /* A connection whose DEVICE goes while it is open ends as a reset, and
+     * nothing of it touches the device afterwards: a connection over va/vb,
+     * then the pair destroyed under it.  Before
+     * the fix the closing side kept `dev` and its retransmit ran through the
+     * freed device 200 ms later (x86_64: a jump to rip 3).  This uses the
+     * A/B pair itself, so it comes last for it. */
+    {
+        struct tcp_conn* cc = net_tcp_connect_ns(B, IPV4(10, 9, 0, 1), 7000, 1500);
+        struct tcp_conn* sc = cc ? net_tcp_accept(lA, 1500) : NULL;
+        int ok_open = cc && sc;
+        netvirt_destroy(va);                       /* vb goes with it */
+        va = vb = NULL;
+        int rs = 0, rc = 0;
+        if (cc) net_tcp_state(cc, NULL, NULL, NULL, &rs, NULL);
+        if (sc) net_tcp_state(sc, NULL, NULL, NULL, &rc, NULL);
+        char b1[4];
+        int sendr = cc ? net_tcp_send(cc, "x", 1, 1) : 0;
+        int recvr = sc ? net_tcp_recv(sc, b1, sizeof b1, 1, 0) : 0;
+        NT(ok_open && rs && rc && sendr < 0 && recvr <= 0,
+           "a device destroyed under open connections resets both ends");
+        if (cc) net_tcp_close(cc);
+        if (sc) net_tcp_close(sc);
+    }
     net_tcp_close(lA);
 
     /* the Docker shape */
@@ -420,6 +456,32 @@ static void cmd_netnstest(const char* args) {
         net_fwd_stats(NULL, NULL, NULL, &o1, &i1, NULL);
         net_set_ip_forward(0, was);
         NT(off == 0, "with ip_forward 0 the gateway is unreachable from C");
+        /* Host forwarding between two namespaces, to a next hop the host
+         * has never talked to: the packet must WAIT for the ARP answer,
+         * not be dropped (the connect would then need a SYN retransmit,
+         * a second, and the 800 ms budget below would fail). */
+        int D = net_ns_create();
+        struct net_device *h2 = NULL, *d2 = NULL;
+        if (D > 0 && netvirt_veth_create(0, "vh2-t", D, "eth0", &h2, &d2) == 0) {
+            up(h2, IPV4(10, 7, 0, 1), IPV4(255, 255, 255, 0));
+            up(d2, IPV4(10, 7, 0, 2), IPV4(255, 255, 255, 0));
+            net_route_add(D, 0, 0, IPV4(10, 7, 0, 1), d2, 0);
+            struct net_device* loD = net_find_ns(D, "lo");
+            if (loD) loD->admin_down = 0;
+            net_set_ip_forward(0, 1);
+            uint32_t rel0 = net_arp_released();
+            struct tcp_conn* lD = net_tcp_listen_ns(D, 0, 8002, 4);
+            struct tcp_conn* cc = lD ? net_tcp_connect_ns(C, IPV4(10, 7, 0, 2), 8002, 800) : NULL;
+            struct tcp_conn* sc = cc ? net_tcp_accept(lD, 800) : NULL;
+            NT(cc && sc && net_arp_released() > rel0,
+               "C reaches D through the host's forwarding, the first packet held for ARP");
+            if (sc) net_tcp_close(sc);
+            if (cc) net_tcp_close(cc);
+            if (lD) net_tcp_close(lD);
+        } else {
+            NT(0, "C reaches D through the host's forwarding (setup)");
+        }
+        net_ns_destroy(D);
         NT(on >= 1 && o1 > o0 && i1 > i0, "with ip_forward 1 C reaches the gateway, masqueraded");
         netvirt_destroy(hp);
         NT(net_find_ns(C, "eth0") == NULL, "destroying a veth end destroys its peer");
@@ -459,3 +521,74 @@ static void cmd_netnstest(const char* args) {
 }
 SHELL_CMD(netnstest) = { "netnstest", "", "network namespaces: veth, bridge, isolation, loopback per namespace",
                          SHELL_G_TEST, cmd_netnstest, SHELL_P_ANY };
+
+/* ---- `icmpsocktest` — §M90: ping from a container ----------------------------
+ *
+ *   A ping socket (SOCK_DGRAM/IPPROTO_ICMP) sends an echo to 127.0.0.1 and
+ *   receives the reply carrying ITS id (the kernel rewrote whatever the caller
+ *   put there); a raw socket (SOCK_RAW/IPPROTO_ICMP) sees the whole IP packet.
+ *   Then the namespace rule: a socket made in a namespace whose loopback is
+ *   DOWN cannot reach 127.0.0.1, even after its creator has gone back to the
+ *   machine's namespace where loopback works — a socket belongs to the
+ *   namespace it was made in, not to whoever uses it. */
+#include "syscall.h"
+int sys_socket(int domain, int type, int proto);
+int sys_close(int fd);
+
+static int t_echo(int fd, uint16_t want_id_any, uint8_t* got, int cap) {
+    uint8_t m[16] = { 8, 0, 0, 0, 0x12, 0x34, 0, 1, 'd', '-', 'o', 's', 0, 0, 0, 0 };
+    long w = sys_sendto_k(fd, m, sizeof m, IPV4(127, 0, 0, 1), 0);
+    (void)want_id_any;
+    uint32_t ip = 0;
+    int r = w == (long)sizeof m ? (int)sys_recvfrom_k(fd, got, (size_t)cap, &ip, NULL) : -100;
+    kprintf("icmpsock: sent %d, received %d (type %d)\n", (int)w, r, r > 0 ? got[0] : -1);
+    return r;
+}
+
+static void cmd_icmpsocktest(const char* args) {
+    (void)args;
+    int ok = 1;
+    #define IT(cond, what) do { int _c = (cond); kprintf("icmpsock: %s %s\n", what, _c ? "ok" : "FAIL"); if (!_c) ok = 0; } while (0)
+    uint8_t b[128];
+
+    int p = sys_socket(2, 2, 1);
+    IT(p >= 0, "a ping socket");
+    int r = p >= 0 ? t_echo(p, 0, b, sizeof b) : -1;
+    IT(r >= 16 && b[0] == 0 && b[8] == 'd' && !(b[4] == 0x12 && b[5] == 0x34),
+       "an echo reply arrives, with the kernel's id, not the caller's");
+    if (p >= 0) sys_close(p);
+
+    int s = sys_socket(2, 3, 1);
+    IT(s >= 0, "a raw ICMP socket (CAP_NET_RAW)");
+    r = s >= 0 ? t_echo(s, 0, b, sizeof b) : -1;
+    IT(r >= 36 && (b[0] >> 4) == 4 && b[9] == 1, "a raw socket receives the IP header too");
+    if (s >= 0) sys_close(s);
+
+    struct task* me = task_current();
+    int q = -1;
+    if (ns_unshare(me, NS_CLONE_NEWNET) == 0) {
+        q = sys_socket(2, 2, 1);                    /* made where lo is DOWN */
+        ns_enter(me, NSK_NET, NULL);                /* back to the machine's */
+    }
+    uint8_t m[16] = { 8, 0, 0, 0, 0, 0, 0, 1 };
+    IT(q >= 0 && sys_sendto_k(q, m, sizeof m, IPV4(127, 0, 0, 1), 0) < 0,
+       "a socket keeps its namespace: 127.0.0.1 unreachable there, whoever sends");
+    if (q >= 0) sys_close(q);
+
+    /* listen on port 0 = an ephemeral port, read back by getsockname
+     * (containerd's CRI streaming server listens on 127.0.0.1:0) */
+    {
+        int l = sys_socket(2, 1, 6);
+        uint32_t lip = 0; int lport = 0;
+        int ok0 = l >= 0 && sys_bind(l, IPV4(127, 0, 0, 1), 0) == 0 && sys_listen(l, 4) == 0
+               && sys_getsockname_k(l, &lip, &lport) == 0 && lport != 0;
+        struct tcp_conn* c = ok0 ? net_tcp_connect_ns(0, IPV4(127, 0, 0, 1), (uint16_t)lport, 1500) : NULL;
+        IT(ok0 && c, "listen on port 0 gets an ephemeral port that accepts");
+        if (c) net_tcp_close(c);
+        if (l >= 0) sys_close(l);
+    }
+    #undef IT
+    kprintf("icmpsock: %s\n", ok ? "ALL ok" : "FAIL");
+}
+SHELL_CMD(icmpsocktest) = { "icmpsocktest", "", "ICMP ping and raw sockets, and a socket's namespace",
+                            SHELL_G_TEST, cmd_icmpsocktest, SHELL_P_ANY };

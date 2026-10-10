@@ -114,6 +114,12 @@ static int u_strcopy(char* dst, const char* us, uint32_t max) {
 #define AT_CLKTCK  17
 #define AT_SECURE  23
 #define AT_RANDOM  25
+#define AT_HWCAP   16      /* §M90 — the CPU's user-visible features (arm64)  */
+/* The architecture's AT_HWCAP (0 = not reported).  aarch64 says what its CPU
+ * offers and that ID registers may be read (HWCAP_CPUID — the kernel emulates
+ * them, exceptions.c); elsewhere nothing reports it yet. */
+uintptr_t hal_user_hwcap(void) __attribute__((weak));
+uintptr_t hal_user_hwcap(void) { return 0; }
 
 /* §M37 — a loaded program image: the main object (for the auxv the dynamic
  * linker reads) plus, if PT_INTERP was present, the load base of the mapped
@@ -225,10 +231,22 @@ static void env_home_for_exec(char* out, int cap) {
  * An execve that dropped envp is how a JRE's launcher looped forever: it sets
  * LD_LIBRARY_PATH, re-executes itself, and the new image — never seeing the
  * variable — does it again. */
+/* §M90 — the builder hands its auxv OUT (struct auxv_out) and the caller
+ * files it with the task it belongs to (proc_keep_auxv): the builder runs on
+ * the parent for a spawn and on the process itself for an exec.  A caller
+ * buffer, not a static one — two CPUs exec at once. */
+struct auxv_out { uintptr_t v[2 * TASK_AUXV_MAX]; uint8_t n; };
+static void proc_keep_auxv(struct task* t, const uintptr_t* v, int n) {
+    if (!t) return;
+    if (n > 2 * TASK_AUXV_MAX) n = 2 * TASK_AUXV_MAX;
+    for (int i = 0; i < n; i++) t->auxv[i] = v[i];
+    t->auxv_n = (uint8_t)n;
+}
+
 static uintptr_t build_initial_stack(pmm_phys_t frame_phys, uintptr_t stack_va,
                                      int argc, const char* const argv[],
                                      int envc, const char* const envp[],
-                                     const struct loaded_prog* lp) {
+                                     const struct loaded_prog* lp, struct auxv_out* ao) {
     if (argc < 0) argc = 0;
     if (argc > PROC_MAX_ARGV) return 0;
     if (envc > PROC_MAX_ENV) return 0;
@@ -260,7 +278,7 @@ static uintptr_t build_initial_stack(pmm_phys_t frame_phys, uintptr_t stack_va,
         uintptr_t need = 16 + 16;                        /* AT_RANDOM + alignment */
         for (int i = 0; i < argc; i++) need += u_strlen(argv[i]) + 1;
         for (int i = 0; i < nenv; i++) need += u_strlen(env[i]) + 1;
-        need += (1 + (uintptr_t)argc + 1 + (uintptr_t)nenv + 1 + 14 * 2) * sizeof(uintptr_t);
+        need += (1 + (uintptr_t)argc + 1 + (uintptr_t)nenv + 1 + 15 * 2) * sizeof(uintptr_t);
         if (need > PAGE_SIZE) {
             kprintf("exec: arguments + environment need %u bytes, the initial stack page holds %u - refused (E2BIG)\n",
                     (unsigned)need, (unsigned)PAGE_SIZE);
@@ -311,7 +329,7 @@ static uintptr_t build_initial_stack(pmm_phys_t frame_phys, uintptr_t stack_va,
      *    PHDR, PHENT, PHNUM, BASE, ENTRY, UID, EUID, GID, EGID, NULL } = 14
      *    pairs. */
     uintptr_t slot = sizeof(uintptr_t);
-    uintptr_t nslots = 1 + (uintptr_t)argc + 1 + (uintptr_t)nenv + 1 + (14 * 2);
+    uintptr_t nslots = 1 + (uintptr_t)argc + 1 + (uintptr_t)nenv + 1 + (15 * 2);
     koff -= nslots * slot;
     koff &= ~(uintptr_t)0xF;                          /* 16-byte align the SP  */
 
@@ -322,6 +340,11 @@ static uintptr_t build_initial_stack(pmm_phys_t frame_phys, uintptr_t stack_va,
     w[k++] = 0;                                       /* argv terminator       */
     for (int i = 0; i < nenv; i++) w[k++] = env_uva[i];
     w[k++] = 0;                                       /* envp terminator       */
+    uintptr_t aux_at = k;                             /* §M90 — kept for /proc */
+    {
+        uintptr_t hw = hal_user_hwcap();
+        if (hw) { w[k++] = AT_HWCAP; w[k++] = hw; }
+    }
     w[k++] = AT_PAGESZ; w[k++] = PAGE_SIZE;           /* auxv: page size       */
     w[k++] = AT_CLKTCK; w[k++] = 100;                 /* auxv: HZ (100 ticks/s)*/
     w[k++] = AT_RANDOM; w[k++] = at_random_uva;       /* auxv: 16 random bytes */
@@ -356,6 +379,9 @@ static uintptr_t build_initial_stack(pmm_phys_t frame_phys, uintptr_t stack_va,
         w[k++] = AT_EGID; w[k++] = (uintptr_t)g;
     }
     w[k++] = AT_NULL;  w[k++] = 0;                     /* auxv terminator       */
+    ao->n = 0;
+    for (uintptr_t i = aux_at; i < k && ao->n < 2 * TASK_AUXV_MAX; i++)
+        ao->v[ao->n++] = w[i];
     kunmap_frame(base);
     return stack_va + koff;
 }
@@ -454,8 +480,10 @@ static int proc_exec_common(const void* image, size_t len,
     uintptr_t stack_va;
     pmm_phys_t stk = map_user_stack(s, &stack_va);
     if (!stk) { vmm_space_destroy(s); return -1; }
-    uintptr_t user_sp = build_initial_stack(stk, stack_va, argc, argv, -1, NULL, &lp);
+    struct auxv_out ao;
+    uintptr_t user_sp = build_initial_stack(stk, stack_va, argc, argv, -1, NULL, &lp, &ao);
     if (!user_sp) { vmm_space_destroy(s); return -1; }
+    proc_keep_auxv(task_current(), ao.v, ao.n);
 
     /* Bind the space to this task so the scheduler maintains CR3/TTBR0 across
      * any preemption during the excursion, activate it, then drop to user
@@ -629,8 +657,10 @@ int proc_execve_env_k(const char* kpath, char* const uargv[], char* const uenvp[
     uintptr_t stack_va;
     pmm_phys_t stk = map_user_stack(ns, &stack_va);
     if (!stk) { vmm_space_destroy(ns); kfree(strbuf); return -1; }
-    uintptr_t user_sp = build_initial_stack(stk, stack_va, argc, kargv, envc, kenvp, &lp);
+    struct auxv_out ao;
+    uintptr_t user_sp = build_initial_stack(stk, stack_va, argc, kargv, envc, kenvp, &lp, &ao);
     if (!user_sp) { vmm_space_destroy(ns); kfree(strbuf); return E2BIG_RC; }
+    proc_keep_auxv(task_current(), ao.v, ao.n);
 
     /* 4. Commit: swap to the new space, free the old one + scratch.  execve
      *    resets signal dispositions to default (custom handlers pointed into
@@ -695,6 +725,8 @@ struct user_boot {
     uintptr_t         entry;
     uintptr_t         user_sp;
     int               linux_abi;   /* run under the Linux-ABI personality?     */
+    uintptr_t         auxv[2 * TASK_AUXV_MAX];   /* §M90 — for /proc/<pid>/auxv */
+    int               auxv_n;
 };
 
 static void user_task_bootstrap(void) {
@@ -707,6 +739,7 @@ static void user_task_bootstrap(void) {
         kprintf("!! user_task_bootstrap RE-ENTERED for pid %d '%s' (last guest syscall %d)\n",
                 me->pid, me->name, me->guest_nr - 1);
     uintptr_t entry = b->entry, sp = b->user_sp;
+    proc_keep_auxv(me, b->auxv, b->auxv_n);
 
     me->mm          = b->space;
     me->user_task   = 1;
@@ -828,8 +861,11 @@ static int spawn_loaded(const char* name, struct vmm_space* s, struct loaded_pro
     if (!b) { vmm_space_destroy(s); return -1; }
     b->space     = s;
     b->entry     = lp.entry;
-    b->user_sp   = build_initial_stack(stk, stack_va, argc, argv, -1, NULL, &lp);
+    struct auxv_out ao;
+    b->user_sp   = build_initial_stack(stk, stack_va, argc, argv, -1, NULL, &lp, &ao);
     if (!b->user_sp) { kfree(b); vmm_space_destroy(s); return -1; }
+    for (int i = 0; i < ao.n; i++) b->auxv[i] = ao.v[i];
+    b->auxv_n = ao.n;
     b->linux_abi = linux_abi;
 
     /* ppid >= 0 parents the package explicitly (a GUI launcher passes the
@@ -963,6 +999,10 @@ struct clone_opts { unsigned long flags; uintptr_t ctid; };
 /* §M90 — a fork's return value, as the caller's pid namespace names the child. */
 static int fork_vnr(int pid) {
     struct task* c = pid > 0 ? task_find(pid) : NULL;
+    if (c) {                                 /* §M90 — same image, same auxv */
+        struct task* me = task_current();
+        if (me) proc_keep_auxv(c, me->auxv, me->auxv_n);
+    }
     return c ? ns_vnr(task_current(), c) : pid;
 }
 int proc_fork_vnr(struct user_regs* r) {

@@ -428,3 +428,29 @@ void cred_exec_caps(struct cred* c) {
     c->cap_eff_drop = 0;
     c->cap_amb = 0;
 }
+
+/* §M90 — setuid / setgid / setres[ug]id with Linux's privilege rule: an
+ * identity holding CAP_SETUID (CAP_SETGID) may take ANY uid (gid); one without
+ * may only "change" to what it already is.  The result is an ordinary USER
+ * identity — its privilege is then decided the usual way (cred_is_admin: uid 0
+ * or the admin group), so `setuid(1000)` by root DROPS root's power and its
+ * capabilities with it, as on Linux (PR_SET_KEEPCAPS is not honoured — said).
+ * There is ONE uid per identity (no separate real/effective/saved), so the
+ * callers pass the single id they want or -1 to keep.  `docker run --user`
+ * goes through here: runc calls setresgid(g,g,g) and setresuid(u,u,u). */
+int cred_set_ids(struct cred* c, int uid, int gid) {
+    if (!c) return -1;
+    int cu = cred_uid(c) < 0 ? 0 : cred_uid(c);
+    int cg = cred_gid(c) < 0 ? 0 : cred_gid(c);
+    if (uid >= 0 && uid != cu && !cred_capable(c, CAP_SETUID_)) return -1;
+    if (gid >= 0 && gid != cg && !cred_capable(c, CAP_SETGID_)) return -1;
+    if ((uid < 0 || uid == cu) && (gid < 0 || gid == cg)) return 0;   /* nothing changes */
+    if (c->owner != TASK_OWNER_USER) {         /* a SYSTEM task becoming somebody */
+        c->owner = TASK_OWNER_USER;
+        c->uid = cu; c->gid = cg;
+        if (!c->groups_explicit) c->ngroups = 0;
+    }
+    if (uid >= 0) c->uid = uid;
+    if (gid >= 0) c->gid = gid;
+    return 0;
+}

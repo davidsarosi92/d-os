@@ -41,6 +41,7 @@
 
 #define ETHERTYPE_IPV4   0x0800
 #define ETHERTYPE_ARP    0x0806
+#define ETHERTYPE_IPV6   0x86DD
 
 /* IPv4 protocol numbers we care about. */
 #define IP_PROTO_ICMP    1
@@ -133,7 +134,19 @@ struct net_device {
     /* A virtual device's teardown (netvirt.c), NULL for hardware. */
     void (*destroy)(struct net_device* dev);
     uint32_t    kind;           /* NETDEV_K_* — what netlink reports as IFLA_INFO_KIND */
+
+    /* ---- §M90 3a — IPv6 (net6.c).  APPENDED.  `ip6_ll` is the link-local
+     * address, derived from the MAC at register (EUI-64) — every IPv6
+     * interface has one, it is how neighbours find each other before anything
+     * is configured.  `ip6[]` are the configured addresses with their prefix
+     * lengths; a loopback carries ::1/128 there.  Network byte order (an IPv6
+     * address is 16 bytes and has no host order worth having). */
+    uint8_t     ip6_ll[16];
+    uint8_t     ip6[4][16];
+    uint8_t     ip6_plen[4];
+    uint8_t     n_ip6;
 };
+#define NET_IP6_MAX 4
 
 #define NETDEV_K_HW       0     /* a driver's device                            */
 #define NETDEV_K_LOOPBACK 1
@@ -268,6 +281,7 @@ void net_routes_drop_dev(struct net_device* dev);
 /* §M90 rung 5d — IPv4 forwarding per namespace (/proc/sys/net/ipv4/ip_forward)
  * and its counters; masquerade is the `net.masquerade` key (net.c). */
 int  net_ip_forward(int ns);
+uint32_t net_arp_released(void);   /* forwarded packets held for an ARP answer, then sent */
 void net_set_ip_forward(int ns, int on);
 void net_fwd_stats(uint32_t* fwd, uint32_t* noarp, uint32_t* noroute, uint32_t* nat_out,
                    uint32_t* nat_in, uint32_t* nat_full);
@@ -466,6 +480,10 @@ int  net_udp_bind(uint16_t port, udp_recv_fn fn, void* ctx);
 void net_udp_unbind(uint16_t port);
 int  net_udp_bind_ns(int ns, uint16_t port, udp_recv_fn fn, void* ctx);
 void net_udp_unbind_ns(int ns, uint16_t port);
+/* §M90 — ICMP sockets: `ip` is the whole IPv4 packet (header included). */
+typedef void (*icmp_recv_fn)(uint32_t src_ip, const uint8_t* ip, uint32_t total, void* ctx);
+int  net_icmp_listen(int ns, icmp_recv_fn fn, void* ctx);
+void net_icmp_unlisten(void* ctx);
 
 /* ----------------------- DNS stub resolver (§M24.2) ----------------------- */
 
@@ -586,5 +604,69 @@ void net_fmt_ip(uint32_t ip, char* buf);
 /* Format a MAC into "aa:bb:cc:dd:ee:ff" (buf ≥ 18 bytes).  The kernel printf
  * has no width/zero-pad, so callers format-then-print with %s. */
 void net_fmt_mac(const uint8_t* mac, char* buf);
+
+/* ---- §M90 3a — IPv6 (net6.c) ------------------------------------------------ */
+/* Called by net_register (addresses) and net_rx (an 0x86DD frame, lock held). */
+void net6_dev_init(struct net_device* dev);
+void ipv6_input(struct net_device* dev, const uint8_t* src_mac, const uint8_t* p, uint32_t len);
+void net6_dev_gone_locked(struct net_device* dev);
+/* An L2 send for net6.c (stack lock held). */
+int  net_eth_send_locked(struct net_device* dev, const uint8_t* dst_mac,
+                         uint16_t ethertype, const void* payload, uint32_t len);
+/* Parse "2001:db8::1" (and "fe80::1%eth0": the scope name is copied out) /
+ * format the canonical compressed form into `out` (>= 40 bytes). */
+int  net_parse_ip6(const char* s, uint8_t out[16], char* scope, int scope_cap);
+void net_fmt_ip6(const uint8_t a[16], char* out);
+int  net6_addr_add(struct net_device* dev, const uint8_t a[16], int plen);
+int  net6_addr_del(struct net_device* dev, const uint8_t a[16]);
+/* Route table per namespace: prefix/plen via gw (all-zero = on-link) on dev. */
+int  net6_route_add(int ns, const uint8_t pfx[16], int plen, const uint8_t gw[16], struct net_device* dev);
+int  net6_route_del(int ns, const uint8_t pfx[16], int plen);
+struct net_device* net6_route(int ns, const uint8_t dst[16], uint8_t nexthop[16]);
+struct net6_rt { int used, ns; uint8_t pfx[16]; uint8_t plen; uint8_t gw[16]; struct net_device* dev; };
+int  net6_route_at(int i, struct net6_rt* out);   /* the i-th table entry; -1 past the end */
+int  net6_forwarding(int ns);
+void net6_set_forwarding(int ns, int on);
+int  net6_disabled(int ns);
+void net6_set_disabled(int ns, int on);
+void net6_procfs_init(void);
+/* §M90 3a — ICMPv6 sockets (raw and ping): the message without its IP header. */
+typedef void (*icmp6_recv_fn)(const uint8_t* src6, const uint8_t* msg, uint32_t len, void* ctx);
+int  net6_icmp_listen(int ns, icmp6_recv_fn fn, void* ctx);
+void net6_icmp_unlisten(void* ctx);
+int  net6_icmp_send(int ns, struct net_device* scope, const uint8_t dst[16], uint8_t* msg, uint32_t len);
+/* Echo `count` times; replies received.  `dev` names the link for a
+ * link-local destination (NULL = route). */
+int  net_ping6(int ns, struct net_device* dev, const uint8_t dst[16], int count);
+/* For the transport (net.c). */
+uint16_t net6_csum(const uint8_t* src, const uint8_t* dst, uint8_t nh, const uint8_t* data, uint32_t len);
+int  net6_emit_locked(struct net_device* dev, const uint8_t* via_mac, const uint8_t* src,
+                      const uint8_t* dst, uint8_t nh, const uint8_t* payload, uint32_t len);
+int  net6_resolve(struct net_device* dev, const uint8_t* nh, uint8_t* mac);
+void net6_pick_src(struct net_device* dev, const uint8_t* dst, uint8_t* src);
+int  net6_is_linklocal(const uint8_t* a);
+int  net6_prepare(int ns, struct net_device* scope, const uint8_t* dst,
+                  struct net_device** dev_out, uint8_t* mac, uint8_t* src);
+/* TCP/UDP segments of an IPv6 packet addressed to us (net.c; lock held). */
+void net_l4_input6(struct net_device* dev, const uint8_t* src_mac, const uint8_t* src,
+                   const uint8_t* dst, uint8_t nh, const uint8_t* l4, uint32_t len);
+/* During a UDP receive callback: the IPv6 source of the datagram being
+ * delivered, or NULL for an IPv4 one (the callback's src_ip is then 0). */
+const uint8_t* net_rx_src6(void);
+const uint8_t* net_rx_dst6(void);
+
+/* ---- §M90 3a stage c — TCP and UDP over IPv6 ---- */
+/* `scope` = the link for a link-local peer (NULL otherwise). */
+struct tcp_conn* net_tcp_connect6_ns(int ns, struct net_device* scope, const uint8_t dst[16],
+                                     uint16_t port, uint32_t timeout_ms);
+/* A v6 listener on `local` (all-zero = every address).  v6only = 0 makes it
+ * DUAL-STACK: it accepts IPv4 connections too (Linux's default for ::). */
+struct tcp_conn* net_tcp_listen6_ns(int ns, const uint8_t local[16], uint16_t port,
+                                    int backlog, int v6only);
+/* 1 = the connection is IPv6 (a6 filled), 0 = IPv4. */
+int  net_tcp_peer6 (struct tcp_conn* c, uint8_t a6[16], uint16_t* port);
+int  net_tcp_local6(struct tcp_conn* c, uint8_t a6[16], uint16_t* port);
+int  net_udp_send6_ns(int ns, struct net_device* scope, const uint8_t dst[16],
+                      uint16_t sport, uint16_t dport, const void* data, uint32_t len);
 
 #endif /* NET_H */

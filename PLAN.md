@@ -6156,7 +6156,46 @@ fixed-address Go binaries load at 0x200000, inside the low identity map):**
   1. (done 2026-10-08 — cgroup limits + inotify)
   2. (done 2026-10-09 — overlayfs; the test recipe now uses
      `--storage-driver=overlay2`)
-  3. (done 2026-10-10 — networking; dockerd now runs WITHOUT --bridge=none)
+  3. (done 2026-10-10 — networking; dockerd now runs WITHOUT --bridge=none;
+     the gaps closed 2026-10-10: ICMP ping/raw sockets, AF_PACKET, sockets
+     keep their namespace, the ARP hold queue, FDB ageing, connections reset
+     when their device goes)
+  3a. **IPv6 (asked for before rung 6: "legyünk teljesek").**  Stages a-d
+     DONE 2026-10-10 (net6.c; ip6test, tcp6test, sock6test; DOCS change
+     log); stage e's kernel half (rtnetlink AF_INET6 addresses/routes/
+     lookups) and v6 FORWARDING (per namespace, NDP hold queue) DONE the same
+     day; what remains is the Docker proof (`--ipv6`).  Stages, each done
+     when its falsifier passes on all three arches:
+     (a) addresses + NDP: a per-device link-local (fe80::/64 from the MAC,
+         EUI-64) and configured globals, Neighbour Solicitation/Advertisement
+         (the IPv6 ARP), DAD answered honestly, ICMPv6 echo — `ping6 ::1`,
+         two namespaces over a veth ping each other by link-local;
+     (b) routing: a v6 route table per namespace (connected /64 + table +
+         default), forwarding per namespace (`/proc/sys/net/ipv6/conf/all/forwarding`);
+     (c) TCP and UDP over v6 on the SAME connection table (the address
+         widened to 16 bytes, v4 as v4-mapped where a socket is dual-stack);
+     (d) AF_INET6 sockets through the §M50 engine (sockaddr_in6, IPV6_V6ONLY),
+         `getaddrinfo` answering AAAA;
+     (e) rtnetlink: RTM_NEWADDR/GETADDR/NEWROUTE/GETROUTE for AF_INET6, so
+         dockerd's `--ipv6` network and `ip -6` work;
+     done = `docker network create --ipv6` + a container pinging the host's v6
+     address, and `tcptest` over ::1.  SLAAC/router advertisements are NOT in
+     scope (QEMU's SLIRP offers them; a static/link-local setup is what Docker
+     uses) — stated, not silently missing.
+  3b. **netfilter (same request).**  The fixed `net.masquerade` policy becomes
+     RULES: (a) a conntrack table (the NAT table generalised: TCP/UDP/ICMP
+     flows, states NEW/ESTABLISHED/RELATED, timeouts) — the masquerade then
+     reads from it; (b) hooks PREROUTING/INPUT/FORWARD/OUTPUT/POSTROUTING in
+     the IPv4 (and 3a's IPv6) paths; (c) nf_tables over NETLINK_NETFILTER:
+     tables, chains on hooks with priority/policy, rules as an expression VM
+     (payload/meta/cmp/immediate/ct/nat/counter/verdict), sets — the subset
+     `nft` and iptables-nft emit for Docker's ruleset; (d) DNAT, so `-p` works
+     WITHOUT docker-proxy (`--userland-proxy=false`).  Needs a userspace
+     (iptables-nft or nft, static, musl) in the image — built by a script like
+     the others, not vendored.  done = dockerd with `--iptables=true` creates
+     its DOCKER/DOCKER-FORWARD chains, `nft list ruleset` shows them, a
+     container reaches the internet through a MASQUERADE RULE (with
+     `net.masquerade` off) and `-p 8080:80` answers with the proxy disabled.
   4. Rung 6: `docker run -it` (pty/devpts), `docker build`, volumes.
   5. x86_64: waits for the higher-half kernel move.
   Open beside it: NEXT.md #14 (rare pthread_join hang) and #16 (a non-leader
@@ -6171,8 +6210,11 @@ fixed-address Go binaries load at 0x200000, inside the low identity map):**
   echo hi`; `strace err name <task>` to see a failing step.
 - Open, noted for later: containerd-shim daemonizes (fork, parent exits) — a
   Linux-personality child must then outlive its parent (today the kill-tree
-  rule ends it); TASK_MAX_FDS is 32; dockerd allows containerd 15 s to start
+  rule ends it); TASK_MAX_FDS was 32 (256 since 2026-10-10); dockerd allows containerd 15 s to start
   and exec of the 40 MB binary from exFAT takes ~10 s under emulation.
+- Open from 2026-10-10: `pidfd_open` / `pidfd_send_signal` / `waitid(P_PIDFD)`
+  and `CLONE_PIDFD` (containerd logs "failed to ensure the kernel supports
+  pidfd"; Go and containerd probe and fall back, so nothing fails today).
 
 ### What "full Docker" is, and what it is not
 
