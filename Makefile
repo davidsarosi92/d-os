@@ -836,6 +836,7 @@ CORE_C_SRCS := \
     kernel/drivers/net/virtio_net.c \
     kernel/drivers/net/e1000e.c \
     kernel/core/net.c \
+    kernel/core/netvirt.c \
     kernel/core/dhcp.c \
     kernel/core/net_cmds.c \
     kernel/core/net_state.c \
@@ -917,6 +918,7 @@ CORE_C_SRCS := \
     kernel/core/abi_linux.c \
     kernel/core/lnx_signal.c \
     kernel/core/net.c \
+    kernel/core/netvirt.c \
     kernel/core/dhcp.c \
     kernel/core/net_cmds.c \
     kernel/core/net_state.c \
@@ -1213,6 +1215,7 @@ CORE_C_SRCS := \
     kernel/drivers/net/virtio_net.c \
     kernel/drivers/net/e1000e.c \
     kernel/core/net.c \
+    kernel/core/netvirt.c \
     kernel/core/dhcp.c \
     kernel/core/net_cmds.c \
     kernel/core/net_state.c \

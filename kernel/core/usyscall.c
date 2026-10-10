@@ -243,7 +243,7 @@ struct fdtable {
     int           refs;
     spinlock_t    lock;
     struct ofile* fd[TASK_MAX_FDS];
-    uint32_t      cloexec;              /* §M90 — bit i: close fd[i] at exec */
+    uint32_t      cloexec[FD_CX_WORDS]; /* §M90 — bit i: close fd[i] at exec */
 };
 
 /* §M90 — CLOSE-ON-EXEC.  This kernel had none: every descriptor survived
@@ -254,10 +254,15 @@ struct fdtable {
  * close-on-exec the parent waits for an EOF that never comes (dockerd starting
  * containerd).  One bit per slot, beside the table it describes; 32 slots, so
  * one word. */
-_Static_assert(TASK_MAX_FDS <= 32, "fd_cloexec is one 32-bit mask");
+_Static_assert(TASK_MAX_FDS % 32 == 0, "close-on-exec bits are whole words");
 static uint32_t* fd_cx(struct task* t) {
-    return t->fdt ? &t->fdt->cloexec : &t->fd_cloexec_inline;
+    return t->fdt ? t->fdt->cloexec : t->fd_cloexec_inline;
 }
+static void cx_set(uint32_t* m, int fd, int on) {
+    if (on) m[fd >> 5] |= 1u << (fd & 31); else m[fd >> 5] &= ~(1u << (fd & 31));
+}
+static int cx_get(const uint32_t* m, int fd) { return (int)((m[fd >> 5] >> (fd & 31)) & 1u); }
+static void cx_copy(uint32_t* d, const uint32_t* s) { for (int i = 0; i < FD_CX_WORDS; i++) d[i] = s ? s[i] : 0; }
 
 /* Lock the CURRENT task's table for a slot update: a no-op for a private
  * table (nobody else can see it), the table's lock for a shared one. */
@@ -279,8 +284,8 @@ struct fdtable* fdtable_share(struct task* parent) {
          * the shared table.  Only the parent is running on its table at this
          * moment — it has no threads yet, by definition. */
         for (int i = 0; i < TASK_MAX_FDS; i++) { ft->fd[i] = parent->fds_inline[i]; parent->fds_inline[i] = NULL; }
-        ft->cloexec = parent->fd_cloexec_inline;        /* the bits move with the slots */
-        parent->fd_cloexec_inline = 0;
+        cx_copy(ft->cloexec, parent->fd_cloexec_inline);   /* the bits move with the slots */
+        cx_copy(parent->fd_cloexec_inline, NULL);
         parent->fdt = ft;
         parent->fds = ft->fd;
     }
@@ -309,7 +314,7 @@ static int fd_install(struct ofile* o) {
     for (int fd = 3; fd < TASK_MAX_FDS; fd++) {
         if (!t->fds[fd]) {
             t->fds[fd] = o;
-            *fd_cx(t) &= ~(1u << fd);           /* a new descriptor is inherited by exec */
+            cx_set(fd_cx(t), fd, 0);            /* a new descriptor is inherited by exec */
             fdt_unlock(t, fl);
             return fd;
         }
@@ -648,7 +653,7 @@ int sys_close(int fd) {
     uint32_t fl = fdt_lock(t);
     if (t->fds[fd] != o) { fdt_unlock(t, fl); return -1; }   /* another thread closed it */
     t->fds[fd] = NULL;
-    *fd_cx(t) &= ~(1u << fd);
+    cx_set(fd_cx(t), fd, 0);
     fdt_unlock(t, fl);
     ofile_unref(o);
     return 0;
@@ -822,7 +827,7 @@ int sys_dup2(int oldfd, int newfd) {
     uint32_t fl = fdt_lock(t);
     struct ofile* old = t->fds[newfd];
     t->fds[newfd] = nw;
-    *fd_cx(t) &= ~(1u << newfd);             /* POSIX: dup2 clears FD_CLOEXEC */
+    cx_set(fd_cx(t), newfd, 0);               /* POSIX: dup2 clears FD_CLOEXEC */
     fdt_unlock(t, fl);
     if (old) ofile_unref(old);               /* outside the lock: may close a file */
     return newfd;
@@ -854,7 +859,7 @@ int sys_dupfd(int fd, int minfd) {
     for (int i = minfd; i < TASK_MAX_FDS; i++) {
         if (t->fds[i]) continue;
         t->fds[i] = nw;
-        *fd_cx(t) &= ~(1u << i);
+        cx_set(fd_cx(t), i, 0);
         fdt_unlock(t, fl);
         return i;
     }
@@ -1779,7 +1784,7 @@ void fd_close_all(void) {
         struct fdtable* ft = t->fdt;
         t->fdt = NULL;
         t->fds = t->fds_inline;
-        t->fd_cloexec_inline = 0;
+        cx_copy(t->fd_cloexec_inline, NULL);
         fdtable_put(ft);
         return;
     }
@@ -1796,7 +1801,7 @@ void fd_close_all(void) {
     for (int fd = t->user_task ? 0 : 3; fd < TASK_MAX_FDS; fd++) {
         if (t->fds[fd]) { ofile_unref(t->fds[fd]); t->fds[fd] = NULL; }
     }
-    t->fd_cloexec_inline = 0;
+    cx_copy(t->fd_cloexec_inline, NULL);
 }
 
 /* ---- network sockets (M24 socket API — AF_INET) --------------------------- */
@@ -2556,7 +2561,7 @@ int fd_set_cloexec(int fd, int on) {
      * checks fds 0-2 with F_GETFD at startup and dies "cannot open standard
      * fds" when it hears EBADF. */
     int ok = t->fds[fd] != NULL || fd <= 2;
-    if (ok) { if (on) *fd_cx(t) |= 1u << fd; else *fd_cx(t) &= ~(1u << fd); }
+    if (ok) cx_set(fd_cx(t), fd, on);
     fdt_unlock(t, fl);
     return ok ? 0 : -1;
 }
@@ -2564,19 +2569,12 @@ int fd_get_cloexec(int fd) {
     struct task* t = task_current();
     if (!t || fd < 0 || fd >= TASK_MAX_FDS) return -1;
     uint32_t fl = fdt_lock(t);
-    int r = (t->fds[fd] || fd <= 2) ? (int)((*fd_cx(t) >> fd) & 1u) : -1;
+    int r = (t->fds[fd] || fd <= 2) ? cx_get(fd_cx(t), fd) : -1;
     fdt_unlock(t, fl);
     return r;
 }
-uint32_t fd_cloexec_mask(struct task* t) {
-    if (!t) return 0;
-    uint32_t fl = fdt_lock(t);
-    uint32_t m = *fd_cx(t);
-    fdt_unlock(t, fl);
-    return m;
-}
-void fd_cloexec_restore(struct task* t, uint32_t mask) {
-    if (t) *fd_cx(t) = mask;            /* a fork child's own, still private table */
+void fd_cloexec_restore(struct task* t, const uint32_t* mask) {
+    if (t) cx_copy(fd_cx(t), mask);     /* a fork child's own, still private table */
 }
 /* At the point of no return in execve: close every marked descriptor.  The
  * references are taken out under the lock and released after it, because
@@ -2584,18 +2582,21 @@ void fd_cloexec_restore(struct task* t, uint32_t mask) {
 void fd_close_on_exec(void) {
     struct task* t = task_current();
     if (!t) return;
-    struct ofile* gone[TASK_MAX_FDS];
+    /* off the kernel stack: TASK_MAX_FDS pointers are 2 KiB */
+    struct ofile** gone = (struct ofile**)kmalloc(sizeof(struct ofile*) * TASK_MAX_FDS);
+    if (!gone) return;
     int n = 0;
     uint32_t fl = fdt_lock(t);
-    uint32_t m = *fd_cx(t);
+    uint32_t* m = fd_cx(t);
     for (int fd = 0; fd < TASK_MAX_FDS; fd++) {
-        if (!(m & (1u << fd))) continue;
+        if (!cx_get(m, fd)) continue;
         if (t->fds[fd]) gone[n++] = t->fds[fd];
         t->fds[fd] = NULL;
     }
-    *fd_cx(t) = 0;
+    cx_copy(m, NULL);
     fdt_unlock(t, fl);
     for (int i = 0; i < n; i++) ofile_unref(gone[i]);
+    kfree(gone);
 }
 
 /* §M90 — the path of a DIRECTORY descriptor, for the *at calls.  0, -9
@@ -2655,7 +2656,7 @@ void fd_snapshot_for_fork(struct task* parent, struct ofile** out, uint32_t* clo
     uint32_t fl = fdt_lock(parent);
     for (int i = 0; i < TASK_MAX_FDS; i++)
         out[i] = parent->fds[i] ? ofile_ref(parent->fds[i]) : NULL;
-    if (cloexec) *cloexec = *fd_cx(parent);
+    if (cloexec) cx_copy(cloexec, fd_cx(parent));
     fdt_unlock(parent, fl);
 }
 
@@ -2682,14 +2683,16 @@ int fd_nth_open(int n) {
 void fd_unshare_table(void) {
     struct task* t = task_current();
     if (!t || !t->fdt) return;
-    struct ofile* copy[TASK_MAX_FDS];
-    uint32_t cx = 0;
-    fd_snapshot_for_fork(t, copy, &cx);
+    struct ofile** copy = (struct ofile**)kmalloc(sizeof(struct ofile*) * TASK_MAX_FDS);
+    if (!copy) return;
+    uint32_t cx[FD_CX_WORDS];
+    fd_snapshot_for_fork(t, copy, cx);
     struct fdtable* ft = t->fdt;
     t->fdt = NULL;
     t->fds = t->fds_inline;
     for (int i = 0; i < TASK_MAX_FDS; i++) t->fds_inline[i] = copy[i];
-    t->fd_cloexec_inline = cx;
+    cx_copy(t->fd_cloexec_inline, cx);
+    kfree(copy);
     fdtable_put(ft);
 }
 

@@ -947,6 +947,21 @@ static void sy_unlinkopentest(const char* args) {
     kprintf("unlinkopen: unlink=%d name-gone=%d read=%d '%s' after-close-gone=%d\n",
             ur, gone, (int)n, buf, again);
     int ok = ur == 0 && gone && n == 10 && buf[0] == 's' && buf[9] == 'e' && again;
+    /* §M90 — and its DIRECTORY removed before the last close: the deferred
+     * removal used to call into the freed directory at close (a kernel jump
+     * through a garbage pointer, found by dockerd's buildkit).  The directory
+     * goes from the namespace at once and from memory after the close. */
+    vfs_mkdir("/tmp-uo-dir");
+    struct file* g = vfs_open("/tmp-uo-dir/f", VFS_RDWR | VFS_CREATE | VFS_TRUNC);
+    int du = g ? vfs_unlink("/tmp-uo-dir/f") : -9;
+    int dr = vfs_unlink("/tmp-uo-dir");
+    int dgone = vfs_stat("/tmp-uo-dir", &st) != 0;
+    long wn = g ? vfs_write(g, "x", 1) : -1;
+    if (g) vfs_close(g);
+    int remake = vfs_mkdir("/tmp-uo-dir") == 0 && vfs_unlink("/tmp-uo-dir") == 0;
+    kprintf("unlinkopen: file %d, its directory %d (name gone %d), write after %ld, close survived, "
+            "name reusable %d\n", du, dr, dgone, wn, remake);
+    if (du != 0 || dr != 0 || !dgone || wn != 1 || !remake) ok = 0;
     console_write(ok ? "unlinkopen: ok\n" : "unlinkopen: FAIL\n");
 }
 /* §M90 — `fifotest`: named pipes (fifo.c), every rule a program depends on,

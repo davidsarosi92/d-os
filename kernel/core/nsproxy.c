@@ -22,8 +22,10 @@
  *   IPC     System V IPC and POSIX message queues — neither exists in this
  *           kernel, so a new IPC namespace has nothing to separate and is
  *           exactly as isolated as Linux's would be with no objects in it.
- *   NET, USER   one namespace each; unshare of them stays refused (net: the
- *           stack is single-instance; user: no id mapping).
+ *   NET     REAL (§M90 rung 5): its own loopback, devices, addresses,
+ *           routes and sockets in the network stack (net.c, net_id).  A
+ *           device moved into it is reachable only from it.
+ *   USER    one namespace; unshare stays refused (no id mapping).
  *   MNT     the VFS's own (task->mntns, vfs_mntns_new) — only its handle's
  *           number is produced here.
  *   PID     REAL: a task has a number in its namespace and in each ancestor;
@@ -102,6 +104,10 @@ void ns_put(struct nsobj* o) {
     spin_unlock_irqrestore(&g_ns_lock, f);
     if (last) {
         struct nsobj* par = o->kind == NSK_PID ? o->parent : NULL;
+        if (o->kind == NSK_NET && o->net_id > 0) {
+            extern void net_ns_destroy(int id);
+            net_ns_destroy(o->net_id);          /* its virtual devices go with it */
+        }
         kfree(o);
         ns_put(par);
     }
@@ -119,6 +125,13 @@ static struct nsobj* ns_new(const struct task* t, int kind) {
     if (kind == NSK_UTS) {
         s_cpy(o->hostname, ns_hostname(t), sizeof o->hostname);
         s_cpy(o->domainname, ns_domainname(t), sizeof o->domainname);
+    }
+    if (kind == NSK_NET) {
+        /* §M90 rung 5 — a fresh network namespace: the stack makes its
+         * loopback (down, as Linux makes it) and its tables. */
+        extern int net_ns_create(void);
+        o->net_id = net_ns_create();
+        if (o->net_id <= 0) { kfree(o); return NULL; }
     }
     if (kind == NSK_CGROUP) {
         /* "/" inside is the cgroup the creator is in now (Linux's rule). */
@@ -138,7 +151,7 @@ static void set_slot(struct nsobj** slot, struct nsobj* o) {
 int ns_unshare(struct task* t, unsigned long flags) {
     if (!t) return -22;
     /* Build every new object first, so an allocation failure changes nothing. */
-    struct nsobj *uts = NULL, *ipc = NULL, *cg = NULL, *tm = NULL, *pd = NULL;
+    struct nsobj *uts = NULL, *ipc = NULL, *cg = NULL, *tm = NULL, *pd = NULL, *net = NULL;
     if (flags & NS_CLONE_NEWPID) {
         int e = 0;
         if (!(pd = ns_pid_new(t, &e))) return e;
@@ -147,15 +160,23 @@ int ns_unshare(struct task* t, unsigned long flags) {
     if ((flags & NS_CLONE_NEWIPC)    && !(ipc = ns_new(t, NSK_IPC)))    goto oom;
     if ((flags & NS_CLONE_NEWCGROUP) && !(cg  = ns_new(t, NSK_CGROUP))) goto oom;
     if ((flags & NS_CLONE_NEWTIME)   && !(tm  = ns_new(t, NSK_TIME)))   goto oom;
+    if ((flags & NS_CLONE_NEWNET)    && !(net = ns_new(t, NSK_NET)))    goto oom;
     if (uts) set_slot(&t->ns[NSK_UTS], uts);
+    if (net) set_slot(&t->ns[NSK_NET], net);
     if (ipc) set_slot(&t->ns[NSK_IPC], ipc);
     if (cg)  set_slot(&t->ns[NSK_CGROUP], cg);
     if (tm)  set_slot(&t->ns_time_children, tm);   /* children only — see the header */
     if (pd)  set_slot(&t->ns_pid_children, pd);    /* likewise */
     return 0;
 oom:
-    ns_put(uts); ns_put(ipc); ns_put(cg); ns_put(tm); ns_put(pd);
+    ns_put(uts); ns_put(ipc); ns_put(cg); ns_put(tm); ns_put(pd); ns_put(net);
     return -12;
+}
+
+struct nsobj* ns_hold(struct nsobj* o) { return ns_ref(o); }
+
+int ns_net_id(const struct task* t) {
+    return (t && t->ns[NSK_NET]) ? t->ns[NSK_NET]->net_id : 0;
 }
 
 void ns_enter(struct task* t, int kind, struct nsobj* o) {

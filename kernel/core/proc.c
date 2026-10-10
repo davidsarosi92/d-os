@@ -958,7 +958,8 @@ struct clone_opts { unsigned long flags; uintptr_t ctid; };
 #define CL_PARENT_SETTID  0x00100000ul
 #define CL_CHILD_CLEARTID 0x00200000ul
 #define CL_CHILD_SETTID   0x01000000ul
-#define CL_NSOBJ          (NS_CLONE_NEWUTS | NS_CLONE_NEWIPC | NS_CLONE_NEWCGROUP | NS_CLONE_NEWTIME)
+#define CL_NSOBJ          (NS_CLONE_NEWUTS | NS_CLONE_NEWIPC | NS_CLONE_NEWCGROUP | NS_CLONE_NEWTIME | \
+                           NS_CLONE_NEWNET)
 /* §M90 — a fork's return value, as the caller's pid namespace names the child. */
 static int fork_vnr(int pid) {
     struct task* c = pid > 0 ? task_find(pid) : NULL;

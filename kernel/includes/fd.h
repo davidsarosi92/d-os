@@ -239,12 +239,11 @@ uint32_t fd_readiness_seq(void);
 struct task;
 int      fd_set_cloexec(int fd, int on);     /* 0, or -1 for a bad fd */
 int      fd_get_cloexec(int fd);             /* 0/1, or -1 for a bad fd */
-uint32_t fd_cloexec_mask(struct task* t);
-void     fd_cloexec_restore(struct task* t, uint32_t mask);
+void     fd_cloexec_restore(struct task* t, const uint32_t* mask);   /* FD_CX_WORDS words */
 void     fd_close_on_exec(void);
 /* §M90 — fork: reference every descriptor and read the close-on-exec mask
  * under the table's lock (see usyscall.c for the race it closes). */
-void     fd_snapshot_for_fork(struct task* parent, struct ofile** out, uint32_t* cloexec);
+void     fd_snapshot_for_fork(struct task* parent, struct ofile** out, uint32_t* cloexec);   /* FD_CX_WORDS */
 int      fd_nth_open(int n);                 /* §M90 — /proc/self/fd's listing */
 void     fd_unshare_table(void);             /* §M90 — unshare(CLONE_FILES) */
 

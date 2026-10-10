@@ -45,7 +45,7 @@ struct fork_boot {
     struct vmm_space* space;
     struct user_regs  regs;
     struct ofile*     fds[TASK_MAX_FDS];    /* parent fd snapshot, refs bumped */
-    uint32_t          cloexec;              /* §M90 — the parent's close-on-exec bits */
+    uint32_t          cloexec[FD_CX_WORDS];              /* §M90 — the parent's close-on-exec bits */
 };
 
 /* First thing the child task runs (in kernel mode): adopt the cloned space +
@@ -95,7 +95,7 @@ int proc_fork(struct user_regs* parent_regs) {
     b->space       = child_space;
     b->regs        = *parent_regs;
     b->regs.eax    = 0;                      /* child: fork() returns 0         */
-    fd_snapshot_for_fork(parent, b->fds, &b->cloexec);   /* §M90 — under the table lock */
+    fd_snapshot_for_fork(parent, b->fds, b->cloexec);   /* §M90 — under the table lock */
 
     struct task* child = task_spawn_arg_held("forked", fork_child_bootstrap, b);
     if (!child) {

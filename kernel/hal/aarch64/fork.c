@@ -44,7 +44,7 @@ struct fork_boot {
     struct user_regs  regs;
     uint64_t          tpidr;                /* the parent's LIVE thread pointer */
     struct ofile*     fds[TASK_MAX_FDS];    /* parent fd snapshot, refs bumped */
-    uint32_t          cloexec;              /* §M90 — the parent's close-on-exec bits */
+    uint32_t          cloexec[FD_CX_WORDS];              /* §M90 — the parent's close-on-exec bits */
 };
 
 /* First thing the child runs, in kernel mode: adopt the cloned space + fd
@@ -101,7 +101,7 @@ int proc_fork(struct user_regs* parent_regs) {
     b->regs.x[0]  = 0;                       /* child: fork() returns 0 */
     /* Read it LIVE rather than from the task struct — see the bootstrap. */
     __asm__ volatile ("mrs %0, tpidr_el0" : "=r"(b->tpidr));
-    fd_snapshot_for_fork(parent, b->fds, &b->cloexec);   /* §M90 — under the table lock */
+    fd_snapshot_for_fork(parent, b->fds, b->cloexec);   /* §M90 — under the table lock */
 
     struct task* child = task_spawn_arg_held("forked", fork_child_bootstrap, b);
     if (!child) {

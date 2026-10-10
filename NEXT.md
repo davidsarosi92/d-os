@@ -1,12 +1,12 @@
 # RESUME HERE (updated 2026-10-08)
 
-**§M90 Docker, ~70 %.**  `docker run --network host busybox:musl echo hi`
-prints `hi` on aarch64 (rungs 1-2 done); cgroup limits and inotify done (rung 3); overlayfs + Docker's overlay2 done (rung 4).  Next, in order — details and the
+**§M90 Docker, ~80 %.**  `docker run --network host busybox:musl echo hi`
+prints `hi` on aarch64 (rungs 1-2 done); cgroup limits and inotify done (rung 3); overlayfs + Docker's overlay2 done (rung 4); container networking done (rung 5: bridge, NAT, `-p`).  Next, in order — details and the
 test recipe in PLAN.md §M90 "RESUME HERE":
 
 1. ~~cgroup v2 limits enforced (`memory.max`, `cpu.max`, `pids.max`) + `inotify`~~ — DONE 2026-10-08; memory.max on a Linux-style charge model 2026-10-09 (`--memory 8m` works, OOMKilled true/137)
 2. ~~overlayfs~~ — DONE 2026-10-09 (overlay2 driver: run, diff, commit)
-3. networking (net namespace, veth, bridge, NAT, `-p`)
+3. ~~networking (net namespace, veth, bridge, NAT, `-p`)~~ — DONE 2026-10-10
 4. `docker run -it` (pty), `docker build`, volumes
 5. x86_64 after the higher-half kernel move
 
@@ -223,6 +223,11 @@ Instruments added: `!! PIT STARVED` (per-CPU, falsified by `pitstarvetest`), NMI
 | 18 | ~~`docker run --memory 8m` OOM-killed `runc init` itself~~ | — | **FIXED 2026-10-09** (asked for: "look at the Linux-like charge model"): frames are charged at allocation to the allocating cgroup and uncharged at free (per-frame owner table); a memfd's cached pages are charged to its creator.  An 8 MiB container starts (memory.current 4.4 MiB inside), OOMKilled true/137 when it overruns |
 | 20 | ~~every unmount dropped the whole page cache~~ | — | **FIXED 2026-10-09**: mapped pages of every file were detached; containerd's bbolt panicked after the first overlay unmount.  Now only the unmounted tree's inodes |
 | 21 | ~~bind records outlived their dentries~~ | — | **FIXED 2026-10-09**: kernel data abort at the next unbind after a container's overlay went; `binds_forget` before every dentry free |
+| 23 | ~~TASK_MAX_FDS was 32~~ | — | **FIXED 2026-10-10**: 256, close-on-exec as a bit array; dockerd ran out at the second container |
+| 24 | ~~a bind of a namespace handle pinned the path, not the namespace~~ | — | **FIXED 2026-10-10**: `procfs_ns_pin` (Docker's /var/run/docker/netns named dockerd's own namespace) |
+| 25 | ~~a deleted-but-open file outliving its directory called into the freed directory at close~~ | — | **FIXED 2026-10-10**: `unlink_pending` defers the directory's removal |
+| 26 | ~~setns(mnt) did not move the caller's root~~ | — | **FIXED 2026-10-10**: `docker exec` works |
+| 27 | ~~arm64 had no sendmsg/recvmsg; splice was ENOSYS~~ | — | **FIXED 2026-10-10**: LP64 handlers; splice EINVAL so Go falls back |
 | 22 | ~~a bind made right before a mount namespace was invisible in it~~ | — | **FIXED 2026-10-09**: off-by-one (`<` for `<=`); a second container saw an empty root |
 | 19 | ~~`/proc/<pid>/cgroup` printed relative to the target's cgroup namespace~~ | — | **FIXED 2026-10-08**: Linux uses the READER's; containerd's shim read "0::/" for a container's init and could not watch its memory.events (no OOM event) |
 

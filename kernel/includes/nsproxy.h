@@ -32,6 +32,10 @@ struct nsobj {
     struct nsobj* parent;
     int       next_nr;
     int       init_pid;
+    /* §M90 rung 5 — NSK_NET: the network stack's namespace number (net.c's
+     * table: its own loopback, devices, routes, sockets).  The initial
+     * namespace is 0 and has no object. */
+    int       net_id;
 };
 #define PIDNS_MAX_LEVEL 4                /* task->upid[] entries: levels 0..3 */
 
@@ -53,6 +57,10 @@ uint32_t ns_child_ino_of(const struct task* t, int kind);
 /* `t`'s namespace object of `kind`, with a reference (NULL = the initial one,
  * which needs none).  ns_put drops one. */
 struct nsobj* ns_get(const struct task* t, int kind);
+/* §M90 rung 5 — the network namespace number `t` is in (0 = the machine's). */
+int ns_net_id(const struct task* t);
+/* Take one more reference on `o` (NULL = the initial namespace: none needed). */
+struct nsobj* ns_hold(struct nsobj* o);
 void          ns_put(struct nsobj* o);
 /* The same for the namespace `t`'s next child is born in (time_for_children). */
 struct nsobj* ns_get_child(const struct task* t, int kind);

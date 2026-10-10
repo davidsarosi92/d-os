@@ -232,7 +232,7 @@ fixed first, whatever it touches.
 | queued UI | ✅ done (§4.116) — Memory page, System information, translations 73 → 0 | — |
 | §M88 | ✅ (§4.118) | open: a taskbar per monitor |
 | §M89 | ◐ → core ✅ | Java: `java Hello.java` from the unmodified JDK on x86_64 + aarch64 (DOCS §4.119); open: `app install` end to end, host-side delivery, rung 5 measurements |
-| §M90 | ◐ ~70 % (2026-10-09) | Docker itself on d-os (dockerd + containerd + runc + the CLI), no Docker Desktop — rungs 1-2 ✅ (`docker run … echo hi` prints `hi`, aarch64); cgroup limits + inotify ✅ (OOMKilled true/137); overlayfs + overlay2 ✅ (run/diff/commit); next: networking, `-it`/build, x86_64 — resume order in §M90 |
+| §M90 | ◐ ~80 % (2026-10-10) | Docker itself on d-os (dockerd + containerd + runc + the CLI), no Docker Desktop — rungs 1-2 ✅ (`docker run … echo hi` prints `hi`, aarch64); cgroup limits + inotify ✅ (OOMKilled true/137); overlayfs + overlay2 ✅ (run/diff/commit); networking ✅ (default bridge, NAT, `-p`); next: `-it`/build/volumes, x86_64 — resume order in §M90 |
 | §M91 | — | the ABI as its own project: d-os, Linux and NT personalities over one common language (ReactOS's pattern) — designed, not started |
 | §M92 | — | a driver engine for d-os, Linux and Windows drivers — an OPEN QUESTION, recorded, not decided |
 | §M93 | — | installing software as a user: DOWNLOAD from the vendor (`wget`) → `app install` → run, no OCI image required — the guide plus the `.tar.gz` install, glibc decision, manifest, service registration; **next after §M90**, before §M91/§M92 |
@@ -6131,11 +6131,32 @@ fixed-address Go binaries load at 0x200000, inside the low identity map):**
   defects fixed on the way (whole page cache dropped at every unmount, bind
   records outliving their dentries, a bind made just before a namespace
   invisible in it).  Estimate now ~70 %.
+- Rung 5 (networking), staged, each with its completion condition:
+  5a network namespaces in the stack (devices, TCP, UDP, ARP, routes per
+     namespace; a loopback per namespace) — DONE when a listener in one
+     namespace is unreachable from another and 127.0.0.1 differs (`netnstest`);
+  5b veth pairs and a learning bridge (kernel/core/netvirt.c) — DONE when two
+     namespaces talk over a veth and a host reaches a namespace through a
+     bridge and back (`netnstest`);
+  5c rtnetlink configuration: NEWLINK bridge/veth (peer namespace by fd or
+     pid), SETLINK up/down/rename/master/netns/MTU/MAC, DELLINK, NEW/DELADDR,
+     NEW/DELROUTE, per-namespace dumps with stable ifindex — DONE when dockerd
+     starts without --bridge=none and creates docker0 (`nltest`);
+  5d IPv4 forwarding per namespace (/proc/sys/net/ipv4/ip_forward) and
+     masquerade as a named kernel policy (`net.masquerade`; no netfilter) —
+     DONE when a namespace behind a bridge reaches the gateway (`netnstest`);
+  5e `-p` through docker-proxy — DONE when `docker run -p 8080:80 … httpd`
+     answers on the host's 127.0.0.1:8080.
+  The rung is complete when a container on Docker's default network has an
+  address, reaches the internet, and a published port answers.
+  DONE 2026-10-10 (all five stages; DOCS change log): eth0 172.17.0.2/16,
+  `wget http://example.com` from a container through NAT, `-p 8080:80`
+  answers on the host.  Estimate now ~80 %.
 - **RESUME HERE — in this order:**
   1. (done 2026-10-08 — cgroup limits + inotify)
   2. (done 2026-10-09 — overlayfs; the test recipe now uses
      `--storage-driver=overlay2`)
-  3. Rung 5: networking — network namespace, veth, bridge, NAT; `-p 8080:80`.
+  3. (done 2026-10-10 — networking; dockerd now runs WITHOUT --bridge=none)
   4. Rung 6: `docker run -it` (pty/devpts), `docker build`, volumes.
   5. x86_64: waits for the higher-half kernel move.
   Open beside it: NEXT.md #14 (rare pthread_join hang) and #16 (a non-leader
@@ -6144,7 +6165,7 @@ fixed-address Go binaries load at 0x200000, inside the low identity map):**
   aarch64 --smp 2 --mem 3G --disk build/aarch64/dk.img --via serial
   --boot-timeout 240 --between 75 --settle 120` (the harness types on a fixed
   clock: too short a pause reads as a hang) with `mkdir /run`, `containerd &`,
-  `dockerd --containerd=/run/containerd/containerd.sock --storage-driver=overlay2
+  `dockerd --containerd=/run/containerd/containerd.sock --storage-driver=overlay2 (no --bridge=none since 2026-10-10)
   --iptables=false --bridge=none --ip6tables=false &`, `docker version`,
   `docker load -i /mnt/busybox.tar`, `docker run --network host busybox:musl
   echo hi`; `strace err name <task>` to see a failing step.

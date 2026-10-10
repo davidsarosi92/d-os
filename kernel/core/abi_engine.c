@@ -938,13 +938,13 @@ static long h_chroot(struct abi_ctx* c) {
 #define CLONE_FS_      0x00000200ul
 #define CLONE_FILES_   0x00000400ul
 #define CLONE_SYSVSEM_ 0x00040000ul
-#define CLONE_NSOBJ_   (NS_CLONE_NEWUTS | NS_CLONE_NEWIPC | NS_CLONE_NEWCGROUP | NS_CLONE_NEWTIME | \
+#define CLONE_NSOBJ_   (NS_CLONE_NEWUTS | NS_CLONE_NEWIPC | NS_CLONE_NEWCGROUP | NS_CLONE_NEWTIME | NS_CLONE_NEWNET | \
                         NS_CLONE_NEWPID)
 static long h_unshare(struct abi_ctx* c) {
     unsigned long fl = c->a[0];
     unsigned long known = CLONE_NEWNS_ | CLONE_FS_ | CLONE_FILES_ | CLONE_SYSVSEM_ | CLONE_NSOBJ_;
     if (fl & ~known) {
-        kprintf("unshare: flags %lx not supported (NET/USER namespaces do not exist yet)\n",
+        kprintf("unshare: flags %lx not supported (USER namespaces do not exist yet)\n",
                 fl & ~known);
         return -ABI_EINVAL;
     }
@@ -1015,7 +1015,14 @@ static long h_mount(struct abi_ctx* c) {
      * path, in this task's mount namespace.  MS_REC changes nothing here — a
      * bind already carries everything below its source. */
     if ((fl & MS_BIND_) && !(fl & MS_REMOUNT_) && src[0]) {
-        int r = vfs_bind(src, tgt);
+        /* §M90 rung 5 — a namespace HANDLE pins its namespace (procfs.c,
+         * procfs_ns_pin): bind the pinned entry, not the per-opener path. */
+        char pinned[64];
+        extern int procfs_ns_pin(const char* path, char* out, size_t cap);
+        int pin = 0;
+        { int i = 0; const char* pp = "/proc/"; while (pp[i] && src[i] == pp[i]) i++;
+          if (!pp[i]) pin = procfs_ns_pin(src, pinned, sizeof pinned) == 0; }
+        int r = vfs_bind(pin ? pinned : src, tgt);
         if (r == 0) return 0;
         if (r == -1) return -ABI_ENOENT;
         if (r == -2) return -16;                         /* EBUSY  */
@@ -1129,8 +1136,19 @@ static long h_setns(struct abi_ctx* c) {
     struct task* t = task_current();
     if (!t) return -ABI_EINVAL;
     if (!cred_capable(&t->cred, CAP_SYS_ADMIN_)) return -ABI_EPERM;
-    if (kind == NSK_MNT) { t->mntns = mnt; return 0; }
-    if (kind == NSK_NET || kind == NSK_USER) return 0;
+    if (kind == NSK_MNT) {
+        /* Linux: joining a mount namespace moves the caller's root and
+         * working directory to that namespace's root (runc exec). */
+        t->mntns = mnt;
+        t->cred.root = vfs_mntns_root(mnt);
+        t->cred.cwd[0] = 0;
+        return 0;
+    }
+    if (kind == NSK_USER) return 0;
+    /* §M90 rung 5 — a NETWORK namespace is joined by the calling THREAD (as
+     * on Linux): Go's netlink library locks an OS thread, setns()es it into
+     * a container's namespace and configures its devices from there. */
+    if (kind == NSK_NET) { ns_enter(t, NSK_NET, o); return 0; }
     /* Linux: joining a PID namespace changes where CHILDREN are born; the
      * caller keeps its own number (and must be at or above that namespace). */
     if (kind == NSK_PID) {
@@ -1175,6 +1193,7 @@ static long h_pivot_root(struct abi_ctx* c) {
     t->cred.root = d;
     t->cred.cwd[0] = 0;
     for (unsigned i = 0; i < sizeof t->pivot_old; i++) { t->pivot_old[i] = rel[i]; if (!rel[i]) break; }
+    vfs_mntns_set_root(t->mntns, d);              /* §M90 — the namespace's "/" now */
     return 0;
 }
 static long h_umount2(struct abi_ctx* c) {
@@ -2996,6 +3015,148 @@ static long h_recvfrom(struct abi_ctx* c) {
     return n;
 }
 
+/* §M90 rung 5 — sendmsg / recvmsg for the LP64 guests (arm64; amd64 keeps its
+ * per-arch pair for now).  arm64 had NEITHER: a busybox `ip addr` in a
+ * container sent its netlink dump request with sendmsg, read the answer with
+ * recvmsg, heard ENOSYS and retried — five million times.  The msghdr is
+ * LP64's: name@0, namelen@8, iov@16, iovlen@24, control@32, controllen@40,
+ * flags@48; an iovec is {base, len}.  The payload is gathered/scattered over
+ * up to 64 KiB of iovecs; a netlink peer is named by a sockaddr_nl, an AF_INET
+ * one by a sockaddr_in, a unix stream carries one descriptor in SCM_RIGHTS. */
+#define ABI_MSG_MAX 65536u
+struct abi_iov { uint64_t base, len; };
+
+static long msg_iovs(unsigned long um, struct abi_iov* v, int* n, uint64_t* total) {
+    uint64_t iov = *(uint64_t*)(uintptr_t)(um + 16), cnt = *(uint64_t*)(uintptr_t)(um + 24);
+    if (cnt > 16) return -ABI_EINVAL;                       /* UIO_MAXIOV is 1024; 16 is plenty here */
+    if (cnt && !abi_user_r_ok(iov, cnt * sizeof(struct abi_iov))) return -ABI_EFAULT;
+    *total = 0;
+    for (uint64_t i = 0; i < cnt; i++) {
+        v[i] = ((struct abi_iov*)(uintptr_t)iov)[i];
+        *total += v[i].len;
+    }
+    *n = (int)cnt;
+    return 0;
+}
+
+static long h_sendmsg(struct abi_ctx* c) {
+    if (c->map->word_bytes != 8) return -ABI_ENOSYS;
+    int fd = (int)c->a[0];
+    unsigned long um = c->a[1];
+    if (!abi_user_r_ok(um, 56)) return -ABI_EFAULT;
+    struct abi_iov v[16]; int n = 0; uint64_t total = 0;
+    long e = msg_iovs(um, v, &n, &total);
+    if (e) return e;
+    if (total > ABI_MSG_MAX) return -90;                    /* EMSGSIZE */
+    uint8_t* k = (uint8_t*)kmalloc(total ? total : 1);
+    if (!k) return -12;
+    uint64_t at = 0;
+    for (int i = 0; i < n; i++) {
+        if (v[i].len && !abi_user_r_ok(v[i].base, v[i].len)) { kfree(k); return -ABI_EFAULT; }
+        for (uint64_t b = 0; b < v[i].len; b++) k[at++] = ((const uint8_t*)(uintptr_t)v[i].base)[b];
+    }
+    long r;
+    uint64_t name = *(uint64_t*)(uintptr_t)um;
+    if (abi_fd_is_netlink(fd)) {
+        struct ofile* o = fd_lookup(fd);
+        r = o ? nl_send(o->nl, k, (size_t)total) : -ABI_EBADF;
+    } else if (abi_fd_is_unix(fd)) {
+        /* one descriptor in SCM_RIGHTS: cmsg_len(8) level(4) type(4) fd(4) */
+        int passfd = -1;
+        uint64_t ctl = *(uint64_t*)(uintptr_t)(um + 32), clen = *(uint64_t*)(uintptr_t)(um + 40);
+        if (ctl && clen >= 20 && abi_user_r_ok(ctl, 20)) {
+            const uint8_t* cm = (const uint8_t*)(uintptr_t)ctl;
+            if (*(const uint32_t*)(cm + 8) == 1 && *(const uint32_t*)(cm + 12) == 1)
+                passfd = *(const int32_t*)(cm + 16);
+        }
+        r = passfd >= 0 ? sys_send_k(fd, k, (size_t)total, passfd) : sys_write_k(fd, k, (size_t)total);
+    } else if (name) {
+        uint32_t ip; int port;
+        int a = abi_addr_in(name, &ip, &port);
+        r = a == -1 ? -ABI_EFAULT : a == -2 ? -ABI_EAFNOSUPPORT : sys_sendto_k(fd, k, (size_t)total, ip, port);
+    } else {
+        r = sys_write_k(fd, k, (size_t)total);
+    }
+    kfree(k);
+    return r;
+}
+
+static long h_recvmsg(struct abi_ctx* c) {
+    if (c->map->word_bytes != 8) return -ABI_ENOSYS;
+    int fd = (int)c->a[0];
+    unsigned long um = c->a[1];
+    int flags = (int)c->a[2];
+    if (!abi_user_w_ok(um, 56)) return -ABI_EFAULT;
+    struct abi_iov v[16]; int n = 0; uint64_t total = 0;
+    long e = msg_iovs(um, v, &n, &total);
+    if (e) return e;
+    for (int i = 0; i < n; i++)
+        if (v[i].len && !abi_user_w_ok(v[i].base, v[i].len)) return -ABI_EFAULT;
+    uint64_t want = total > ABI_MSG_MAX ? ABI_MSG_MAX : total;
+    uint8_t* k = (uint8_t*)kmalloc(want ? want : 1);
+    if (!k) return -12;
+    long r;
+    uint64_t name = *(uint64_t*)(uintptr_t)um;
+    uint64_t got = 0;                                       /* bytes placed in k */
+    int msgflags = 0;
+    if (abi_fd_is_netlink(fd)) {
+        struct ofile* o = fd_lookup(fd);
+        if (!o) { kfree(k); return -ABI_EBADF; }
+        int block = !o->nonblock && !(flags & 0x40);
+        r = nl_recv(o->nl, k, (size_t)want, block, flags & 0x2, 1 /* full length */);
+        if (r >= 0) {
+            got = (uint64_t)r < want ? (uint64_t)r : want;
+            if ((uint64_t)r > want) msgflags |= 0x20;           /* MSG_TRUNC */
+            if (!(flags & 0x20)) r = (long)got;                 /* MSG_TRUNC asks for the full size */
+            if (name) abi_nl_out(name, um + 8, 0);
+        }
+        *(uint64_t*)(uintptr_t)(um + 40) = 0;                  /* no control data */
+    } else if (abi_fd_is_unix(fd)) {
+        int passfd = -1;
+        /* straight into the first iovec (these cores take USER buffers and
+         * bounce them themselves); a later iovec stays untouched — what Go and
+         * busybox, the callers here, both use is one */
+        r = n ? sys_recv_u(fd, (uintptr_t)v[0].base, (size_t)v[0].len, &passfd) : 0;
+        uint64_t ctl = *(uint64_t*)(uintptr_t)(um + 32), clen = *(uint64_t*)(uintptr_t)(um + 40);
+        uint64_t used = 0;
+        if (r >= 0 && passfd >= 0 && ctl && clen >= 24 && abi_user_w_ok(ctl, 24)) {
+            uint8_t* cm = (uint8_t*)(uintptr_t)ctl;
+            *(uint64_t*)cm = 20; *(uint32_t*)(cm + 8) = 1; *(uint32_t*)(cm + 12) = 1;
+            *(int32_t*)(cm + 16) = passfd;
+            used = 24;
+        } else if (passfd >= 0) {
+            msgflags |= 0x8;                                    /* MSG_CTRUNC: nowhere to put it */
+        }
+        *(uint64_t*)(uintptr_t)(um + 40) = used;
+        if (name && abi_user_w_ok(um + 8, 4)) *(uint32_t*)(uintptr_t)(um + 8) = 0;
+    } else {
+        uint32_t ip = 0; int port = 0;
+        r = n ? sys_recvfrom_u(fd, (uintptr_t)v[0].base, (size_t)v[0].len, &ip, &port) : 0;
+        if (r >= 0 && name) abi_addr_out(name, um + 8, ip, port);
+        *(uint64_t*)(uintptr_t)(um + 40) = 0;
+    }
+    /* scatter (the netlink path; the others wrote the iovec themselves) */
+    uint64_t at = 0;
+    for (int i = 0; i < n && at < got; i++) {
+        uint64_t m = v[i].len < got - at ? v[i].len : got - at;
+        for (uint64_t b = 0; b < m; b++) ((uint8_t*)(uintptr_t)v[i].base)[b] = k[at + b];
+        at += m;
+    }
+    kfree(k);
+    *(int32_t*)(uintptr_t)(um + 48) = msgflags;
+    return r;
+}
+
+/* §M90 rung 5 — splice(2): EINVAL, Linux's answer for descriptors it cannot
+ * splice — and the one Go falls back on.  Go's io.Copy between two TCP
+ * connections tries splice first and treats any error OTHER than EINVAL as
+ * the copy's own failure, so ENOSYS here made docker-proxy forward nothing
+ * (`docker run -p 8080:80` answered 0 bytes).  A real splice is not built:
+ * moving bytes between two descriptors through a kernel buffer would lose
+ * whatever was read when the write fails, which is worse than not offering
+ * it; every caller here has a copy loop to fall back on. */
+static long h_splice(struct abi_ctx* c) { (void)c; return -ABI_EINVAL; }
+
 static long h_shutdown(struct abi_ctx* c) {
     return sys_shutdown((int)c->a[0], (int)c->a[1]);
 }
@@ -3140,6 +3301,9 @@ static const struct {
     [ABI_INOTIFY_INIT]    = { "inotify_init",    h_inotify_init },
     [ABI_INOTIFY_ADD_WATCH] = { "inotify_add_watch", h_inotify_add_watch },
     [ABI_INOTIFY_RM_WATCH]  = { "inotify_rm_watch",  h_inotify_rm_watch },
+    [ABI_SENDMSG]         = { "sendmsg",         h_sendmsg },
+    [ABI_RECVMSG]         = { "recvmsg",         h_recvmsg },
+    [ABI_SPLICE]          = { "splice",          h_splice },
     /* §M24 — the socket surface, shared by all three arches at once. */
     [ABI_SOCKET]       = { "socket",       h_socket       },
     [ABI_SOCKETPAIR]   = { "socketpair",   h_socketpair   },   /* §M90 */

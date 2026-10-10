@@ -182,6 +182,7 @@ static const struct abi_nument linux_i386_ents[] = {
     /* §M90 rung 3 — inotify: init 291, add_watch 292, rm_watch 293, init1 332. */
     { 291, ABI_INOTIFY_INIT }, { 292, ABI_INOTIFY_ADD_WATCH }, { 293, ABI_INOTIFY_RM_WATCH },
     { 332, ABI_INOTIFY_INIT1 },
+    { 313, ABI_SPLICE },                                  /* §M90 rung 5 — EINVAL */
 };
 
 /* ---- Linux / amd64 -------------------------------------------------------- */
@@ -303,6 +304,7 @@ static const struct abi_nument linux_amd64_ents[] = {
     /* §M90 rung 3 — inotify: init 253, add_watch 254, rm_watch 255, init1 294. */
     { 253, ABI_INOTIFY_INIT }, { 254, ABI_INOTIFY_ADD_WATCH }, { 255, ABI_INOTIFY_RM_WATCH },
     { 294, ABI_INOTIFY_INIT1 },
+    { 275, ABI_SPLICE },                                  /* §M90 rung 5 — EINVAL */
     /* §M65 — d-os display-bridge op; the SAME number on every guest,
      * because it is ours to choose (Linux has no such call). */
     { 0xD054, ABI_UI_BUILD },
@@ -426,6 +428,9 @@ static const struct abi_nument linux_arm64_ents[] = {
     { 242, ABI_ACCEPT4     },
     /* §M90 rung 3 — inotify: init1 26, add_watch 27, rm_watch 28 (no plain init). */
     {  26, ABI_INOTIFY_INIT1 }, {  27, ABI_INOTIFY_ADD_WATCH }, {  28, ABI_INOTIFY_RM_WATCH },
+    /* §M90 rung 5 — sendmsg 211, recvmsg 212 (arm64 had neither). */
+    { 211, ABI_SENDMSG }, { 212, ABI_RECVMSG },
+    {  76, ABI_SPLICE },                                  /* §M90 rung 5 — EINVAL */
     /* §M65 — d-os display-bridge op; the SAME number on every guest,
      * because it is ours to choose (Linux has no such call). */
     { 0xD054, ABI_UI_BUILD },

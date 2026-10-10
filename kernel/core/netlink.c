@@ -39,6 +39,8 @@
 #include "task.h"
 #include "fd.h"
 #include "printf.h"
+#include "nsproxy.h"
+#include "syscall.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -55,6 +57,7 @@ struct nlsock {
     struct nl_dgram q[NL_MAXQ];
     int          head, count;
     struct ofile* owner;
+    int          netns;              /* §M90 rung 5 — the namespace it was made in */
 };
 
 /* ---- message building ------------------------------------------------------ */
@@ -115,13 +118,15 @@ static void nl_attr_be32(struct nlb* b, uint16_t type, uint32_t host) {
 #define AF_INET_  2
 #define AF_INET6_ 10
 
-struct devlist { struct net_device* d[16]; int n; };
+struct devlist { struct net_device* d[64]; int n; int ns; };
 static void dev_collect(struct net_device* dev, void* ctx) {
     struct devlist* l = (struct devlist*)ctx;
-    if (l->n < 16 && !(dev->flags & NETDEV_F_SIMULATED)) l->d[l->n++] = dev;
+    if (l->n < 64 && !(dev->flags & NETDEV_F_SIMULATED) && dev->netns == l->ns) l->d[l->n++] = dev;
 }
 static int is_lo(const struct net_device* d) { return (d->flags & NETDEV_F_LOOPBACK) != 0; }
 static int prefix_of(uint32_t mask) { int n = 0; while (mask & 0x80000000u) { n++; mask <<= 1; } return n; }
+static uint32_t mask_of(int len) { return len <= 0 ? 0 : (len >= 32 ? 0xFFFFFFFFu : ~((1u << (32 - len)) - 1)); }
+static uint32_t be32_host(const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
 
 static uint32_t if_flags(const struct net_device* d) {
     uint32_t f = 0;
@@ -132,13 +137,21 @@ static uint32_t if_flags(const struct net_device* d) {
     return f;
 }
 
-static void put_link(struct nlb* b, const struct net_device* d, int idx, uint16_t flags,
+static const char* kind_name(const struct net_device* d) {
+    switch (d->kind) {
+    case NETDEV_K_VETH:   return "veth";
+    case NETDEV_K_BRIDGE: return "bridge";
+    default:              return NULL;
+    }
+}
+
+static void put_link(struct nlb* b, const struct net_device* d, uint16_t flags,
                      uint32_t seq, uint32_t pid) {
     uint32_t at = nl_begin(b, RTM_NEWLINK, flags, seq, pid);
     uint8_t* ifi = (uint8_t*)nlb_put(b, 16);
     if (ifi) {
         w16(ifi + 2, is_lo(d) ? 772 : 1);             /* ARPHRD_LOOPBACK / ETHER */
-        w32(ifi + 4, (uint32_t)idx);
+        w32(ifi + 4, (uint32_t)d->ifindex);
         w32(ifi + 8, if_flags(d));
     }
     const char* nm = d->name ? d->name : "eth";
@@ -155,10 +168,21 @@ static void put_link(struct nlb* b, const struct net_device* d, int idx, uint16_
     for (int i = 0; i < 6; i++) { mac[i] = is_lo(d) ? 0 : d->mac[i]; bc[i] = is_lo(d) ? 0 : 0xFF; }
     nl_attr(b, 1 /* IFLA_ADDRESS */, mac, 6);
     nl_attr(b, 2 /* IFLA_BROADCAST */, bc, 6);
+    if (d->master) nl_attr32(b, 10 /* IFLA_MASTER */, (uint32_t)d->master->ifindex);
+    /* §M90 rung 5 — what kind of link it is (Docker checks that docker0 is a
+     * "bridge" before it reuses it): IFLA_LINKINFO { IFLA_INFO_KIND }. */
+    const char* k = kind_name(d);
+    if (k) {
+        uint32_t li = b->n;
+        uint8_t* hdr = (uint8_t*)nlb_put(b, 4);
+        uint16_t kl = 0; while (k[kl]) kl++;
+        nl_attr(b, 1 /* IFLA_INFO_KIND */, k, (uint16_t)(kl + 1));
+        if (hdr && !b->overflow) { w16(hdr, (uint16_t)(b->n - li)); w16(hdr + 2, 18 /* IFLA_LINKINFO */); }
+    }
     nl_end(b, at);
 }
 
-static void put_addr(struct nlb* b, const struct net_device* d, int idx, uint32_t seq, uint32_t pid) {
+static void put_addr(struct nlb* b, const struct net_device* d, uint32_t seq, uint32_t pid) {
     if (!d->ip) return;
     uint32_t at = nl_begin(b, RTM_NEWADDR, F_MULTI, seq, pid);
     uint8_t* ifa = (uint8_t*)nlb_put(b, 8);
@@ -167,7 +191,7 @@ static void put_addr(struct nlb* b, const struct net_device* d, int idx, uint32_
         ifa[1] = (uint8_t)prefix_of(d->netmask);
         ifa[2] = 0x80;                                /* IFA_F_PERMANENT */
         ifa[3] = is_lo(d) ? 254 : 0;                  /* RT_SCOPE_HOST / UNIVERSE */
-        w32(ifa + 4, (uint32_t)idx);
+        w32(ifa + 4, (uint32_t)d->ifindex);
     }
     nl_attr_be32(b, 1 /* IFA_ADDRESS */, d->ip);
     nl_attr_be32(b, 2 /* IFA_LOCAL */, d->ip);
@@ -221,6 +245,195 @@ static const uint8_t* find_attr(const uint8_t* a, uint32_t len, uint16_t type, u
     }
     return NULL;
 }
+static int attr_str(const uint8_t* a, uint16_t al, char* out, int cap) {
+    int i = 0;
+    for (; i < al && i + 1 < cap && a[i]; i++) out[i] = (char)a[i];
+    out[i] = 0;
+    return i;
+}
+
+/* ---- §M90 rung 5 — configuration ------------------------------------------------ */
+
+#define RTM_DELLINK  17
+#define RTM_DELADDR  21
+#define RTM_DELROUTE 25
+#define IFF_UP_      0x1u
+
+struct nsobj;
+int procfs_ns_handle(struct file* f, int* kind, struct nsobj** obj, int* mnt, uint32_t* ino);
+
+/* The network namespace an IFLA_NET_NS_FD / IFLA_NET_NS_PID names, or -1. */
+static int ns_from_attrs(const uint8_t* attrs, uint32_t alen) {
+    uint16_t l = 0;
+    const uint8_t* v = find_attr(attrs, alen, 28 /* IFLA_NET_NS_FD */, &l);
+    if (v && l >= 4) {
+        struct file* f = sys_fd_vfs_file((int)r32(v));
+        int kind; struct nsobj* o = NULL;
+        if (!f || !procfs_ns_handle(f, &kind, &o, NULL, NULL) || kind != NSK_NET) return -1;
+        return o ? o->net_id : 0;
+    }
+    v = find_attr(attrs, alen, 19 /* IFLA_NET_NS_PID */, &l);
+    if (v && l >= 4) {
+        struct task* me = task_current();
+        int g = ns_pid_resolve(me, (int)r32(v));
+        struct task* t = g > 0 ? task_find(g) : NULL;
+        return t ? ns_net_id(t) : -1;
+    }
+    return -2;                                         /* not given */
+}
+
+/* SETLINK / NEWLINK on an existing device: the parts we can apply. */
+static int link_apply(struct net_device* d, uint32_t ifl, uint32_t change,
+                      const uint8_t* attrs, uint32_t alen) {
+    uint16_t l = 0;
+    const uint8_t* v;
+    if ((v = find_attr(attrs, alen, 3 /* IFLA_IFNAME */, &l))) {
+        char nm[16];
+        attr_str(v, l, nm, sizeof nm);
+        const char* cur = d->name ? d->name : "";
+        int same = 1; for (int i = 0; nm[i] || cur[i]; i++) if (nm[i] != cur[i]) { same = 0; break; }
+        if (!same && netvirt_rename(d, nm) != 0) return netvirt_is_virtual(d) ? -17 : -95;
+    }
+    if ((v = find_attr(attrs, alen, 4 /* IFLA_MTU */, &l)) && l >= 4) {
+        uint32_t mtu = r32(v);
+        if (mtu < 68 || mtu > ETH_MTU) return -22;     /* frames here are at most 1500 */
+        d->mtu = mtu;
+    }
+    if ((v = find_attr(attrs, alen, 1 /* IFLA_ADDRESS */, &l)) && l == 6 && netvirt_is_virtual(d))
+        for (int i = 0; i < 6; i++) d->mac[i] = v[i];
+    if ((v = find_attr(attrs, alen, 10 /* IFLA_MASTER */, &l)) && l >= 4) {
+        uint32_t mi = r32(v);
+        struct net_device* br = mi ? net_by_index(d->netns, (int)mi) : NULL;
+        if (mi && !br) return -19;
+        if (netvirt_set_master(d, br) != 0) return -22;
+    }
+    int nsid = ns_from_attrs(attrs, alen);
+    if (nsid == -1) return -22;
+    if (nsid >= 0 && nsid != d->netns) {
+        if (!netvirt_is_virtual(d)) return -95;        /* hardware stays where it is */
+        if (net_find_ns(nsid, d->name)) return -17;
+        if (net_dev_set_ns(d, nsid) != 0) return -22;
+    }
+    if (change & IFF_UP_) d->admin_down = (ifl & IFF_UP_) ? 0 : 1;
+    else if (!change && (ifl & IFF_UP_)) d->admin_down = 0;     /* old-style: flags only */
+    return 0;
+}
+
+/* RTM_NEWLINK with NLM_F_CREATE: a bridge or a veth pair. */
+static int link_create(int ns, uint32_t ifl, const uint8_t* attrs, uint32_t alen) {
+    uint16_t l = 0;
+    char name[16] = "";
+    const uint8_t* v = find_attr(attrs, alen, 3 /* IFLA_IFNAME */, &l);
+    if (v) attr_str(v, l, name, sizeof name);
+    const uint8_t* li = find_attr(attrs, alen, 18 /* IFLA_LINKINFO */, &l);
+    if (!li) return -22;
+    uint16_t ll = l, kl = 0;
+    const uint8_t* kv = find_attr(li, ll, 1 /* IFLA_INFO_KIND */, &kl);
+    char kind[16] = "";
+    if (kv) attr_str(kv, kl, kind, sizeof kind);
+    static uint32_t auto_n;
+    if (!name[0]) {                                     /* the kernel picks one */
+        const char* pre = kind[0] == 'b' ? "br" : "veth";
+        int o = 0; for (; pre[o]; o++) name[o] = pre[o];
+        uint32_t n = auto_n++; char d[8]; int k = 0;
+        do { d[k++] = (char)('0' + n % 10); n /= 10; } while (n);
+        while (k) name[o++] = d[--k];
+        name[o] = 0;
+    }
+    struct net_device* made = NULL;
+    if (kind[0] == 'b' && kind[1] == 'r') {
+        made = netvirt_bridge_create(ns, name);
+        if (!made) return -17;
+    } else if (kind[0] == 'v' && kind[1] == 'e' && kind[2] == 't' && kind[3] == 'h') {
+        /* IFLA_INFO_DATA { VETH_INFO_PEER { ifinfomsg, attrs… } } */
+        char pname[16] = "";
+        int pns = ns;
+        uint16_t dl = 0, pl = 0;
+        const uint8_t* data = find_attr(li, ll, 2 /* IFLA_INFO_DATA */, &dl);
+        const uint8_t* peer = data ? find_attr(data, dl, 1 /* VETH_INFO_PEER */, &pl) : NULL;
+        if (peer && pl >= 16) {
+            const uint8_t* pa = peer + 16;
+            uint32_t pal = pl - 16u;
+            uint16_t nl2 = 0;
+            const uint8_t* pn = find_attr(pa, pal, 3, &nl2);
+            if (pn) attr_str(pn, nl2, pname, sizeof pname);
+            int x = ns_from_attrs(pa, pal);
+            if (x == -1) return -22;
+            if (x >= 0) pns = x;
+        }
+        if (!pname[0]) {
+            const char* pre = "veth";
+            int o = 0; for (; pre[o]; o++) pname[o] = pre[o];
+            uint32_t n = auto_n++; char d[8]; int k = 0;
+            do { d[k++] = (char)('0' + n % 10); n /= 10; } while (n);
+            while (k) pname[o++] = d[--k];
+            pname[o] = 0;
+        }
+        struct net_device* b2 = NULL;
+        int r = netvirt_veth_create(ns, name, pns, pname, &made, &b2);
+        if (r == -2) return -17;
+        if (r != 0) return -12;
+    } else {
+        kprintf("netlink: RTM_NEWLINK kind '%s' refused - only bridge and veth exist here\n", kind);
+        return -95;
+    }
+    /* the rest of the request (MTU, master, address, up) applies to it */
+    return link_apply(made, ifl, ifl & IFF_UP_, attrs, alen) == 0 ? 0 : 0;
+}
+
+static int addr_change(int ns, int add, const uint8_t* m, uint32_t len, uint16_t nlflags) {
+    if (len < 24) return -22;
+    if (m[16] != AF_INET_) return m[16] == AF_INET6_ ? -95 : -97;   /* no IPv6 here */
+    int plen = m[17];
+    struct net_device* d = net_by_index(ns, (int)r32(m + 20));
+    if (!d) return -19;
+    uint16_t l = 0;
+    const uint8_t* v = find_attr(m + 24, len - 24, 2 /* IFA_LOCAL */, &l);
+    if (!v) v = find_attr(m + 24, len - 24, 1 /* IFA_ADDRESS */, &l);
+    if (!v || l < 4) return -22;
+    uint32_t ip = be32_host(v);
+    uint32_t f = net_lock();
+    int r = 0;
+    if (add) {
+        if (d->ip == ip && (nlflags & 0x200 /* EXCL */)) r = -17;
+        else if (d->ip && d->ip != ip && !is_lo(d)) r = -95;   /* one address per device */
+        else { d->ip = ip; d->netmask = mask_of(plen); d->config_src = NETCFG_STATIC; }
+    } else {
+        if (d->ip != ip) r = -99;                              /* EADDRNOTAVAIL */
+        else { d->ip = 0; d->netmask = 0; }
+    }
+    net_unlock(f);
+    return r;
+}
+
+static int route_change(int ns, int add, const uint8_t* m, uint32_t len) {
+    if (len < 28) return -22;
+    if (m[16] != AF_INET_) return m[16] == AF_INET6_ ? -95 : -97;
+    int dlen = m[17];
+    uint32_t dst = 0, gw = 0, metric = 0;
+    int oif = 0;
+    uint16_t l = 0;
+    const uint8_t* v;
+    const uint8_t* a = m + 28; uint32_t al = len - 28;
+    if ((v = find_attr(a, al, 1 /* RTA_DST */, &l)) && l >= 4) dst = be32_host(v);
+    if ((v = find_attr(a, al, 5 /* RTA_GATEWAY */, &l)) && l >= 4) gw = be32_host(v);
+    if ((v = find_attr(a, al, 4 /* RTA_OIF */, &l)) && l >= 4) oif = (int)r32(v);
+    if ((v = find_attr(a, al, 6 /* RTA_PRIORITY */, &l)) && l >= 4) metric = r32(v);
+    struct net_device* d = oif ? net_by_index(ns, oif) : NULL;
+    if (oif && !d) return -19;
+    if (!d && gw) {                                   /* the device that reaches the gateway */
+        uint32_t nh = 0;
+        d = net_route_ns(ns, gw, &nh);
+        if (d && nh != gw) d = NULL;                  /* not on-link: Linux says ENETUNREACH */
+        if (!d) return -101;
+    }
+    if (!add) return net_route_del(ns, dst, mask_of(dlen), d) == 0 ? 0 : -3;   /* ESRCH */
+    if (!d) return -22;
+    /* The connected route of a device's own subnet exists already. */
+    if (!gw && d->ip && mask_of(dlen) == d->netmask && (dst & d->netmask) == (d->ip & d->netmask)) return 0;
+    int r = net_route_add(ns, dst, mask_of(dlen), gw, d, metric);
+    return r == 0 ? 0 : (r == -2 ? -17 : -28);
+}
 
 /* ---- one request -------------------------------------------------------------- */
 
@@ -228,14 +441,15 @@ static void handle(struct nlsock* s, const uint8_t* m, uint32_t len, struct nlb*
     uint16_t type = r16(m + 4), flags = r16(m + 6);
     uint32_t seq = r32(m + 8), pid = s->portid;
     int dump = (flags & F_DUMP) == F_DUMP;
-    struct devlist l = { { 0 }, 0 };
+    struct devlist l;
+    l.n = 0; l.ns = s->netns;
     net_for_each(dev_collect, &l);
     uint8_t family = len > 16 ? m[16] : 0;
 
     switch (type) {
     case RTM_GETLINK:
         if (dump) {
-            for (int i = 0; i < l.n; i++) put_link(b, l.d[i], i + 1, F_MULTI, seq, pid);
+            for (int i = 0; i < l.n; i++) put_link(b, l.d[i], F_MULTI, seq, pid);
             put_done(b, seq, pid);
             return;
         } else {
@@ -243,7 +457,7 @@ static void handle(struct nlsock* s, const uint8_t* m, uint32_t len, struct nlb*
             uint16_t al = 0;
             const uint8_t* nm = len > 32 ? find_attr(m + 32, len - 32, 3, &al) : NULL;
             for (int i = 0; i < l.n; i++) {
-                int match = want ? (want == i + 1) : 0;
+                int match = want ? (want == l.d[i]->ifindex) : 0;
                 if (!want && nm) {
                     const char* dn = l.d[i]->name ? l.d[i]->name : "";
                     match = 1;
@@ -253,7 +467,7 @@ static void handle(struct nlsock* s, const uint8_t* m, uint32_t len, struct nlb*
                     }
                 }
                 if (match) {
-                    put_link(b, l.d[i], i + 1, 0, seq, pid);
+                    put_link(b, l.d[i], 0, seq, pid);
                     if (flags & F_ACK) put_error(b, 0, m, pid);
                     return;
                 }
@@ -263,20 +477,58 @@ static void handle(struct nlsock* s, const uint8_t* m, uint32_t len, struct nlb*
         }
     case RTM_GETADDR:
         if (family != AF_INET6_)
-            for (int i = 0; i < l.n; i++) put_addr(b, l.d[i], i + 1, seq, pid);
+            for (int i = 0; i < l.n; i++) put_addr(b, l.d[i], seq, pid);
         put_done(b, seq, pid);
         return;
     case RTM_GETROUTE:
+        /* §M90 rung 5 — WITHOUT NLM_F_DUMP this is a route LOOKUP ("ip route
+         * get", netlink.RouteGet): the one route that carries RTA_DST, as the
+         * kernel would send the packet.  Answering it with the whole table
+         * made Docker take the FIRST entry's device — the loopback's — for a
+         * container's default gateway ("default via 172.17.0.1 dev lo"). */
+        if (!dump) {
+            uint32_t dst = 0;
+            uint16_t al = 0;
+            const uint8_t* v = len > 28 ? find_attr(m + 28, len - 28, 1 /* RTA_DST */, &al) : NULL;
+            if (v && al >= 4) dst = be32_host(v);
+            uint32_t nh = 0;
+            struct net_device* d = net_route_ns(s->netns, dst, &nh);
+            if (!d) { put_error(b, -101 /* ENETUNREACH */, m, pid); return; }
+            uint32_t at = nl_begin(b, RTM_NEWROUTE, 0, seq, pid);
+            uint8_t* rt = (uint8_t*)nlb_put(b, 12);
+            if (rt) {
+                rt[0] = AF_INET_; rt[1] = 32;
+                rt[4] = 254;
+                rt[5] = 2;
+                rt[6] = 0;
+                rt[7] = (d->flags & NETDEV_F_LOOPBACK) ? 2 /* RTN_LOCAL */ : 1 /* UNICAST */;
+            }
+            nl_attr32(b, 15 /* RTA_TABLE */, 254);
+            nl_attr_be32(b, 1 /* RTA_DST */, dst);
+            nl_attr32(b, 4 /* RTA_OIF */, (uint32_t)d->ifindex);
+            if (nh != dst) nl_attr_be32(b, 5 /* RTA_GATEWAY */, nh);
+            if (d->ip) nl_attr_be32(b, 7 /* RTA_PREFSRC */, d->ip);
+            nl_end(b, at);
+            if (flags & F_ACK) put_error(b, 0, m, pid);
+            return;
+        }
         if (family != AF_INET6_) {
             for (int i = 0; i < l.n; i++) {
                 struct net_device* d = l.d[i];
-                if (!d->ip) continue;
-                put_route(b, d->ip & d->netmask, prefix_of(d->netmask), 0, d->ip, i + 1,
+                if (!d->ip || d->admin_down) continue;
+                put_route(b, d->ip & d->netmask, prefix_of(d->netmask), 0, d->ip, d->ifindex,
                           is_lo(d) ? 254 : 253 /* HOST / LINK */, seq, pid);
             }
-            for (int i = 0; i < l.n; i++)
+            struct net_rt r;
+            int have_default = 0;
+            for (int i = 0; net_route_at(i, &r) == 0; i++) {
+                if (!r.used || r.ns != s->netns || !r.dev) continue;
+                put_route(b, r.dst, prefix_of(r.mask), r.gw, 0, r.dev->ifindex, r.gw ? 0 : 253, seq, pid);
+                if (!r.mask) have_default = 1;
+            }
+            for (int i = 0; i < l.n && !have_default; i++)
                 if (l.d[i]->gateway && !is_lo(l.d[i])) {
-                    put_route(b, 0, 0, l.d[i]->gateway, 0, i + 1, 0, seq, pid);
+                    put_route(b, 0, 0, l.d[i]->gateway, 0, l.d[i]->ifindex, 0, seq, pid);
                     break;
                 }
         }
@@ -284,39 +536,52 @@ static void handle(struct nlsock* s, const uint8_t* m, uint32_t len, struct nlb*
         return;
     case RTM_NEWLINK:
     case RTM_SETLINK: {
-        /* "Bring an EXISTING device up" is accepted under either spelling:
-         * vishvananda/netlink's LinkSetUp — what libnetwork uses to raise "lo"
-         * in every sandbox, the host's default one included — sends it as
-         * RTM_NEWLINK with Change = Flags = IFF_UP and no attributes, while
-         * ip(8) sends RTM_SETLINK.  Neither creates anything without
-         * NLM_F_CREATE, and every device here is already up, so the request is
-         * true as asked.  The device must exist (ENODEV, as on Linux).
-         * Anything more — creating a link (a bridge, a veth pair), renaming,
-         * an MTU, taking a device DOWN — is still refused and NAMED. */
-        uint32_t idx = len >= 32 ? r32(m + 20) : 0;
-        uint32_t want_flags = len >= 32 ? r32(m + 24) : 0, change = len >= 32 ? r32(m + 28) : 0;
-        int creates = (type == RTM_NEWLINK) && (flags & (0x400 /* CREATE */ | 0x200 /* EXCL */));
-        int only_up = !creates && (len <= 32) && ((change & ~0x1u) == 0) &&
-                      (!change || (want_flags & 0x1));
-        if (!only_up) {
-            kprintf("netlink: %s (index %u, change %x, flags %x, %u attribute bytes) refused - "
-                    "link configuration is M90 rung 5\n",
-                    type == RTM_NEWLINK ? "RTM_NEWLINK" : "RTM_SETLINK", idx, change, want_flags,
-                    len > 32 ? len - 32 : 0);
-            put_error(b, -95 /* EOPNOTSUPP */, m, pid);
-            return;
+        if (len < 32) { put_error(b, -22, m, pid); return; }
+        uint32_t idx = r32(m + 20);
+        uint32_t ifl = r32(m + 24), change = r32(m + 28);
+        const uint8_t* attrs = m + 32; uint32_t alen = len - 32;
+        struct net_device* d = idx ? net_by_index(s->netns, (int)idx) : NULL;
+        if (!d && !idx) {                             /* by name */
+            uint16_t al = 0; char nm[16];
+            const uint8_t* v = find_attr(attrs, alen, 3, &al);
+            if (v) { attr_str(v, al, nm, sizeof nm); d = net_find_ns(s->netns, nm); }
         }
-        put_error(b, (idx >= 1 && (int)idx <= l.n) ? 0 : -19 /* ENODEV */, m, pid);
+        int err;
+        if (d) {
+            err = (type == RTM_NEWLINK && (flags & 0x200 /* EXCL */) && (flags & 0x400)) ? -17
+                : link_apply(d, ifl, change, attrs, alen);
+        } else if (type == RTM_NEWLINK && (flags & 0x400 /* CREATE */)) {
+            err = link_create(s->netns, ifl, attrs, alen);
+        } else {
+            err = -19;                                 /* ENODEV */
+        }
+        put_error(b, err, m, pid);
         return;
     }
+    case RTM_DELLINK: {
+        uint32_t idx = len >= 32 ? r32(m + 20) : 0;
+        struct net_device* d = idx ? net_by_index(s->netns, (int)idx) : NULL;
+        if (!d && len > 32) {
+            uint16_t al = 0; char nm[16];
+            const uint8_t* v = find_attr(m + 32, len - 32, 3, &al);
+            if (v) { attr_str(v, al, nm, sizeof nm); d = net_find_ns(s->netns, nm); }
+        }
+        put_error(b, !d ? -19 : (netvirt_destroy(d) == 0 ? 0 : -95), m, pid);
+        return;
+    }
+    case RTM_NEWADDR: case RTM_DELADDR:
+        put_error(b, addr_change(s->netns, type == RTM_NEWADDR, m, len, flags), m, pid);
+        return;
+    case RTM_NEWROUTE: case RTM_DELROUTE:
+        put_error(b, route_change(s->netns, type == RTM_NEWROUTE, m, len), m, pid);
+        return;
     default:
         if (dump && (type & 3) == 2) {               /* any other GET dump: nothing to list */
             put_done(b, seq, pid);
             return;
         }
-        kprintf("netlink: message type %u (flags %x) refused - no configuration changes yet\n",
-                type, flags);
-        put_error(b, -95 /* EOPNOTSUPP: no configuration changes yet */, m, pid);
+        kprintf("netlink: message type %u (flags %x) refused - not handled here\n", type, flags);
+        put_error(b, -95, m, pid);
         return;
     }
 }
@@ -331,6 +596,7 @@ struct nlsock* nl_create(int proto) {
     waitq_init(&s->wq);
     struct task* t = task_current();
     s->portid = t ? (uint32_t)task_tgid(t) : 1;
+    s->netns  = net_cur_ns();       /* Linux: a socket belongs to its creator's namespace */
     return s;
 }
 
@@ -419,7 +685,8 @@ static void cmd_nltest(const char* args) {
     struct nlsock* s = nl_create(0);
     uint8_t* rx = (uint8_t*)kmalloc(NL_DGRAM);
     if (!s || !rx) { kprintf("nltest: FAIL (no socket)\n"); return; }
-    struct devlist l = { { 0 }, 0 };
+    struct devlist l;
+    l.n = 0; l.ns = net_cur_ns();
     net_for_each(dev_collect, &l);
     int ok = 1;
 
@@ -450,9 +717,10 @@ static void cmd_nltest(const char* args) {
             addrs++;
             uint32_t idx = r32(rx + off + 20);
             uint16_t al; const uint8_t* a = find_attr(rx + off + 24, len - 24, 2, &al);
-            if (a && al == 4 && idx >= 1 && (int)idx <= l.n) {
+            struct net_device* d = net_by_index(l.ns, (int)idx);
+            if (a && al == 4 && d) {
                 uint32_t ip = (uint32_t)a[0] << 24 | (uint32_t)a[1] << 16 | (uint32_t)a[2] << 8 | a[3];
-                if (ip == l.d[idx - 1]->ip) match++;
+                if (ip == d->ip) match++;
             }
         }
         off += (len + 3) & ~3u;
@@ -475,8 +743,86 @@ static void cmd_nltest(const char* args) {
 
     n = nlt_ask(s, RTM_NEWLINK, F_ACK | 0x400 /* CREATE */, 0, rx, NL_DGRAM);
     int err = (n >= 20 && r16(rx + 4) == NLMSG_ERROR) ? (int)r32(rx + 16) : 0;
-    kprintf("nltest: NEWLINK|CREATE (a configuration change) -> error %d (want -95)\n", err);
-    if (err != -95) ok = 0;
+    kprintf("nltest: NEWLINK|CREATE with no link kind -> error %d (want -22)\n", err);
+    if (err != -22) ok = 0;
+
+    /* §M90 rung 5 — a bridge made, addressed, read back and removed over
+     * netlink: what Docker does to create docker0. */
+    {
+        uint8_t req[128];
+        for (int i = 0; i < 128; i++) req[i] = 0;
+        uint32_t o2 = 32;
+        /* IFLA_IFNAME "nlbr0" */
+        w16(req + o2, 4 + 6); w16(req + o2 + 2, 3); for (int i = 0; i < 6; i++) req[o2 + 4 + i] = (uint8_t)"nlbr0"[i]; o2 += 12;
+        /* IFLA_LINKINFO { IFLA_INFO_KIND "bridge" } */
+        w16(req + o2, 4 + 12); w16(req + o2 + 2, 18);
+        w16(req + o2 + 4, 4 + 7); w16(req + o2 + 6, 1); for (int i = 0; i < 7; i++) req[o2 + 8 + i] = (uint8_t)"bridge"[i];
+        o2 += 16;
+        w32(req, o2); w16(req + 4, RTM_NEWLINK); w16(req + 6, 1 | F_ACK | 0x400 | 0x200); w32(req + 8, 90);
+        w32(req + 24, 1); w32(req + 28, 1);                   /* IFF_UP */
+        n = (nl_send(s, req, o2) == (long)o2) ? (int)nl_recv(s, rx, NL_DGRAM, 0, 0, 0) : -1;
+        int mk = (n >= 20 && r16(rx + 4) == NLMSG_ERROR) ? (int)r32(rx + 16) : -999;
+        struct net_device* br = net_find_ns(l.ns, "nlbr0");
+        int again = -999;
+        if (nl_send(s, req, o2) == (long)o2 && nl_recv(s, rx, NL_DGRAM, 0, 0, 0) >= 20) again = (int)r32(rx + 16);
+        /* NEWADDR 10.77.0.1/24 */
+        for (int i = 0; i < 128; i++) req[i] = 0;
+        req[16] = AF_INET_; req[17] = 24; w32(req + 20, br ? (uint32_t)br->ifindex : 0);
+        w16(req + 24, 8); w16(req + 26, 2); req[28] = 10; req[29] = 77; req[30] = 0; req[31] = 1;
+        w32(req, 32); w16(req + 4, RTM_NEWADDR); w16(req + 6, 1 | F_ACK | 0x400); w32(req + 8, 91);
+        n = (nl_send(s, req, 32) == 32) ? (int)nl_recv(s, rx, NL_DGRAM, 0, 0, 0) : -1;
+        int ad = (n >= 20 && r16(rx + 4) == NLMSG_ERROR) ? (int)r32(rx + 16) : -999;
+        int up = br && !br->admin_down && br->ip == IPV4(10, 77, 0, 1) && br->netmask == IPV4(255, 255, 255, 0);
+        /* DELLINK by index */
+        for (int i = 0; i < 32; i++) req[i] = 0;
+        w32(req, 32); w16(req + 4, RTM_DELLINK); w16(req + 6, 1 | F_ACK); w32(req + 8, 92);
+        w32(req + 20, br ? (uint32_t)br->ifindex : 0);
+        n = (nl_send(s, req, 32) == 32) ? (int)nl_recv(s, rx, NL_DGRAM, 0, 0, 0) : -1;
+        int del = (n >= 20 && r16(rx + 4) == NLMSG_ERROR) ? (int)r32(rx + 16) : -999;
+        int gone = net_find_ns(l.ns, "nlbr0") == NULL;
+        kprintf("nltest: bridge create %d, again %d (want -17), address %d, up+addressed %s, delete %d, gone %s\n",
+                mk, again, ad, up ? "yes" : "NO", del, gone ? "yes" : "NO");
+        if (mk != 0 || again != -17 || ad != 0 || !up || del != 0 || !gone) ok = 0;
+    }
+
+    /* §M90 rung 5 — RouteGet: a non-dump GETROUTE answers ONE route. */
+    {
+        int oif_lo = -1, oif_far = -1; uint32_t gw_far = 0; int nmsg = 0;
+        for (int pass = 0; pass < 2; pass++) {
+            uint8_t req[40];
+            for (int i = 0; i < 40; i++) req[i] = 0;
+            w32(req, 36); w16(req + 4, 26 /* RTM_GETROUTE */); w16(req + 6, 1); w32(req + 8, 95);
+            req[16] = AF_INET_; req[17] = 32;
+            w16(req + 28, 8); w16(req + 30, 1);
+            if (pass == 0) { req[32] = 127; req[33] = 0; req[34] = 0; req[35] = 1; }
+            else           { req[32] = 8;   req[33] = 8; req[34] = 8; req[35] = 8; }
+            n = (nl_send(s, req, 36) == 36) ? (int)nl_recv(s, rx, NL_DGRAM, 0, 0, 0) : -1;
+            for (int off = 0; n > 0 && off + 16 <= n; ) {
+                uint32_t ln = r32(rx + off);
+                if (ln < 16) break;
+                if (r16(rx + off + 4) == RTM_NEWROUTE) {
+                    nmsg++;
+                    uint16_t al; const uint8_t* a = find_attr(rx + off + 28, ln - 28, 4, &al);
+                    int oif = a ? (int)r32(a) : -1;
+                    if (pass == 0) oif_lo = oif;
+                    else {
+                        oif_far = oif;
+                        const uint8_t* g = find_attr(rx + off + 28, ln - 28, 5, &al);
+                        if (g) gw_far = be32_host(g);
+                    }
+                }
+                off += (ln + 3) & ~3u;
+            }
+        }
+        struct net_device* lo = NULL;
+        for (int i = 0; i < l.n; i++) if (is_lo(l.d[i])) lo = l.d[i];
+        struct net_device* pr = net_primary_ns(l.ns);
+        int good = nmsg == 2 && lo && oif_lo == lo->ifindex && pr && oif_far == pr->ifindex &&
+                   gw_far == pr->gateway;
+        kprintf("nltest: RouteGet 127.0.0.1 -> oif %d, 8.8.8.8 -> oif %d via %x (%d answers) %s\n",
+                oif_lo, oif_far, gw_far, nmsg, good ? "ok" : "WRONG");
+        if (!good) ok = 0;
+    }
 
     /* LinkSetUp's shape: RTM_NEWLINK, index 1, Change = Flags = IFF_UP. */
     {

@@ -75,6 +75,10 @@
  * with htons/htonl (net.h).  The stack's own state is host byte order.
  * ============================================================================= */
 
+#include "task.h"      /* §M90 rung 5 — the caller's network namespace */
+#include "nsproxy.h"
+#include "config.h"
+#include "settings.h"
 #include "net.h"
 #include "hal.h"
 #include "hal_api.h"
@@ -194,9 +198,59 @@ uint16_t net_checksum(const void* data, uint32_t len) {
 /* ----------------------- Device registry ---------------------------------- */
 
 static struct net_device* g_head = NULL;
+#define NET_RT_MAX 64
+static struct net_rt g_rt[NET_RT_MAX];
+
+/* ---- §M90 rung 5 — network namespaces -----------------------------------------
+ *
+ * A namespace is a NUMBER here (0 = the machine's).  What belongs to it says so
+ * itself — net_device.netns, tcp_conn.netns, udp_binding.ns, net_rt.ns — and
+ * every lookup matches within one, so there is no per-namespace copy of the
+ * stack to keep in step: one table, filtered.  The slot table only says which
+ * numbers are alive. */
+#define NET_NS_MAX 256
+static uint8_t g_ns_used[NET_NS_MAX] = { 1 };     /* 0 is always alive */
+static int g_next_ifindex = 1;
+
+int net_cur_ns(void) {
+    struct task* t = task_current();
+    return t ? ns_net_id(t) : 0;
+}
+int net_ns_alive(int ns) { return ns >= 0 && ns < NET_NS_MAX && g_ns_used[ns]; }
+
+static void arp_drop_dev_locked(struct net_device* dev);
+
+int net_ns_create(void) {
+    int id = 0;
+    uint32_t f = net_lock();
+    for (int i = 1; i < NET_NS_MAX; i++) if (!g_ns_used[i]) { g_ns_used[i] = 1; id = i; break; }
+    net_unlock(f);
+    if (!id) { kprintf("net: %d network namespaces in use - refused\n", NET_NS_MAX - 1); return 0; }
+    /* Every namespace has its own loopback, born DOWN as on Linux (the
+     * runtime raises it). */
+    if (!netvirt_lo_create(id)) {
+        f = net_lock(); g_ns_used[id] = 0; net_unlock(f);
+        return 0;
+    }
+    return id;
+}
+
+void net_ns_destroy(int ns) {
+    if (ns <= 0 || ns >= NET_NS_MAX) return;
+    /* Its virtual devices are destroyed (a veth's peer with it), a hardware
+     * device goes back to the machine's namespace — Linux's rules. */
+    netvirt_ns_gone(ns);
+    uint32_t f = net_lock();
+    for (struct net_device* n = g_head; n; n = n->next)
+        if (n->netns == ns) { n->netns = 0; n->ip = n->netmask = n->gateway = 0; n->master = NULL; }
+    for (int i = 0; i < NET_RT_MAX; i++) if (g_rt[i].used && g_rt[i].ns == ns) g_rt[i].used = 0;
+    g_ns_used[ns] = 0;
+    net_unlock(f);
+}
 
 int net_register(struct net_device* dev) {
     dev->next = NULL;
+    if (!dev->ifindex) dev->ifindex = g_next_ifindex++;
     if (!g_head) { g_head = dev; }
     else {
         struct net_device* n = g_head;
@@ -224,6 +278,10 @@ int net_register(struct net_device* dev) {
  * rather than to copy this comment. */
 int net_unregister(struct net_device* dev) {
     if (!dev) return -1;
+    uint32_t lf = net_lock();
+    net_routes_drop_dev(dev);
+    arp_drop_dev_locked(dev);                 /* a pointer that must not outlive it */
+    net_unlock(lf);
     struct net_device** pp = &g_head;
     while (*pp && *pp != dev) pp = &(*pp)->next;
     if (!*pp) return -1;                         /* not registered */
@@ -233,8 +291,10 @@ int net_unregister(struct net_device* dev) {
     return 0;
 }
 
-struct net_device* net_find(const char* name) {
+struct net_device* net_find(const char* name) { return net_find_ns(net_cur_ns(), name); }
+struct net_device* net_find_ns(int ns, const char* name) {
     for (struct net_device* n = g_head; n; n = n->next) {
+        if (n->netns != ns) continue;
         const char* a = n->name; const char* b = name;
         while (*a && *a == *b) { a++; b++; }
         if (*a == *b) return n;
@@ -246,7 +306,14 @@ struct net_device* net_find(const char* name) {
  * than merely registered last: registration order is a property of the DRIVER
  * table, and making a routing decision depend on it means one added driver can
  * silently redirect every packet in the system. */
-struct net_device* net_primary(void) {
+struct net_device* net_by_index(int ns, int ifindex) {
+    for (struct net_device* n = g_head; n; n = n->next)
+        if (n->ifindex == ifindex && (ns < 0 || n->netns == ns)) return n;
+    return NULL;
+}
+
+struct net_device* net_primary(void) { return net_primary_ns(net_cur_ns()); }
+struct net_device* net_primary_ns(int ns) {
     /* §M87: a SIMULATED adapter never carries traffic, so it is never the
      * route; and an adapter the user DISABLED is passed over while another
      * one is usable — but still returned when it is the only one, so that a
@@ -254,37 +321,119 @@ struct net_device* net_primary(void) {
      * with "no network device", which would be a lie about the hardware. */
     struct net_device* fallback = NULL;
     for (struct net_device* n = g_head; n; n = n->next) {
+        if (n->netns != ns) continue;
         if (n->flags & (NETDEV_F_LOOPBACK | NETDEV_F_SIMULATED)) continue;
+        if (n->master) continue;                 /* a bridge port carries no IP */
         if (!n->admin_down) return n;
         if (!fallback) fallback = n;
     }
     return fallback;
 }
 
-static struct net_device* net_loopback(void) {
+static struct net_device* net_loopback(int ns) {
     for (struct net_device* n = g_head; n; n = n->next)
-        if (n->flags & NETDEV_F_LOOPBACK) return n;
+        if ((n->flags & NETDEV_F_LOOPBACK) && n->netns == ns) return n;
     return NULL;
 }
 
-int net_is_local_ip(uint32_t ip) {
+int net_is_local_ip(uint32_t ip) { return net_is_local_ip_ns(net_cur_ns(), ip); }
+int net_is_local_ip_ns(int ns, uint32_t ip) {
     for (struct net_device* n = g_head; n; n = n->next)
-        if (n->ip && n->ip == ip) return 1;
+        if (n->netns == ns && n->ip && n->ip == ip) return 1;
+    if ((ip >> 24) == 127) return net_loopback(ns) != NULL;   /* all of 127/8 */
     return 0;
 }
 
-struct net_device* net_route(uint32_t dst_ip) {
+static int mask_len(uint32_t m) { int n = 0; while (m & 0x80000000u) { n++; m <<= 1; } return n; }
+
+struct net_device* net_route(uint32_t dst_ip) { return net_route_ns(net_cur_ns(), dst_ip, NULL); }
+
+/* §M90 rung 5 — the route for `dst_ip` in namespace `ns`, longest prefix
+ * first: the CONNECTED routes (a device's own subnet), then the table, then —
+ * for a device that has one — its gateway as the default.  *nexthop = the
+ * address to resolve on the returned device (the gateway, or `dst_ip`). */
+struct net_device* net_route_ns(int ns, uint32_t dst_ip, uint32_t* nexthop) {
     /* 127.0.0.0/8 belongs to the loopback by definition, and nothing else may
      * claim it — a NIC whose subnet was misconfigured to overlap must not
      * silently start carrying localhost traffic onto the wire. */
-    if ((dst_ip >> 24) == 127) return net_loopback();
+    if ((dst_ip >> 24) == 127) { if (nexthop) *nexthop = dst_ip; return net_loopback(ns); }
+    /* One of the namespace's OWN addresses: Linux's "local" table — the
+     * packet never leaves the host, it goes round the loopback. */
+    for (struct net_device* n = g_head; n; n = n->next)
+        if (n->netns == ns && n->ip == dst_ip && !(n->flags & NETDEV_F_LOOPBACK)) {
+            struct net_device* lo = net_loopback(ns);
+            if (lo) { if (nexthop) *nexthop = dst_ip; return lo; }
+        }
 
+    struct net_device* best = NULL;
+    int best_len = -1;
+    uint32_t best_gw = 0, best_metric = 0xFFFFFFFFu;
     for (struct net_device* n = g_head; n; n = n->next) {
+        if (n->netns != ns || n->master) continue;
         if (n->flags & (NETDEV_F_LOOPBACK | NETDEV_F_SIMULATED)) continue;
-        if (n->admin_down) continue;
-        if (n->netmask && (dst_ip & n->netmask) == (n->ip & n->netmask)) return n;
+        if (n->admin_down || !n->netmask || !n->ip) continue;
+        if ((dst_ip & n->netmask) != (n->ip & n->netmask)) continue;
+        int l = mask_len(n->netmask);
+        if (l > best_len) { best = n; best_len = l; best_gw = 0; best_metric = 0; }
     }
-    return net_primary();
+    for (int i = 0; i < NET_RT_MAX; i++) {
+        struct net_rt* r = &g_rt[i];
+        if (!r->used || r->ns != ns || !r->dev || r->dev->admin_down) continue;
+        if ((dst_ip & r->mask) != r->dst) continue;
+        int l = mask_len(r->mask);
+        if (l > best_len || (l == best_len && r->metric < best_metric)) {
+            best = r->dev; best_len = l; best_gw = r->gw; best_metric = r->metric;
+        }
+    }
+    if (best_len < 0) {
+        /* No route matched: a device's own gateway is the default (DHCP's, or
+         * the driver's built-in numbers) — the machine's primary first. */
+        struct net_device* p = net_primary_ns(ns);
+        if (p && p->gateway && !p->admin_down) { best = p; best_gw = p->gateway; }
+        else {
+            for (struct net_device* n = g_head; n && !best; n = n->next)
+                if (n->netns == ns && n->gateway && !n->admin_down && !n->master) { best = n; best_gw = n->gateway; }
+        }
+        if (!best && ns == 0) best = p;          /* the old answer: the primary */
+    }
+    if (nexthop) *nexthop = best_gw ? best_gw : dst_ip;
+    return best;
+}
+
+int net_route_add(int ns, uint32_t dst, uint32_t mask, uint32_t gw, struct net_device* dev, uint32_t metric) {
+    if (!dev) return -1;
+    dst &= mask;
+    uint32_t f = net_lock();
+    int r = -1;
+    for (int i = 0; i < NET_RT_MAX; i++)
+        if (g_rt[i].used && g_rt[i].ns == ns && g_rt[i].dst == dst && g_rt[i].mask == mask &&
+            g_rt[i].dev == dev && g_rt[i].metric == metric) { r = -2; goto out; }
+    for (int i = 0; i < NET_RT_MAX; i++)
+        if (!g_rt[i].used) {
+            g_rt[i].used = 1; g_rt[i].ns = ns; g_rt[i].dst = dst; g_rt[i].mask = mask;
+            g_rt[i].gw = gw; g_rt[i].dev = dev; g_rt[i].metric = metric;
+            r = 0; break;
+        }
+out:
+    net_unlock(f);
+    return r;
+}
+int net_route_del(int ns, uint32_t dst, uint32_t mask, struct net_device* dev) {
+    uint32_t f = net_lock();
+    int r = -1;
+    for (int i = 0; i < NET_RT_MAX; i++)
+        if (g_rt[i].used && g_rt[i].ns == ns && g_rt[i].dst == (dst & mask) && g_rt[i].mask == mask &&
+            (!dev || g_rt[i].dev == dev)) { g_rt[i].used = 0; r = 0; break; }
+    net_unlock(f);
+    return r;
+}
+int net_route_at(int i, struct net_rt* out) {
+    if (i < 0 || i >= NET_RT_MAX) return -1;
+    *out = g_rt[i];
+    return 0;
+}
+void net_routes_drop_dev(struct net_device* dev) {
+    for (int i = 0; i < NET_RT_MAX; i++) if (g_rt[i].used && g_rt[i].dev == dev) g_rt[i].used = 0;
 }
 
 void net_for_each(net_iter_fn fn, void* ctx) {
@@ -298,8 +447,21 @@ void net_list(void) {
         net_fmt_ip(n->ip, ip); net_fmt_ip(n->netmask, mask); net_fmt_ip(n->gateway, gw);
         net_fmt_mac(n->mac, mac);
         kprintf("%s  mac %s  ip %s/%s  gw %s\n", n->name, mac, ip, mask, gw);
+        /* §M90 rung 5 — which namespace, which bridge, up or down: every
+         * namespace is listed (the machine's view of all of them). */
+        kprintf("     netns %d  ifindex %d  %s%s%s%s\n", n->netns, n->ifindex,
+                n->admin_down ? "DOWN" : "UP",
+                n->kind == NETDEV_K_VETH ? "  veth" : n->kind == NETDEV_K_BRIDGE ? "  bridge" :
+                n->kind == NETDEV_K_LOOPBACK ? "  loopback" : "",
+                n->master ? "  master " : "", n->master ? n->master->name : "");
         kprintf("     RX %u pkts / %u bytes   TX %u pkts / %u bytes   drop %u\n",
                 n->rx_packets, n->rx_bytes, n->tx_packets, n->tx_bytes, n->rx_dropped);
+    }
+    {
+        uint32_t fw, na, nr, no, ni, nf;
+        net_fwd_stats(&fw, &na, &nr, &no, &ni, &nf);
+        kprintf("forward: ip_forward(ns 0) %d  forwarded %u  no-arp %u  no-route %u  masq out %u in %u\n",
+                net_ip_forward(0), fw, na, nr, no, ni);
     }
     /* The poller's own state.  `waiters 0` + `netd idle` on a quiet box is the
      * whole point of §M55: nothing is polling anything. */
@@ -393,6 +555,15 @@ static volatile int      g_nic_irq_seen;     /* set by the FIRST real one     */
  * The stack learns that interrupts WORK by receiving one, rather than by being
  * told: a driver that wires an interrupt which never fires leaves netd in the
  * polled mode instead of blocking forever on a promise. */
+/* §M90 rung 5 — a VIRTUAL device queued a frame (netvirt.c): wake the poller
+ * if it waits for an interrupt, without claiming the NIC has one. */
+void net_kick(void) {
+    uint32_t f = waitq_lock(&g_nicwq);
+    g_irq_seq++;
+    waitq_wake_all(&g_nicwq);
+    waitq_unlock(&g_nicwq, f);
+}
+
 void net_rx_irq(struct net_device* dev) {
     (void)dev;
     uint32_t f = waitq_lock(&g_nicwq);
@@ -688,23 +859,43 @@ static int ipv4_emit_locked(struct net_device* dev, const uint8_t* via_mac,
 
 /* A tiny fixed-size cache — plenty for a host + a gateway.  LRU-free: on a
  * full cache we overwrite slot 0 (good enough for the slice). */
-#define ARP_CACHE_SIZE 8
-struct arp_entry { uint32_t ip; uint8_t mac[ETH_ALEN]; int valid; };
+/* §M90 rung 5 — an entry belongs to the DEVICE it was learned on: two
+ * namespaces (or two bridges) may each have a neighbour at 172.17.0.2. */
+#define ARP_CACHE_SIZE 32
+struct arp_entry { uint32_t ip; uint8_t mac[ETH_ALEN]; int valid; struct net_device* dev; };
 static struct arp_entry g_arp[ARP_CACHE_SIZE];
+static int g_arp_next;
 
-static void arp_cache_put(uint32_t ip, const uint8_t* mac) {
+static void arp_cache_put(struct net_device* dev, uint32_t ip, const uint8_t* mac) {
     for (int i = 0; i < ARP_CACHE_SIZE; i++) {
-        if (g_arp[i].valid && g_arp[i].ip == ip) { mac_copy(g_arp[i].mac, mac); return; }
+        if (g_arp[i].valid && g_arp[i].ip == ip && g_arp[i].dev == dev) { mac_copy(g_arp[i].mac, mac); return; }
     }
     for (int i = 0; i < ARP_CACHE_SIZE; i++) {
-        if (!g_arp[i].valid) { g_arp[i].ip = ip; mac_copy(g_arp[i].mac, mac); g_arp[i].valid = 1; return; }
+        if (!g_arp[i].valid) { g_arp[i].ip = ip; g_arp[i].dev = dev; mac_copy(g_arp[i].mac, mac); g_arp[i].valid = 1; return; }
     }
-    g_arp[0].ip = ip; mac_copy(g_arp[0].mac, mac); g_arp[0].valid = 1;
+    int v = g_arp_next++ % ARP_CACHE_SIZE;          /* full: replace round-robin */
+    g_arp[v].ip = ip; g_arp[v].dev = dev; mac_copy(g_arp[v].mac, mac); g_arp[v].valid = 1;
 }
-static int arp_cache_get(uint32_t ip, uint8_t* mac) {
+static int arp_cache_get(struct net_device* dev, uint32_t ip, uint8_t* mac) {
     for (int i = 0; i < ARP_CACHE_SIZE; i++)
-        if (g_arp[i].valid && g_arp[i].ip == ip) { mac_copy(mac, g_arp[i].mac); return 0; }
+        if (g_arp[i].valid && g_arp[i].ip == ip && g_arp[i].dev == dev) { mac_copy(mac, g_arp[i].mac); return 0; }
     return -1;
+}
+/* A device moved or destroyed: what it learned is no longer true. */
+static void arp_drop_dev_locked(struct net_device* dev) {
+    for (int i = 0; i < ARP_CACHE_SIZE; i++) if (g_arp[i].dev == dev) g_arp[i].valid = 0;
+}
+
+int net_dev_set_ns(struct net_device* dev, int ns) {
+    if (!dev || !net_ns_alive(ns)) return -1;
+    uint32_t f = net_lock();
+    dev->netns = ns;
+    dev->ip = dev->netmask = dev->gateway = 0;     /* addresses do not travel */
+    dev->master = NULL;                           /* nor bridge membership   */
+    net_routes_drop_dev(dev);
+    arp_drop_dev_locked(dev);
+    net_unlock(f);
+    return 0;
 }
 
 static void arp_send_locked(struct net_device* dev, uint16_t oper,
@@ -732,7 +923,7 @@ static void arp_input(struct net_device* dev, const uint8_t* p, uint32_t len) {
     uint32_t tpa = octets_to_ip(a->tpa);
 
     /* Learn the sender either way. */
-    arp_cache_put(spa, a->sha);
+    arp_cache_put(dev, spa, a->sha);
 
     if (ntohs(a->oper) == ARP_OP_REQUEST && tpa == dev->ip) {
         /* Somebody wants our MAC → reply to the sender.  We already hold the
@@ -747,18 +938,18 @@ static void arp_input(struct net_device* dev, const uint8_t* p, uint32_t len) {
 #define ARP_TIMEOUT_MS      1000
 #define ARP_ATTEMPTS        3
 
-struct arp_wait { uint32_t ip; uint8_t* mac; };
+struct arp_wait { uint32_t ip; uint8_t* mac; struct net_device* dev; };
 static int arp_cond(void* a) {                  /* evaluated under the lock */
     struct arp_wait* w = (struct arp_wait*)a;
-    return arp_cache_get(w->ip, w->mac) == 0;
+    return arp_cache_get(w->dev, w->ip, w->mac) == 0;
 }
 
 /* MUST NOT be called with the stack lock held — it waits for a reply. */
 int net_arp_resolve(struct net_device* dev, uint32_t ip, uint8_t mac_out[ETH_ALEN]) {
-    struct arp_wait w = { ip, mac_out };
+    struct arp_wait w = { ip, mac_out, dev };
 
     uint32_t f = net_lock();
-    int hit = arp_cache_get(ip, mac_out) == 0;
+    int hit = arp_cache_get(dev, ip, mac_out) == 0;
     net_unlock(f);
     if (hit) return 0;
 
@@ -781,8 +972,14 @@ static int route_mac(struct net_device* dev, uint32_t dst_ip, uint8_t mac[ETH_AL
      * so we use its own, which is what a frame "from us to us" should carry. */
     if (dev->flags & NETDEV_F_LOOPBACK) { mac_copy(mac, dev->mac); return 0; }
 
-    uint32_t nexthop = ((dst_ip & dev->netmask) == (dev->ip & dev->netmask))
-                     ? dst_ip : dev->gateway;
+    /* §M90 rung 5 — the next hop from the ROUTE TABLE of the device's
+     * namespace (a container's default route is a table entry, not a field). */
+    uint32_t nexthop = dst_ip;
+    if (!(dev->netmask && (dst_ip & dev->netmask) == (dev->ip & dev->netmask))) {
+        uint32_t nh = 0;
+        struct net_device* via = net_route_ns(dev->netns, dst_ip, &nh);
+        nexthop = (via == dev && nh) ? nh : (dev->gateway ? dev->gateway : dst_ip);
+    }
     return net_arp_resolve(dev, nexthop, mac);
 }
 
@@ -877,33 +1074,35 @@ int net_ping(struct net_device* dev, uint32_t ip, int count) {
 
 /* One binding per port is enough for the slice (a stub resolver + a nc-style
  * test).  Grows into the socket layer (§M24 stage 6) later. */
-#define UDP_BINDINGS 8
-struct udp_binding { uint16_t port; udp_recv_fn fn; void* ctx; int used; };
+#define UDP_BINDINGS 64
+struct udp_binding { uint16_t port; udp_recv_fn fn; void* ctx; int used; int ns; };
 static struct udp_binding g_udp[UDP_BINDINGS];
 
 /* The binding table is read from the RX path (under the lock) and written from
  * task context, so bind/unbind take the lock too. */
-int net_udp_bind(uint16_t port, udp_recv_fn fn, void* ctx) {
-    if (!fn) { net_udp_unbind(port); return 0; }
+int net_udp_bind(uint16_t port, udp_recv_fn fn, void* ctx) { return net_udp_bind_ns(net_cur_ns(), port, fn, ctx); }
+void net_udp_unbind(uint16_t port) { net_udp_unbind_ns(net_cur_ns(), port); }
+int net_udp_bind_ns(int ns, uint16_t port, udp_recv_fn fn, void* ctx) {
+    if (!fn) { net_udp_unbind_ns(ns, port); return 0; }
     int rc = -1;
     uint32_t f = net_lock();
     for (int i = 0; i < UDP_BINDINGS; i++)
-        if (g_udp[i].used && g_udp[i].port == port) {
+        if (g_udp[i].used && g_udp[i].port == port && g_udp[i].ns == ns) {
             g_udp[i].fn = fn; g_udp[i].ctx = ctx; rc = 0; goto out;
         }
     for (int i = 0; i < UDP_BINDINGS; i++)
         if (!g_udp[i].used) {
-            g_udp[i].used = 1; g_udp[i].port = port;
+            g_udp[i].used = 1; g_udp[i].port = port; g_udp[i].ns = ns;
             g_udp[i].fn = fn; g_udp[i].ctx = ctx; rc = 0; goto out;
         }
 out:
     net_unlock(f);
     return rc;
 }
-void net_udp_unbind(uint16_t port) {
+void net_udp_unbind_ns(int ns, uint16_t port) {
     uint32_t f = net_lock();
     for (int i = 0; i < UDP_BINDINGS; i++)
-        if (g_udp[i].used && g_udp[i].port == port) g_udp[i].used = 0;
+        if (g_udp[i].used && g_udp[i].port == port && g_udp[i].ns == ns) g_udp[i].used = 0;
     net_unlock(f);
 }
 
@@ -959,7 +1158,6 @@ int net_udp_broadcast(struct net_device* dev, uint32_t src_ip,
 
 static void udp_input(struct net_device* dev, uint32_t src_ip,
                       const uint8_t* p, uint32_t len) {
-    (void)dev;
     if (len < sizeof(struct udp_hdr)) return;
     const struct udp_hdr* uh = (const struct udp_hdr*)p;
     uint16_t dport = ntohs(uh->dst_port);
@@ -970,7 +1168,7 @@ static void udp_input(struct net_device* dev, uint32_t src_ip,
     uint32_t dlen = ulen - sizeof(struct udp_hdr);
 
     for (int i = 0; i < UDP_BINDINGS; i++)
-        if (g_udp[i].used && g_udp[i].port == dport) {
+        if (g_udp[i].used && g_udp[i].port == dport && g_udp[i].ns == dev->netns) {
             g_udp[i].fn(src_ip, sport, data, dlen, g_udp[i].ctx);
             return;
         }
@@ -1197,6 +1395,7 @@ struct tcp_conn {
     volatile uint8_t reset;     /* RST — an ERROR, not an orderly end (§M56.2)*/
 
     struct net_device* dev;
+    int      netns;             /* §M90 rung 5 — the namespace it lives in    */
     uint32_t local_ip, peer_ip;
     uint16_t local_port, peer_port;
     uint8_t  peer_mac[ETH_ALEN];
@@ -1263,6 +1462,7 @@ static struct tcp_conn* tcp_alloc_locked(void) {
         c->listener = c->state = c->fin_pending = c->fin_sent = c->orphan = 0;
         c->peer_fin = c->reset = 0;
         c->dev = NULL;
+        c->netns = 0;
         c->local_ip = c->peer_ip = 0;
         c->local_port = c->peer_port = 0;
         for (int k = 0; k < ETH_ALEN; k++) c->peer_mac[k] = 0;
@@ -1285,16 +1485,16 @@ static void tcp_free_locked(struct tcp_conn* c) {
     c->used  = 0;
 }
 
-static int tcp_port_taken_locked(uint16_t port) {
+static int tcp_port_taken_locked(int ns, uint16_t port) {
     for (int i = 0; i < TCP_MAX_CONNS; i++)
-        if (g_conns[i].used && g_conns[i].local_port == port) return 1;
+        if (g_conns[i].used && g_conns[i].netns == ns && g_conns[i].local_port == port) return 1;
     return 0;
 }
 
-static uint16_t tcp_ephem_port_locked(void) {
+static uint16_t tcp_ephem_port_locked(int ns) {
     for (int tries = 0; tries < 0x4000; tries++) {
         uint16_t p = (uint16_t)(0xC000 + (g_tcp_ephem++ & 0x3FFF));
-        if (!tcp_port_taken_locked(p)) return p;
+        if (!tcp_port_taken_locked(ns, p)) return p;
     }
     return 0;
 }
@@ -1304,18 +1504,18 @@ static uint16_t tcp_ephem_port_locked(void) {
  * a listener and the connections it accepted share a local port, so matching
  * the listener first would route every segment of every accepted connection
  * into the accept queue. */
-static struct tcp_conn* tcp_lookup_locked(uint32_t local_ip, uint16_t local_port,
+static struct tcp_conn* tcp_lookup_locked(int ns, uint32_t local_ip, uint16_t local_port,
                                           uint32_t peer_ip, uint16_t peer_port) {
     for (int i = 0; i < TCP_MAX_CONNS; i++) {
         struct tcp_conn* c = &g_conns[i];
-        if (!c->used || c->listener) continue;
+        if (!c->used || c->listener || c->netns != ns) continue;
         if (c->local_port == local_port && c->peer_port == peer_port &&
             c->peer_ip == peer_ip &&
             (c->local_ip == local_ip || c->local_ip == 0)) return c;
     }
     for (int i = 0; i < TCP_MAX_CONNS; i++) {
         struct tcp_conn* c = &g_conns[i];
-        if (!c->used || !c->listener || c->state != TCP_ST_LISTEN) continue;
+        if (!c->used || !c->listener || c->state != TCP_ST_LISTEN || c->netns != ns) continue;
         if (c->local_port != local_port) continue;
         if (c->local_ip == 0 || c->local_ip == local_ip) return c;   /* 0.0.0.0 */
     }
@@ -1523,7 +1723,7 @@ static void tcp_input(struct net_device* dev, const uint8_t* src_mac,
     uint32_t ack  = ntohl(th->ack);
     uint8_t  flags = th->flags;
 
-    struct tcp_conn* c = tcp_lookup_locked(dst_ip, dport, src_ip, sport);
+    struct tcp_conn* c = tcp_lookup_locked(dev->netns, dst_ip, dport, src_ip, sport);
     if (!c) {
         /* Nobody is listening.  Answering with an RST is what turns a connect
          * to a closed port into an immediate failure instead of a timeout. */
@@ -1555,6 +1755,7 @@ static void tcp_input(struct net_device* dev, const uint8_t* src_mac,
             return;
         }
         n->dev        = dev;
+        n->netns      = c->netns;
         n->local_ip   = dst_ip;
         n->local_port = dport;
         n->peer_ip    = src_ip;
@@ -1876,7 +2077,10 @@ static int tcp_accept_cond(void* a) {
 /* ----------------------- public API --------------------------------------- */
 
 struct tcp_conn* net_tcp_connect(uint32_t ip, uint16_t port, uint32_t timeout_ms) {
-    struct net_device* dev = net_route(ip);
+    return net_tcp_connect_ns(net_cur_ns(), ip, port, timeout_ms);
+}
+struct tcp_conn* net_tcp_connect_ns(int ns, uint32_t ip, uint16_t port, uint32_t timeout_ms) {
+    struct net_device* dev = net_route_ns(ns, ip, NULL);
     if (!dev) return NULL;
 
     /* Resolve the next hop FIRST and unlocked — it is the one step that can
@@ -1891,8 +2095,12 @@ struct tcp_conn* net_tcp_connect(uint32_t ip, uint16_t port, uint32_t timeout_ms
     struct tcp_conn* c = tcp_alloc_locked();
     if (!c) { net_unlock(f); return NULL; }
     c->dev        = dev;
-    c->local_ip   = dev->ip;
-    c->local_port = tcp_ephem_port_locked();
+    c->netns      = ns;
+    /* To one of our OWN addresses: the connection is that address's (a
+     * packet from us to 10.0.2.15 is delivered by the loopback, but it must
+     * carry 10.0.2.15 on both ends to find its listener). */
+    c->local_ip   = (dev->flags & NETDEV_F_LOOPBACK) && (ip >> 24) != 127 ? ip : dev->ip;
+    c->local_port = tcp_ephem_port_locked(ns);
     c->peer_ip    = ip;
     c->peer_port  = port;
     mac_copy(c->peer_mac, mac);
@@ -1915,11 +2123,15 @@ struct tcp_conn* net_tcp_connect(uint32_t ip, uint16_t port, uint32_t timeout_ms
 }
 
 struct tcp_conn* net_tcp_listen(uint32_t local_ip, uint16_t port, int backlog) {
+    return net_tcp_listen_ns(net_cur_ns(), local_ip, port, backlog);
+}
+struct tcp_conn* net_tcp_listen_ns(int ns, uint32_t local_ip, uint16_t port, int backlog) {
     tcp_sweeper_ensure();
     uint32_t f = net_lock();
-    if (tcp_port_taken_locked(port)) { net_unlock(f); return NULL; }
+    if (tcp_port_taken_locked(ns, port)) { net_unlock(f); return NULL; }
     struct tcp_conn* l = tcp_alloc_locked();
     if (!l) { net_unlock(f); return NULL; }
+    l->netns      = ns;
     l->listener   = 1;
     l->state      = TCP_ST_LISTEN;
     l->local_ip   = local_ip;              /* 0 = every local address          */
@@ -2275,6 +2487,249 @@ int net_ipv4_send(struct net_device* dev, uint32_t dst_ip, uint8_t proto,
     return rc;
 }
 
+/* ---- §M90 rung 5d — FORWARDING and MASQUERADE ---------------------------------
+ *
+ * A packet that arrives for an address that is not the namespace's own is
+ * FORWARDED when the namespace forwards (/proc/sys/net/ipv4/ip_forward, per
+ * namespace, off by default as on Linux — Docker turns it on): routed in the
+ * same namespace, TTL decremented, out of the route's device.  The next hop's
+ * MAC must already be known: the RX path cannot wait, so a miss sends an ARP
+ * request and DROPS this packet (TCP's retransmit and every resolver's retry
+ * then find the answer).  Linux queues the packet instead.
+ *
+ * MASQUERADE.  Docker's default network relies on an iptables rule —
+ * MASQUERADE for its subnet leaving through anything but docker0 — and this
+ * kernel has neither netfilter nor an iptables binary (dockerd runs with
+ * --iptables=false).  So the equivalent is a KERNEL POLICY, named and
+ * switchable: `net.masquerade` (default 1) rewrites the source of a forwarded
+ * TCP, UDP or ICMP-echo packet that LEAVES THE MACHINE (a hardware device) from
+ * outside that device's subnet to the device's own address, with a port (or
+ * echo id) of its own; the reply is matched and rewritten back before local
+ * delivery.  Entries idle out (TCP 300 s, UDP 60 s, ICMP 30 s).  Other
+ * protocols leave unmodified.  Without it a container could reach the host
+ * and its siblings but nothing beyond. */
+
+static uint8_t  g_fwd_on[NET_NS_MAX];
+static uint32_t g_fwd_count, g_fwd_noarp, g_fwd_noroute, g_nat_out, g_nat_in, g_nat_full;
+static uint8_t  g_fwdbuf[ETH_MTU];
+
+int  net_ip_forward(int ns) { return ns >= 0 && ns < NET_NS_MAX ? g_fwd_on[ns] : 0; }
+void net_set_ip_forward(int ns, int on) { if (ns >= 0 && ns < NET_NS_MAX) g_fwd_on[ns] = on ? 1 : 0; }
+
+#define NAT_MAX 256
+#define NAT_PORT_LO 20000u
+#define NAT_PORT_N  10000u
+struct nat_ent {
+    uint8_t  used, proto;
+    int      ns;
+    uint32_t in_ip;   uint16_t in_port;      /* the inside end (a container)     */
+    uint32_t peer_ip; uint16_t peer_port;    /* the outside end                  */
+    uint32_t out_ip;  uint16_t ext_port;     /* what the outside sees            */
+    uint64_t last_ms;
+};
+static struct nat_ent g_nat[NAT_MAX];
+static uint16_t g_nat_next;
+
+static uint32_t nat_idle_ms(uint8_t proto) {
+    return proto == IP_PROTO_TCP ? 300000u : proto == IP_PROTO_UDP ? 60000u : 30000u;
+}
+
+/* The checksum of a TCP/UDP segment with its pseudo-header. */
+static uint16_t l4_checksum(uint32_t src, uint32_t dst, uint8_t proto, const uint8_t* seg, uint32_t len) {
+    uint32_t sum = 0;
+    sum += (src >> 16) & 0xFFFF; sum += src & 0xFFFF;
+    sum += (dst >> 16) & 0xFFFF; sum += dst & 0xFFFF;
+    sum += proto;
+    sum += len;
+    for (uint32_t i = 0; i + 1 < len; i += 2) sum += ((uint16_t)seg[i] << 8) | seg[i + 1];
+    if (len & 1) sum += (uint16_t)seg[len - 1] << 8;
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return htons((uint16_t)~sum);
+}
+
+/* Where the "port" of a packet lives: TCP/UDP source/destination port, the
+ * ICMP echo identifier (for both directions).  NULL = not translatable. */
+static uint8_t* nat_port_ptr(uint8_t* l4, uint32_t l4len, uint8_t proto, int dst_side) {
+    if (proto == IP_PROTO_TCP || proto == IP_PROTO_UDP) {
+        if (l4len < 8) return NULL;
+        return l4 + (dst_side ? 2 : 0);
+    }
+    if (proto == IP_PROTO_ICMP) {
+        if (l4len < 8 || (l4[0] != 8 && l4[0] != 0)) return NULL;    /* echo request / reply */
+        return l4 + 4;
+    }
+    return NULL;
+}
+
+/* Recompute the transport checksum after a rewrite (UDP 0 = none, kept). */
+static void l4_fix(uint8_t* ip, uint32_t ihl, uint32_t total) {
+    uint8_t proto = ip[9];
+    uint8_t* l4 = ip + ihl;
+    uint32_t l4len = total - ihl;
+    uint32_t src = (uint32_t)ip[12] << 24 | (uint32_t)ip[13] << 16 | (uint32_t)ip[14] << 8 | ip[15];
+    uint32_t dst = (uint32_t)ip[16] << 24 | (uint32_t)ip[17] << 16 | (uint32_t)ip[18] << 8 | ip[19];
+    if (proto == IP_PROTO_TCP && l4len >= 20) {
+        l4[16] = l4[17] = 0;
+        uint16_t c = l4_checksum(src, dst, IP_PROTO_TCP, l4, l4len);
+        l4[16] = (uint8_t)c; l4[17] = (uint8_t)(c >> 8);
+    } else if (proto == IP_PROTO_UDP && l4len >= 8 && (l4[6] | l4[7])) {
+        l4[6] = l4[7] = 0;
+        uint16_t c = l4_checksum(src, dst, IP_PROTO_UDP, l4, l4len);
+        if (!c) c = 0xFFFF;
+        l4[6] = (uint8_t)c; l4[7] = (uint8_t)(c >> 8);
+    } else if (proto == IP_PROTO_ICMP && l4len >= 8) {
+        l4[2] = l4[3] = 0;
+        uint16_t c = net_checksum(l4, l4len);
+        l4[2] = (uint8_t)c; l4[3] = (uint8_t)(c >> 8);
+    }
+}
+static void ip_fix(uint8_t* ip, uint32_t ihl) {
+    ip[10] = ip[11] = 0;
+    uint16_t c = net_checksum(ip, ihl);
+    ip[10] = (uint8_t)c; ip[11] = (uint8_t)(c >> 8);
+}
+static void put_be32(uint8_t* p, uint32_t v) { p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
+static uint32_t get_be32(const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+
+static int masq_wanted(struct net_device* out, uint32_t src) {
+    if (!config_get_long("net.masquerade", 1)) return 0;
+    if (out->kind != NETDEV_K_HW || (out->flags & (NETDEV_F_LOOPBACK | NETDEV_F_SIMULATED))) return 0;
+    if (!out->ip) return 0;
+    return !out->netmask || (src & out->netmask) != (out->ip & out->netmask);
+}
+
+/* Outbound: rewrite the inside source to the device's address and a port of
+ * ours.  0 = rewritten, -1 = no entry could be made (dropped). */
+static int nat_out_locked(int ns, struct net_device* out, uint8_t* ip, uint32_t ihl, uint32_t total) {
+    uint8_t proto = ip[9];
+    uint8_t* l4 = ip + ihl;
+    uint8_t* sp = nat_port_ptr(l4, total - ihl, proto, 0);
+    if (!sp) return 0;                                 /* not translatable: as is */
+    uint8_t* dp = (proto == IP_PROTO_ICMP) ? sp : nat_port_ptr(l4, total - ihl, proto, 1);
+    uint32_t src = get_be32(ip + 12), dst = get_be32(ip + 16);
+    uint16_t sport = (uint16_t)(sp[0] << 8 | sp[1]);
+    uint16_t dport = proto == IP_PROTO_ICMP ? 0 : (uint16_t)(dp[0] << 8 | dp[1]);
+    uint64_t now = timer_ticks_ms();
+    struct nat_ent* e = NULL;
+    for (int i = 0; i < NAT_MAX; i++) {
+        struct nat_ent* x = &g_nat[i];
+        if (x->used && x->ns == ns && x->proto == proto && x->in_ip == src && x->in_port == sport &&
+            x->peer_ip == dst && x->peer_port == dport && x->out_ip == out->ip) { e = x; break; }
+    }
+    if (!e) {
+        struct nat_ent* victim = NULL;
+        for (int i = 0; i < NAT_MAX && !victim; i++)
+            if (!g_nat[i].used || now - g_nat[i].last_ms > nat_idle_ms(g_nat[i].proto)) victim = &g_nat[i];
+        if (!victim) { g_nat_full++; return -1; }
+        /* a port no live entry of this protocol and address uses */
+        uint16_t port = 0;
+        for (uint32_t tries = 0; tries < NAT_PORT_N && !port; tries++) {
+            uint16_t c = (uint16_t)(NAT_PORT_LO + (g_nat_next++ % NAT_PORT_N));
+            int taken = 0;
+            for (int i = 0; i < NAT_MAX && !taken; i++)
+                if (g_nat[i].used && &g_nat[i] != victim && g_nat[i].proto == proto &&
+                    g_nat[i].out_ip == out->ip && g_nat[i].ext_port == c) taken = 1;
+            if (!taken) port = c;
+        }
+        if (!port) { g_nat_full++; return -1; }
+        e = victim;
+        e->used = 1; e->ns = ns; e->proto = proto;
+        e->in_ip = src; e->in_port = sport; e->peer_ip = dst; e->peer_port = dport;
+        e->out_ip = out->ip; e->ext_port = port;
+    }
+    e->last_ms = now;
+    put_be32(ip + 12, out->ip);
+    sp[0] = (uint8_t)(e->ext_port >> 8); sp[1] = (uint8_t)e->ext_port;
+    l4_fix(ip, ihl, total);
+    g_nat_out++;
+    return 0;
+}
+
+/* Inbound on `dev`: a reply to a masqueraded flow?  Rewritten back to the
+ * inside address and port in `ip` (a copy), 1; else 0. */
+static int nat_in_locked(struct net_device* dev, uint8_t* ip, uint32_t ihl, uint32_t total) {
+    uint8_t proto = ip[9];
+    uint8_t* l4 = ip + ihl;
+    uint8_t* dp = nat_port_ptr(l4, total - ihl, proto, 1);
+    if (!dp) return 0;
+    if (proto == IP_PROTO_ICMP && l4[0] != 0) return 0;          /* only an echo REPLY */
+    uint8_t* sp = proto == IP_PROTO_ICMP ? dp : nat_port_ptr(l4, total - ihl, proto, 0);
+    uint32_t src = get_be32(ip + 12), dst = get_be32(ip + 16);
+    uint16_t dport = (uint16_t)(dp[0] << 8 | dp[1]);
+    uint16_t sport = proto == IP_PROTO_ICMP ? 0 : (uint16_t)(sp[0] << 8 | sp[1]);
+    for (int i = 0; i < NAT_MAX; i++) {
+        struct nat_ent* e = &g_nat[i];
+        if (!e->used || e->ns != dev->netns || e->proto != proto || e->out_ip != dst ||
+            e->ext_port != dport || e->peer_ip != src || e->peer_port != sport) continue;
+        e->last_ms = timer_ticks_ms();
+        put_be32(ip + 16, e->in_ip);
+        dp[0] = (uint8_t)(e->in_port >> 8); dp[1] = (uint8_t)e->in_port;
+        l4_fix(ip, ihl, total);
+        g_nat_in++;
+        return 1;
+    }
+    return 0;
+}
+
+/* Send the IPv4 packet in g_fwdbuf out of the route for its destination. */
+static void fwd_emit_locked(int ns, struct net_device* in, uint32_t ihl, uint32_t total, int nat) {
+    uint8_t* ip = g_fwdbuf;
+    uint32_t dst = get_be32(ip + 16), src = get_be32(ip + 12);
+    uint32_t nh = 0;
+    struct net_device* out = net_route_ns(ns, dst, &nh);
+    if (!out || out == in || out->admin_down || (out->flags & NETDEV_F_LOOPBACK)) { g_fwd_noroute++; return; }
+    if (nat && masq_wanted(out, src) && nat_out_locked(ns, out, ip, ihl, total) != 0) return;
+    if (ip[8] <= 1) return;                            /* TTL expired (no ICMP sent) */
+    ip[8]--;
+    ip_fix(ip, ihl);
+    uint8_t mac[ETH_ALEN];
+    if (arp_cache_get(out, nh, mac) != 0) {
+        arp_send_locked(out, ARP_OP_REQUEST, BCAST_MAC, nh);
+        g_fwd_noarp++;
+        return;
+    }
+    eth_send_locked(out, mac, ETHERTYPE_IPV4, ip, total);
+    g_fwd_count++;
+}
+
+static void net_forward_locked(struct net_device* dev, const uint8_t* src_mac,
+                               const uint8_t* p, uint32_t len) {
+    (void)src_mac;
+    int ns = dev->netns;
+    if (!net_ip_forward(ns)) return;
+    uint32_t ihl = (p[0] & 0x0F) * 4u;
+    uint32_t total = (uint32_t)p[2] << 8 | p[3];
+    if (total > len || total > sizeof g_fwdbuf || ihl < 20 || ihl > total) return;
+    for (uint32_t i = 0; i < total; i++) g_fwdbuf[i] = p[i];
+    fwd_emit_locked(ns, dev, ihl, total, 1);
+}
+
+/* A reply to a masqueraded flow, arriving at the machine's address: rewritten
+ * and forwarded inside.  1 = it was one (consumed). */
+static int net_unmasq_locked(struct net_device* dev, const uint8_t* p, uint32_t len) {
+    if (!dev->ip || dev->kind != NETDEV_K_HW) return 0;
+    uint32_t ihl = (p[0] & 0x0F) * 4u;
+    uint32_t total = (uint32_t)p[2] << 8 | p[3];
+    if (total > len || total > sizeof g_fwdbuf || ihl < 20 || ihl > total) return 0;
+    if (get_be32(p + 16) != dev->ip) return 0;
+    uint8_t proto = p[9];
+    if (proto != IP_PROTO_TCP && proto != IP_PROTO_UDP && proto != IP_PROTO_ICMP) return 0;
+    for (uint32_t i = 0; i < total; i++) g_fwdbuf[i] = p[i];
+    if (!nat_in_locked(dev, g_fwdbuf, ihl, total)) return 0;
+    fwd_emit_locked(dev->netns, dev, ihl, total, 0);
+    return 1;
+}
+
+void net_fwd_stats(uint32_t* fwd, uint32_t* noarp, uint32_t* noroute, uint32_t* nat_out,
+                   uint32_t* nat_in, uint32_t* nat_full) {
+    if (fwd) *fwd = g_fwd_count;
+    if (noarp) *noarp = g_fwd_noarp;
+    if (noroute) *noroute = g_fwd_noroute;
+    if (nat_out) *nat_out = g_nat_out;
+    if (nat_in) *nat_in = g_nat_in;
+    if (nat_full) *nat_full = g_nat_full;
+}
+
 static void ipv4_input(struct net_device* dev, const uint8_t* src_mac,
                        const uint8_t* p, uint32_t len) {
     if (len < sizeof(struct ipv4_hdr)) return;
@@ -2288,7 +2743,16 @@ static void ipv4_input(struct net_device* dev, const uint8_t* src_mac,
      * because it does not yet know what it is addressed as.  That is not
      * laxity, it is the only way DHCP can work: the reply that TELLS us our
      * address is itself addressed to that address. */
-    if (dev->ip && dst != dev->ip && dst != 0xFFFFFFFFu) return;   /* not ours */
+    /* §M90 rung 5d — a reply to a masqueraded flow is the container's, not ours. */
+    if (net_unmasq_locked(dev, p, len)) return;
+    /* §M90 rung 5 — any address of the device's NAMESPACE is ours (Linux's
+     * weak host model: the host's eth0 address is reachable from a container
+     * through the bridge).  Anything else is somebody else's: forwarded, when
+     * this namespace forwards (net_forward_locked), else dropped. */
+    if (dev->ip && dst != dev->ip && dst != 0xFFFFFFFFu && !net_is_local_ip_ns(dev->netns, dst)) {
+        net_forward_locked(dev, src_mac, p, len);
+        return;
+    }
 
     uint32_t src = ntohl(ih->src);
     uint16_t total = ntohs(ih->total_len);
@@ -2313,6 +2777,16 @@ void net_rx(struct net_device* dev, const uint8_t* frame, uint32_t len) {
     if (len < ETH_HLEN) { dev->rx_dropped++; return; }
     if (dev->admin_down) { dev->rx_dropped++; return; }     /* §M87 */
     const struct eth_hdr* eh = (const struct eth_hdr*)frame;
+
+    /* §M90 rung 5 — a BRIDGE PORT does not deliver to the local stack: the
+     * frame is the bridge's to switch (and to deliver to itself if it is
+     * addressed to the bridge). */
+    if (dev->master && dev->master->port_rx) {
+        dev->rx_packets++; dev->rx_bytes += len;
+        g_rx_frames++;
+        dev->master->port_rx(dev->master, dev, frame, len);
+        return;
+    }
 
     /* Accept frames addressed to us or broadcast. */
     if (!mac_eq(eh->dst, dev->mac) && !mac_eq(eh->dst, BCAST_MAC)) return;
@@ -2399,7 +2873,9 @@ static void pw_ip(struct procfs_writer* w, uint32_t ip) {
 
 static void gen_net_dev(struct procfs_writer* w) {
     pw_puts(w, "iface  rx-packets rx-bytes tx-packets tx-bytes drops  address\n");
+    int ns = net_cur_ns();                    /* §M90 — the reader's namespace */
     for (struct net_device* n = g_head; n; n = n->next) {
+        if (n->netns != ns) continue;
         pw_puts(w, n->name); pw_puts(w, "  ");
         pw_put_uint(w, n->rx_packets); pw_putc(w, ' ');
         pw_put_uint(w, n->rx_bytes);   pw_putc(w, ' ');
@@ -2418,8 +2894,9 @@ static void gen_net_arp(struct procfs_writer* w) {
     struct arp_entry snap[ARP_CACHE_SIZE];
     for (int i = 0; i < ARP_CACHE_SIZE; i++) snap[i] = g_arp[i];
     net_unlock(f);
+    int ns = net_cur_ns();
     for (int i = 0; i < ARP_CACHE_SIZE; i++) {
-        if (!snap[i].valid) continue;
+        if (!snap[i].valid || !snap[i].dev || snap[i].dev->netns != ns) continue;
         char mb[18]; net_fmt_mac(snap[i].mac, mb);
         pw_ip(w, snap[i].ip); pw_puts(w, "  "); pw_puts(w, mb); pw_putc(w, '\n');
     }
@@ -2427,12 +2904,21 @@ static void gen_net_arp(struct procfs_writer* w) {
 
 static void gen_net_route(struct procfs_writer* w) {
     pw_puts(w, "destination      gateway          iface\n");
+    int ns = net_cur_ns();
     for (struct net_device* n = g_head; n; n = n->next) {
+        if (n->netns != ns || !n->ip) continue;
         pw_ip(w, n->ip & n->netmask); pw_puts(w, "  ");
         pw_puts(w, "-                ");
         pw_puts(w, n->name); pw_putc(w, '\n');
     }
-    struct net_device* d = net_primary();
+    struct net_rt r;
+    for (int i = 0; net_route_at(i, &r) == 0; i++) {
+        if (!r.used || r.ns != ns || !r.dev) continue;
+        pw_ip(w, r.dst); pw_putc(w, '/'); pw_put_uint(w, (uint32_t)mask_len(r.mask)); pw_puts(w, "  ");
+        if (r.gw) pw_ip(w, r.gw); else pw_puts(w, "-");
+        pw_puts(w, "  "); pw_puts(w, r.dev->name); pw_putc(w, '\n');
+    }
+    struct net_device* d = net_primary_ns(ns);
     if (d && d->gateway) {
         pw_puts(w, "0.0.0.0          ");
         pw_ip(w, d->gateway); pw_puts(w, "  "); pw_puts(w, d->name); pw_putc(w, '\n');
@@ -2487,11 +2973,40 @@ static void gen_net_stat(struct procfs_writer* w) {
     pw_putc(w, '\n');
 }
 
+/* §M90 rung 5d — forwarding and masquerade counters (the reader's view of
+ * the whole stack: the counters are not per namespace). */
+static void gen_net_fwd(struct procfs_writer* w) {
+    uint32_t fw, na, nr, no, ni, nf;
+    net_fwd_stats(&fw, &na, &nr, &no, &ni, &nf);
+    pw_puts(w, "forwarded "); pw_put_uint(w, fw);
+    pw_puts(w, " no-arp ");   pw_put_uint(w, na);
+    pw_puts(w, " no-route "); pw_put_uint(w, nr);
+    pw_puts(w, " masq-out "); pw_put_uint(w, no);
+    pw_puts(w, " masq-in ");  pw_put_uint(w, ni);
+    pw_puts(w, " masq-full "); pw_put_uint(w, nf);
+    pw_putc(w, '\n');
+}
+
+/* /proc/sys/net/ipv4/ip_forward — "0" or "1", the WRITER'S namespace (as on
+ * Linux, each namespace has its own). */
+static void gen_ip_forward(struct procfs_writer* w) {
+    pw_put_uint(w, (unsigned)net_ip_forward(net_cur_ns())); pw_putc(w, '\n');
+}
+static long write_ip_forward(struct task* target, const char* buf, size_t n) {
+    (void)target;
+    if (!n || (buf[0] != '0' && buf[0] != '1')) return -22;
+    net_set_ip_forward(net_cur_ns(), buf[0] == '1');
+    return (long)n;
+}
+
 static struct procfs_node nd_net_dev   = { .name = "net/dev",   .gen = gen_net_dev   };
 static struct procfs_node nd_net_arp   = { .name = "net/arp",   .gen = gen_net_arp   };
 static struct procfs_node nd_net_route = { .name = "net/route", .gen = gen_net_route };
 static struct procfs_node nd_net_tcp   = { .name = "net/tcp",   .gen = gen_net_tcp   };
 static struct procfs_node nd_net_stat  = { .name = "net/stat",  .gen = gen_net_stat  };
+static struct procfs_node nd_net_fwd   = { .name = "net/forward", .gen = gen_net_fwd };
+static struct procfs_node nd_ip_forward = { .name = "sys/net/ipv4/ip_forward", .gen = gen_ip_forward,
+                                            .write = write_ip_forward };
 
 void net_procfs_init(void) {
     procfs_register(&nd_net_dev);
@@ -2499,4 +3014,12 @@ void net_procfs_init(void) {
     procfs_register(&nd_net_route);
     procfs_register(&nd_net_tcp);
     procfs_register(&nd_net_stat);
+    procfs_register(&nd_net_fwd);
+    procfs_register(&nd_ip_forward);
 }
+
+CONFIG_KEY(ck_net_masq) = {
+    .key = "net.masquerade", .group = "Network", .type = CFG_BOOL, .def = "1",
+    .help = "rewrite forwarded traffic leaving the machine to the machine's address (what Docker's "
+            "iptables MASQUERADE rule does on Linux)",
+};

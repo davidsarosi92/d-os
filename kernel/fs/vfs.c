@@ -224,7 +224,11 @@ int task_mntns_current(void) { return 0; }
  * runtime creates (one per container), and a full table REFUSES the unshare
  * rather than handing two containers one namespace. */
 #define VFS_MAX_MNTNS 256
-static struct { int parent; unsigned born; } g_ns[VFS_MAX_MNTNS] = { { -1, 0 } };
+/* §M90 — `root`: the namespace's "/" once a task in it has pivot_root'ed
+ * (NULL = the machine's).  Linux's setns(CLONE_NEWNS) moves the caller's root
+ * and working directory to the namespace's root — how `runc exec` (docker
+ * exec) lands inside a running container's filesystem. */
+static struct { int parent; unsigned born; struct dentry* root; } g_ns[VFS_MAX_MNTNS] = { { -1, 0, NULL } };
 static int      g_ns_n = 1;                 /* id 0 = the machine's namespace */
 static unsigned g_bind_seq;
 
@@ -246,11 +250,15 @@ static int dentry_path_from(struct dentry* d, struct dentry* top, char* out, siz
  * it exits); the next walk over the table followed a freed dentry, and the
  * next unbind WROTE into freed memory.  An anonymous filesystem (/.mounts/…)
  * that was the source of such a record is queued for removal. */
+void procfs_ns_unpin(struct dentry* d) __attribute__((weak));
+static void unpin_src(struct dentry* S) { if (procfs_ns_unpin) procfs_ns_unpin(S); }
 static void binds_forget(struct dentry* d) {
+    for (int n = 0; n < VFS_MAX_MNTNS; n++) if (g_ns[n].root == d) g_ns[n].root = NULL;
     for (int i = 0; i < g_nbinds; ) {
         if (g_binds[i].tgt != d && g_binds[i].src != d) { i++; continue; }
         struct dentry* S = g_binds[i].src;
         if (g_binds[i].src == d && g_binds[i].tgt) g_binds[i].tgt->bound = NULL;
+        unpin_src(S);
         if (g_binds[i].tgt == d && S != d && g_norphans < 8 &&
             dentry_path_from(S, root, g_orphans[g_norphans], sizeof g_orphans[0]) == 0) {
             const char* pre = "/.mounts/";
@@ -305,6 +313,18 @@ static struct dentry* follow_bind(struct dentry* d) {
     return d;
 }
 
+void vfs_mntns_set_root(int ns, struct dentry* r) {
+    kmutex_lock(&ns_lock);
+    if (ns > 0 && ns < g_ns_n) g_ns[ns].root = r;
+    kmutex_unlock(&ns_lock);
+}
+struct dentry* vfs_mntns_root(int ns) {
+    kmutex_lock(&ns_lock);
+    struct dentry* r = (ns > 0 && ns < g_ns_n) ? g_ns[ns].root : NULL;
+    kmutex_unlock(&ns_lock);
+    return r;
+}
+
 int vfs_mntns_new(int parent) {
     kmutex_lock(&ns_lock);
     int id = -1;
@@ -312,6 +332,7 @@ int vfs_mntns_new(int parent) {
         id = g_ns_n++;
         g_ns[id].parent = parent;
         g_ns[id].born   = g_bind_seq;
+        g_ns[id].root   = g_ns[parent].root;     /* a copy starts where its parent's "/" is */
         if (config_get_long("debug.mntns", 0)) {
             struct task* me = task_current();
             kprintf("mntns: new ns %d parent %d born %u by %d '%s'\n", id, parent, g_bind_seq,
@@ -1121,6 +1142,25 @@ struct file* vfs_open(const char* path, int flags) {
     return f;
 }
 
+/* §M90 — perform a deferred removal (`ino` was unlinked while open, and is
+ * now closed and has no deferred children of its own), then walk up: its
+ * parent, if that was itself removed and was waiting only for this, goes
+ * next.  Namespace lock held. */
+static void deferred_unlink_chain(struct inode* ino) {
+    for (int guard = 0; ino && ino->unlink_dir && guard < 64; guard++) {
+        struct inode* dir = ino->unlink_dir;
+        char* nm = ino->unlink_name;
+        ino->unlink_dir = NULL; ino->unlink_name = NULL;
+        pcache_invalidate(ino);
+        if (dir->dir_ops && dir->dir_ops->unlink) dir->dir_ops->unlink(dir, nm ? nm : "", ino);
+        if (nm) kfree(nm);
+        if (dir->unlink_pending > 0) dir->unlink_pending--;
+        /* the parent: removed already, now free of pending children, closed */
+        if (dir->unlink_pending == 0 && dir->unlink_dir && dir->opens == 0) ino = dir;
+        else break;
+    }
+}
+
 int vfs_close(struct file* f) {
     if (!f) return -1;
     if (f->magic != VFS_FILE_MAGIC) {
@@ -1150,14 +1190,8 @@ int vfs_close(struct file* f) {
      * vfs_unlink deferred: until now its inode (and, on ramfs, its pages)
      * had to stay valid for this open file. */
     struct inode* ino = f->inode;
-    if (ino && ino->opens > 0 && --ino->opens == 0 && ino->unlink_dir) {
-        struct inode* dir = ino->unlink_dir;
-        char* nm = ino->unlink_name;
-        ino->unlink_dir = NULL; ino->unlink_name = NULL;
-        pcache_invalidate(ino);
-        if (dir->dir_ops && dir->dir_ops->unlink) dir->dir_ops->unlink(dir, nm ? nm : "", ino);
-        if (nm) kfree(nm);
-    }
+    if (ino && ino->opens > 0 && --ino->opens == 0 && ino->unlink_dir && ino->unlink_pending == 0)
+        deferred_unlink_chain(ino);
     /* §M90 — a magic-link handle's inode is this file's own. */
     if (ino && (ino->vflags & VFS_IF_LINKHANDLE)) { kfree(ino->private); kfree(ino); }
     kmutex_unlock(&ns_lock);
@@ -1556,7 +1590,12 @@ static int unlink_core(struct dentry* parent, const char* last, int check) {
      * closes it (vfs_close).  Freeing it here left every open descriptor
      * pointing at freed memory — a daemon that removes a file it still holds
      * (or renames a new one over it) then crashed the kernel at close. */
-    if (d->inode->type != INODE_DIR && d->inode->opens > 0) {
+    /* A directory too, when it is OPEN (rmdir of a directory somebody is
+     * reading) or still the parent of deferred removals — except one whose
+     * filesystem decides removal itself (cgroupfs), which checks its own. */
+    int dir_defer = d->inode->type == INODE_DIR && !(d->inode->vflags & VFS_IF_OWN_CHILDREN) &&
+                    (d->inode->opens > 0 || d->inode->unlink_pending > 0);
+    if ((d->inode->type != INODE_DIR && d->inode->opens > 0) || dir_defer) {
         struct inode* d_ino_tmp = d->inode;
         size_t nl = strlen_(last);
         char* nm = (char*)kmalloc(nl + 1);
@@ -1564,6 +1603,7 @@ static int unlink_core(struct dentry* parent, const char* last, int check) {
         for (size_t i = 0; i <= nl; i++) nm[i] = last[i];
         d->inode->unlink_dir  = parent->inode;
         d->inode->unlink_name = nm;
+        parent->inode->unlink_pending++;          /* the parent must outlive it */
         *link = d->sibling;
         binds_forget(d);
         kfree(d);
@@ -2406,9 +2446,11 @@ int vfs_unbind(const char* tgt) {
     if (T && T->bound && bind_visible(T)) {
         /* an anonymous filesystem's directory goes with its only mount */
         if (vfs_dentry_path_unlocked(T->bound, anon, sizeof anon) != 0) anon[0] = 0;
+        struct dentry* S0 = T->bound;
         T->bound = NULL;
         for (int i = 0; i < g_nbinds; i++)
             if (g_binds[i].tgt == T) { g_binds[i] = g_binds[--g_nbinds]; break; }
+        unpin_src(S0);                       /* a pinned namespace handle lets go */
         r = 0;
     }
     kmutex_unlock(&ns_lock);

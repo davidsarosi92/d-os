@@ -121,7 +121,24 @@ struct net_device {
      * driver's built-in default is still sitting there leaves the user unable
      * to tell a configured machine from an unconfigured one. */
     uint32_t    config_src;
+
+    /* ---- §M90 rung 5 — network namespaces and virtual devices.  APPENDED. */
+    int         netns;          /* the namespace it belongs to; 0 = the machine's */
+    int         ifindex;        /* stable, unique, given at register (netlink's) */
+    struct net_device* master;  /* a BRIDGE PORT: its bridge; NULL otherwise    */
+    /* A bridge: a frame arriving on one of its ports.  Called instead of the
+     * local stack (net_rx), with the stack lock held.  NULL = not a bridge. */
+    void (*port_rx)(struct net_device* bridge, struct net_device* port,
+                    const uint8_t* frame, uint32_t len);
+    /* A virtual device's teardown (netvirt.c), NULL for hardware. */
+    void (*destroy)(struct net_device* dev);
+    uint32_t    kind;           /* NETDEV_K_* — what netlink reports as IFLA_INFO_KIND */
 };
+
+#define NETDEV_K_HW       0     /* a driver's device                            */
+#define NETDEV_K_LOOPBACK 1
+#define NETDEV_K_VETH     2
+#define NETDEV_K_BRIDGE   3
 
 #define NETCFG_DEFAULT  0   /* the driver's built-in (QEMU SLIRP) numbers     */
 #define NETCFG_DHCP     1   /* a lease from a DHCP server                     */
@@ -217,6 +234,55 @@ int  net_register(struct net_device* dev);
 int  net_unregister(struct net_device* dev);
 struct net_device* net_find(const char* name);
 
+/* ---- §M90 rung 5 — network NAMESPACES ---------------------------------------
+ *
+ * Every device, TCP connection and UDP binding belongs to one namespace (an
+ * int; 0 = the machine's).  Lookups, routing and delivery only ever match
+ * within a namespace, so a socket in a container's namespace reaches only
+ * devices moved into it, and 127.0.0.1 is a different loopback in each.  The
+ * calls without `_ns` act in the CURRENT task's namespace; a socket records
+ * its namespace when it is created (Linux's rule: setns afterwards does not
+ * move it). */
+int  net_cur_ns(void);                          /* the calling task's        */
+int  net_ns_create(void);                       /* a new one (with its lo); 0 = failed */
+void net_ns_destroy(int ns);                    /* its virtual devices go    */
+int  net_ns_alive(int ns);
+struct net_device* net_find_ns(int ns, const char* name);
+struct net_device* net_by_index(int ns, int ifindex);
+struct net_device* net_primary_ns(int ns);
+struct net_device* net_route_ns(int ns, uint32_t dst_ip, uint32_t* nexthop);
+int  net_is_local_ip_ns(int ns, uint32_t ip);
+/* Move a device to another namespace (its addresses are dropped, as Linux
+ * does).  0 / -1. */
+int  net_dev_set_ns(struct net_device* dev, int ns);
+
+/* ROUTES.  A device's own subnet is always routed through it (the connected
+ * route); everything else comes from this table, longest prefix first.
+ * `gw` 0 = on-link.  The machine's namespace keeps its device's gateway as a
+ * default route too (what DHCP sets).  0 / -1 (full) / -2 (exists). */
+struct net_rt { int used, ns; uint32_t dst, mask, gw, metric; struct net_device* dev; };
+int  net_route_add(int ns, uint32_t dst, uint32_t mask, uint32_t gw, struct net_device* dev, uint32_t metric);
+int  net_route_del(int ns, uint32_t dst, uint32_t mask, struct net_device* dev);
+int  net_route_at(int i, struct net_rt* out);   /* iterate: 0 = filled, -1 = end */
+void net_routes_drop_dev(struct net_device* dev);
+/* §M90 rung 5d — IPv4 forwarding per namespace (/proc/sys/net/ipv4/ip_forward)
+ * and its counters; masquerade is the `net.masquerade` key (net.c). */
+int  net_ip_forward(int ns);
+void net_set_ip_forward(int ns, int on);
+void net_fwd_stats(uint32_t* fwd, uint32_t* noarp, uint32_t* noroute, uint32_t* nat_out,
+                   uint32_t* nat_in, uint32_t* nat_full);
+
+/* ---- §M90 rung 5 — virtual devices (netvirt.c) ---- */
+struct net_device* netvirt_lo_create(int ns);
+int  netvirt_veth_create(int ns, const char* name, int peer_ns, const char* peer_name,
+                         struct net_device** a_out, struct net_device** b_out);
+struct net_device* netvirt_bridge_create(int ns, const char* name);
+int  netvirt_set_master(struct net_device* port, struct net_device* bridge);
+int  netvirt_rename(struct net_device* dev, const char* name);
+int  netvirt_destroy(struct net_device* dev);
+int  netvirt_is_virtual(struct net_device* dev);
+void netvirt_ns_gone(int ns);
+
 /* The DEFAULT-ROUTE device: the first registered non-loopback one, or NULL.
  *
  * The definition changed with §M24.8 and the wording matters.  It used to be
@@ -263,6 +329,7 @@ void net_rx(struct net_device* dev, const uint8_t* frame, uint32_t len);
  * an interrupt which never fires leaves the poller in its timed fallback rather
  * than blocking forever on a promise. */
 void net_rx_irq(struct net_device* dev);
+void net_kick(void);                     /* §M90 — a virtual device queued a frame */
 
 /* "Nothing right now, ask again" — the stream/datagram answer that is NOT an
  * error and NOT an end of file.  Kept as a net.h constant rather than the
@@ -397,6 +464,8 @@ typedef void (*udp_recv_fn)(uint32_t src_ip, uint16_t src_port,
                             const uint8_t* data, uint32_t len, void* ctx);
 int  net_udp_bind(uint16_t port, udp_recv_fn fn, void* ctx);
 void net_udp_unbind(uint16_t port);
+int  net_udp_bind_ns(int ns, uint16_t port, udp_recv_fn fn, void* ctx);
+void net_udp_unbind_ns(int ns, uint16_t port);
 
 /* ----------------------- DNS stub resolver (§M24.2) ----------------------- */
 
@@ -422,11 +491,13 @@ struct tcp_conn;
  * (0 = the default).  Returns NULL on refusal (an RST arrives promptly, so a
  * closed port fails fast rather than at the timeout) or on timeout. */
 struct tcp_conn* net_tcp_connect(uint32_t ip, uint16_t port, uint32_t timeout_ms);
+struct tcp_conn* net_tcp_connect_ns(int ns, uint32_t ip, uint16_t port, uint32_t timeout_ms);
 
 /* Passive open.  `local_ip` 0 means every local address — a listener has no
  * device of its own, because each connection it accepts takes the device its
  * SYN arrived on.  Returns NULL if the port is already in use. */
 struct tcp_conn* net_tcp_listen(uint32_t local_ip, uint16_t port, int backlog);
+struct tcp_conn* net_tcp_listen_ns(int ns, uint32_t local_ip, uint16_t port, int backlog);
 
 /* Take the next established connection off a listener's backlog, waiting up to
  * `timeout_ms` (0 = do not wait).  Returns NULL if none arrived. */

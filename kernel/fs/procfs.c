@@ -123,6 +123,19 @@ struct file_state {
 };
 static int ns_kind_of_node(const struct procfs_node* n);   /* below */
 
+/* §M90 rung 5 — a namespace handle PINNED by a bind mount: on Linux, binding
+ * /proc/<pid>/ns/net somewhere (`ip netns add`, Docker's
+ * /var/run/docker/netns/<id>) pins the namespace OBJECT — the bound file names
+ * it for as long as the bind exists, whoever opens it later.  Here a handle's
+ * namespace is decided at open from the path's process, so a bind of
+ * /proc/self/task/<tid>/ns/net named the namespace of whoever opened the bind
+ * (dockerd's own) — Docker then built a container's interface in the HOST
+ * namespace and its rename to eth0 collided with the real eth0.  So binding a
+ * handle binds a pinned one instead: an entry under /proc/.nsfs that holds a
+ * reference to the namespace captured at bind time. */
+struct ns_pin { struct procfs_node node; int kind; struct nsobj* obj; int mnt; uint32_t ino; int live; };
+static void gen_pin(struct procfs_writer* w) { (void)w; }
+
 /* §M90 — see procfs.h.  The target is recorded on the opening task by the
  * path lookup (vfs_proc_alias) and consumed at open, in the same call. */
 struct task* procfs_target(void) {
@@ -145,7 +158,13 @@ static struct file_state* procfs_generate(struct file* f, struct procfs_node* no
     struct task* cur = task_current();
     st->pid = (cur && cur->proc_target_pid > 0) ? cur->proc_target_pid : 0;
     st->ns_kind = ns_kind_of_node(node);
-    if (st->ns_kind >= 0) {
+    if (st->ns_kind == -2) {                    /* §M90 — a PINNED handle */
+        struct ns_pin* pin = (struct ns_pin*)node;
+        st->ns_kind = pin->kind;
+        st->ns_obj  = ns_hold(pin->obj);
+        st->ns_mnt  = pin->mnt;
+        st->ns_ino  = pin->ino;
+    } else if (st->ns_kind >= 0) {
         struct task* tg = procfs_target();
         int k = st->ns_kind & 0xFF, child = st->ns_kind >> 8;
         st->ns_ino = child ? ns_child_ino_of(tg, k) : ns_ino_of(tg, k);
@@ -874,6 +893,7 @@ static struct procfs_node nd_ns[] = {
 /* The kind a handle node stands for: the enum value, plus 0x100 for a
  * *_for_children node; -1 for anything that is not a handle. */
 static int ns_kind_of_node(const struct procfs_node* n) {
+    if (n && n->gen == gen_pin) return -2;
     for (unsigned i = 0; i < sizeof nd_ns / sizeof nd_ns[0]; i++)
         if (n == &nd_ns[i]) return i < NSK_COUNT ? (int)i : (i == 8 ? (0x100 | NSK_TIME) : (0x100 | NSK_PID));
     return -1;
@@ -937,6 +957,58 @@ static void attach_ns_dir(void) {
         ino->private = &nd_ns[i];
         if (!vfs_attach_child(ns, nd_ns[i].name, ino)) kfree(ino);
     }
+}
+
+/* Pin the namespace the handle at `path` names now.  0 and the pinned path in
+ * `out`; -1 = `path` is not a namespace handle (the caller binds it as is). */
+int procfs_ns_pin(const char* path, char* out, size_t cap) {
+    struct file* f = vfs_open(path, VFS_RDONLY);
+    if (!f) return -1;
+    int kind = -1, mnt = 0; struct nsobj* obj = NULL; uint32_t ino = 0;
+    int is = procfs_ns_handle(f, &kind, &obj, &mnt, &ino);
+    struct nsobj* held = is ? ns_hold(obj) : NULL;
+    vfs_close(f);
+    if (!is) return -1;
+    struct dentry* dir = proc_subdir(".nsfs", 5);
+    struct ns_pin* pin = (struct ns_pin*)kcalloc(1, sizeof *pin);
+    struct inode* in = (struct inode*)kcalloc(1, sizeof *in);
+    if (!dir || !pin || !in) { kfree(pin); kfree(in); ns_put(held); return -1; }
+    static uint32_t seq;
+    char nm[24]; size_t o = 0;
+    uint32_t n = ++seq; char d[12]; int k = 0;
+    nm[o++] = 'n'; nm[o++] = 's';
+    do { d[k++] = (char)('0' + n % 10); n /= 10; } while (n);
+    while (k) nm[o++] = d[--k];
+    nm[o] = 0;
+    pin->node.name = "nsfs";
+    pin->node.gen = gen_pin;
+    pin->kind = kind; pin->obj = held; pin->mnt = mnt; pin->ino = ino; pin->live = 1;
+    in->type = INODE_FILE;
+    vfs_inode_defaults(in);
+    in->ops = &procfs_file_ops;
+    in->private = &pin->node;
+    if (!vfs_attach_child(dir, nm, in)) { kfree(in); kfree(pin); ns_put(held); return -1; }
+    const char* pre = "/proc/.nsfs/";
+    size_t w = 0;
+    for (; pre[w] && w + 1 < cap; w++) out[w] = pre[w];
+    for (size_t i = 0; nm[i] && w + 1 < cap; i++) out[w++] = nm[i];
+    out[w] = 0;
+    return 0;
+}
+
+/* A bind whose SOURCE was `d` ended: if `d` is a pinned handle, its
+ * namespace reference goes (and with the last one, the namespace).  The
+ * entry itself stays, empty, as a name nothing binds any more. */
+void procfs_ns_unpin(struct dentry* d) {
+    if (!d || !d->inode || d->inode->ops != &procfs_file_ops || !d->inode->private) return;
+    struct procfs_node* node = (struct procfs_node*)d->inode->private;
+    if (node->gen != gen_pin) return;
+    struct ns_pin* pin = (struct ns_pin*)node;
+    if (!pin->live) return;
+    pin->live = 0;
+    struct nsobj* o = pin->obj;
+    pin->obj = NULL;
+    ns_put(o);
 }
 
 static struct procfs_node nd_mounts     = { .name = "mounts",         .gen = gen_mounts };

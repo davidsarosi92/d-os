@@ -225,6 +225,11 @@ struct inode {
      * 0 = the reader (Linux's rule for files), n = cgroup charge id n - 1
      * (a memfd: its pages are its creator's, see cgroupfs.c). */
     int           memcg_as_plus1;
+    /* §M90 — APPENDED.  A DIRECTORY: how many of its former children were
+     * unlinked while open and still name it as their unlink_dir.  While this
+     * is non-zero the directory's own removal is deferred too — an open,
+     * deleted file must never call into a directory that has been freed. */
+    int           unlink_pending;
 };
 
 /* §M90 — a directory whose filesystem decides whether it may be removed while
@@ -591,5 +596,10 @@ int vfs_inode_flag(const char* path, int follow, uint32_t flag, int op);
 int vfs_file_inode_flag(struct file* f, uint32_t flag, int op);
 
 const char* vfs_fs_type_at(int i, int* nodev);   /* §M90 — /proc/filesystems */
+
+/* §M90 — a mount namespace's root (set by pivot_root inside it; NULL = the
+ * machine's): what setns(CLONE_NEWNS) moves the caller's root to. */
+void vfs_mntns_set_root(int ns, struct dentry* r);
+struct dentry* vfs_mntns_root(int ns);
 
 #endif

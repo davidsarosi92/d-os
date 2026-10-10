@@ -49,7 +49,12 @@ struct waitq;      /* §M49 — task.wq back-pointer; defined in waitq.h */
 struct ofile;
 
 #define TASK_NAME_MAX  31
-#define TASK_MAX_FDS   32       /* per-process file descriptors (0/1/2 = console) */
+/* §M90 — 256 (was 32): dockerd keeps a netlink handle and a namespace handle
+ * per container besides its sockets and pipes, and ran out at the second
+ * container ("too many open files" — it then built the container's interface
+ * in the HOST namespace).  Linux's default soft limit is 1024. */
+#define TASK_MAX_FDS   256      /* per-process file descriptors (0/1/2 = console) */
+#define FD_CX_WORDS    (TASK_MAX_FDS / 32)   /* close-on-exec bits, 32 a word */
 /* Per-task kernel stack.  4 KiB was too small once ring-3 programs make
  * deep-call syscalls: a NetSurf launched from the Start menu runs on a spawned
  * task, and its DOSGUI_PRESENT → gui_window_blit → gfx_blit (a full-window
@@ -556,7 +561,7 @@ struct task {
      * fds_inline[i]); a shared table keeps its own (struct fdtable).  Read and
      * written only through fd.h's fd_*cloexec* helpers, which pick the right
      * one — the same split `fds` / `fdt` already makes. */
-    uint32_t  fd_cloexec_inline;
+    uint32_t  fd_cloexec_inline[FD_CX_WORDS];
     /* §M90 — while one *at call runs on a real directory descriptor: that
      * directory's path, standing in for cred.cwd (cred_fs_cwd answers with
      * it), so a relative name resolves against the descriptor and not the
