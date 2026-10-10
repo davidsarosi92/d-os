@@ -262,6 +262,7 @@ int net_register(struct net_device* dev) {
         n->next = dev;
     }
     net_unlock(rf);
+    net6_procfs_dev(dev);                        /* §M90 3a — conf/<name>/ */
     char ipb[16], macb[18];
     net_fmt_ip(dev->ip, ipb); net_fmt_mac(dev->mac, macb);
     kprintf("net: registered %s mac=%s ip=%s\n", dev->name, macb, ipb);

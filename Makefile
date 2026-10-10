@@ -1447,6 +1447,42 @@ XDG_XML    := /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml
 wayland: $(WL_PREFIX)/lib/libwayland-client.a
 
 # libffi first — the client library links against it.
+# -----------------------------------------------------------------------------
+# §M90 3b — `nft`, the netfilter userspace, static against musl.  Release
+# tarballs (scripts/fetch-nftables.sh): their configure scripts and bison
+# output are pre-generated, so the build image needs no autotools.  No
+# pkg-config in the image: the dependency flags are passed in the variables
+# PKG_CHECK_MODULES reads first.  mini-gmp, no CLI line editing, no JSON —
+# the smallest nft that parses and lists a ruleset.  Output: user/nft.<arch>,
+# fetched by a guest over HTTP for the tests.
+#     docker run --rm --platform=linux/amd64 -v "$PWD":/src d-os-build \
+#         make ARCH=aarch64 nftables
+# -----------------------------------------------------------------------------
+NFT_SRC    := third_party/nftables-src
+NFT_PREFIX := $(CURDIR)/third_party/nft-$(ARCH)
+nftables:
+	@test -f $(NFT_SRC)/nftables-1.1.1.tar.xz || { echo "run ./scripts/fetch-nftables.sh first"; exit 1; }
+	@test -x $(MUSL_ELF_CC) || { echo "musl toolchain for $(ARCH) missing ($(MUSL_ELF_CC))"; exit 1; }
+	rm -rf /tmp/nftb && mkdir -p /tmp/nftb
+	cd /tmp/nftb && tar xjf $(CURDIR)/$(NFT_SRC)/libmnl-1.0.5.tar.bz2 && \
+	    tar xJf $(CURDIR)/$(NFT_SRC)/libnftnl-1.2.8.tar.xz && tar xJf $(CURDIR)/$(NFT_SRC)/nftables-1.1.1.tar.xz
+	cd /tmp/nftb/libmnl-1.0.5 && CC=$(CURDIR)/$(MUSL_ELF_CC) ./configure --host=$(MUSL_TRIPLE) \
+	    --prefix=$(NFT_PREFIX) --enable-static --disable-shared >/dev/null && \
+	    $(MAKE) -j4 >/dev/null && $(MAKE) install >/dev/null
+	cd /tmp/nftb/libnftnl-1.2.8 && CC=$(CURDIR)/$(MUSL_ELF_CC) \
+	    LIBMNL_CFLAGS="-I$(NFT_PREFIX)/include" LIBMNL_LIBS="-L$(NFT_PREFIX)/lib -lmnl" \
+	    ./configure --host=$(MUSL_TRIPLE) --prefix=$(NFT_PREFIX) --enable-static --disable-shared >/dev/null && \
+	    $(MAKE) -j4 >/dev/null && $(MAKE) install >/dev/null
+	cd /tmp/nftb/nftables-1.1.1 && CC=$(CURDIR)/$(MUSL_ELF_CC) \
+	    LIBMNL_CFLAGS="-I$(NFT_PREFIX)/include" LIBMNL_LIBS="-L$(NFT_PREFIX)/lib -lmnl" \
+	    LIBNFTNL_CFLAGS="-I$(NFT_PREFIX)/include" LIBNFTNL_LIBS="-L$(NFT_PREFIX)/lib -lnftnl -lmnl" \
+	    ./configure --host=$(MUSL_TRIPLE) --prefix=$(NFT_PREFIX) --enable-static --disable-shared \
+	        --with-mini-gmp --without-cli --without-json --disable-man-doc >/dev/null && \
+	    $(MAKE) -j4 LDFLAGS="-all-static" >/dev/null && $(MAKE) install >/dev/null
+	cp $(NFT_PREFIX)/sbin/nft user/nft.$(ARCH)
+	rm -rf /tmp/nftb
+	@echo "nft ($(ARCH)) -> user/nft.$(ARCH)"
+
 $(FFI_PREFIX)/lib/libffi.a:
 	@test -f $(FFI_DIR)/configure || { \
 	  echo "libffi missing — run ./scripts/fetch-wayland.sh first"; exit 1; }

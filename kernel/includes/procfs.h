@@ -55,6 +55,13 @@ struct procfs_node {
      * (not terminated), `target` the process the path named (/proc/<pid>/…,
      * else the writer).  Returns n, or a negative errno.  NULL = read-only. */
     long (*write)(struct task* target, const char* buf, size_t n);
+    /* §M90 3a — OPTIONAL, APPENDED.  The same, told WHICH node: one generator
+     * serving many files (/proc/sys/net/ipv6/conf/<if>/<key>, one node per
+     * interface and key) reads its own `priv`.  Used instead of gen/write
+     * when set. */
+    void (*gen2)(struct procfs_writer* w, const struct procfs_node* self);
+    long (*write2)(const struct procfs_node* self, const char* buf, size_t n);
+    void* priv;
 };
 
 /* §M90 — the process a per-process generator answers for: the one the path

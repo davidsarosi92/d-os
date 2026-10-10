@@ -108,3 +108,8 @@ scratchpad_*.sh
 # Python bytecode cache from the host-side build/test scripts
 # (scripts/svg2paths.py, scripts/dos-shell-test.py).  A build product.
 **/__pycache__/
+
+# §M90 3b — fetched netfilter userspace tarballs and their per-arch builds
+third_party/nftables-src/
+third_party/nft-*/
+user/nft.*

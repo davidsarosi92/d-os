@@ -219,6 +219,7 @@ static void put_addr6_one(struct nlb* b, const struct net_device* d, const uint8
     nl_end(b, at);
 }
 static void put_addr6(struct nlb* b, const struct net_device* d, uint32_t seq, uint32_t pid) {
+    if (d->ip6_disabled) return;                       /* disable_ipv6: no v6 addresses */
     if (!is_lo(d)) put_addr6_one(b, d, d->ip6_ll, 64, 253 /* RT_SCOPE_LINK */, seq, pid);
     for (int i = 0; i < d->n_ip6; i++)
         put_addr6_one(b, d, d->ip6[i], d->ip6_plen[i], is_lo(d) ? 254 : 0, seq, pid);

@@ -44,6 +44,7 @@
 #include "kmalloc.h"
 #include "timer.h"
 #include "task.h"
+#include "vfs.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -176,7 +177,9 @@ void net_fmt_ip6(const uint8_t a[16], char* out) {
 
 /* ---- per-device addresses ------------------------------------------------------- */
 
+void net6_dev_defaults(struct net_device* dev);
 void net6_dev_init(struct net_device* dev) {
+    net6_dev_defaults(dev);
     if (dev->flags & NETDEV_F_LOOPBACK) {
         if (!dev->n_ip6) { a6_cpy(dev->ip6[0], IP6_LOOP); dev->ip6_plen[0] = 128; dev->n_ip6 = 1; }
         return;
@@ -392,7 +395,7 @@ static int ip6_emit_locked(struct net_device* dev, const uint8_t* via_mac, const
                            const uint8_t* dst, uint8_t nh, uint8_t hops,
                            const uint8_t* payload, uint32_t len) {
     static uint8_t pkt[ETH_MTU];
-    if (net6_disabled(dev->netns)) return -97;       /* EAFNOSUPPORT, as Linux: disabled */
+    if (net6_disabled(dev->netns) || dev->ip6_disabled) return -97;   /* EAFNOSUPPORT, as Linux: disabled */
     if (len + IP6_HLEN > dev->mtu || len + IP6_HLEN > sizeof pkt) return -90;   /* EMSGSIZE */
     pkt[0] = 0x60; pkt[1] = 0; pkt[2] = 0; pkt[3] = 0;
     pkt[4] = (uint8_t)(len >> 8); pkt[5] = (uint8_t)len;
@@ -529,7 +532,95 @@ static long write_dis6(struct task* t, const char* buf, size_t n) {
 }
 static struct procfs_node nd_fwd6 = { .name = "sys/net/ipv6/conf/all/forwarding", .gen = gen_fwd6, .write = write_fwd6 };
 static struct procfs_node nd_dis6 = { .name = "sys/net/ipv6/conf/all/disable_ipv6", .gen = gen_dis6, .write = write_dis6 };
-void net6_procfs_init(void) { procfs_register(&nd_fwd6); procfs_register(&nd_dis6); }
+
+/* conf/<if>/{disable_ipv6,forwarding,accept_ra} and conf/default/ — one
+ * node per interface NAME and key, made the first time a device of that name
+ * registers or is renamed to it.  The device is found by name in the READER's
+ * namespace (two namespaces both have an eth0, the files are shared), and a
+ * name nobody in this namespace carries reads empty and refuses writes
+ * (ENODEV); a file is never removed — the names a machine has used stay
+ * listed, which is said rather than hidden.  `default` gives the values a
+ * device registered later in the namespace starts with. */
+enum { IF6_DISABLE, IF6_FORWARD, IF6_ACCEPT_RA, IF6_NKEYS };
+static const char* const g_if6_key[IF6_NKEYS] = { "disable_ipv6", "forwarding", "accept_ra" };
+struct if6_node { struct procfs_node node; char path[72]; char ifname[16]; int key; };
+#define IF6_MAX 96
+static struct if6_node* g_if6[IF6_MAX];
+static uint8_t g_def6[NET6_NS_MAX][IF6_NKEYS];
+static uint8_t* if6_field(struct net_device* d, int key) {
+    return key == IF6_DISABLE ? &d->ip6_disabled : key == IF6_FORWARD ? &d->ip6_fwd : &d->ip6_accept_ra;
+}
+static void if6_gen(struct procfs_writer* w, const struct procfs_node* self) {
+    const struct if6_node* n = (const struct if6_node*)self;
+    int ns = net_cur_ns();
+    if (n->ifname[0] == 0) {                             /* default/ */
+        if (ns >= 0 && ns < NET6_NS_MAX) { pw_put_uint(w, g_def6[ns][n->key]); pw_putc(w, '\n'); }
+        return;
+    }
+    struct net_device* d = net_find_ns(ns, n->ifname);
+    if (!d) return;
+    pw_put_uint(w, *if6_field(d, n->key)); pw_putc(w, '\n');
+}
+static long if6_write(const struct procfs_node* self, const char* buf, size_t len) {
+    const struct if6_node* n = (const struct if6_node*)self;
+    if (!len || buf[0] < '0' || buf[0] > '2') return -22;
+    int v = buf[0] - '0';
+
+    if (n->key != IF6_ACCEPT_RA && v > 1) return -22;
+    int ns = net_cur_ns();
+    if (n->ifname[0] == 0) {
+        if (ns < 0 || ns >= NET6_NS_MAX) return -22;
+        g_def6[ns][n->key] = (uint8_t)v;
+        return (long)len;
+    }
+    struct net_device* d = net_find_ns(ns, n->ifname);
+    if (!d) return -19;                                  /* ENODEV */
+    *if6_field(d, n->key) = (uint8_t)v;
+    return (long)len;
+}
+static void if6_make(const char* ifname, int key) {
+    for (int i = 0; i < IF6_MAX; i++)
+        if (g_if6[i] && g_if6[i]->key == key) {
+            const char* a = g_if6[i]->ifname; const char* b = ifname;
+            while (*a && *a == *b) { a++; b++; }
+            if (*a == *b) return;                        /* exists */
+        }
+    int slot = -1;
+    for (int i = 0; i < IF6_MAX; i++) if (!g_if6[i]) { slot = i; break; }
+    if (slot < 0) return;
+    struct if6_node* n = (struct if6_node*)kcalloc(1, sizeof *n);
+    if (!n) return;
+    int k = 0;
+    const char* pre = "sys/net/ipv6/conf/";
+    for (int i = 0; pre[i]; i++) n->path[k++] = pre[i];
+    const char* nm = ifname[0] ? ifname : "default";
+    for (int i = 0; nm[i] && k < 50; i++) n->path[k++] = nm[i];
+    n->path[k++] = '/';
+    for (int i = 0; g_if6_key[key][i]; i++) n->path[k++] = g_if6_key[key][i];
+    n->path[k] = 0;
+    for (int i = 0; ifname[i] && i < 15; i++) n->ifname[i] = ifname[i];
+    n->key = key;
+    n->node.name = n->path; n->node.gen2 = if6_gen; n->node.write2 = if6_write;
+    g_if6[slot] = n;
+    if (procfs_register(&n->node) != 0) { g_if6[slot] = NULL; kfree(n); }
+}
+/* A device registered (or renamed): its conf/<name>/ files exist, and a new
+ * device takes its namespace's defaults. */
+void net6_procfs_dev(struct net_device* dev) {
+    if (!dev || !dev->name || !dev->name[0]) return;
+    for (int k = 0; k < IF6_NKEYS; k++) if6_make(dev->name, k);
+}
+void net6_dev_defaults(struct net_device* dev) {
+    int ns = dev->netns;
+    if (ns < 0 || ns >= NET6_NS_MAX) return;
+    dev->ip6_disabled = g_def6[ns][IF6_DISABLE];
+    dev->ip6_fwd = g_def6[ns][IF6_FORWARD];
+    dev->ip6_accept_ra = g_def6[ns][IF6_ACCEPT_RA];
+}
+void net6_procfs_init(void) {
+    procfs_register(&nd_fwd6); procfs_register(&nd_dis6);
+    for (int k = 0; k < IF6_NKEYS; k++) if6_make("", k);
+}
 
 /* ---- receive ------------------------------------------------------------------ */
 
@@ -640,7 +731,7 @@ static void own_any(struct net_device* d, void* ctx) {
 
 void ipv6_input(struct net_device* dev, const uint8_t* src_mac, const uint8_t* p, uint32_t len) {
     if (len < IP6_HLEN || (p[0] >> 4) != 6) { g_rx6_drop++; return; }
-    if (net6_disabled(dev->netns)) { g_rx6_drop++; return; }     /* disable_ipv6 = 1 */
+    if (net6_disabled(dev->netns) || dev->ip6_disabled) { g_rx6_drop++; return; }   /* disable_ipv6 */
     uint32_t plen = (uint32_t)(p[4] << 8 | p[5]);
     if (plen + IP6_HLEN > len) { g_rx6_drop++; return; }
     const uint8_t* src = p + 8;
@@ -651,7 +742,7 @@ void ipv6_input(struct net_device* dev, const uint8_t* src_mac, const uint8_t* p
         struct own_q q = { dev->netns, dst, 0 };
         if (!a6_is_mcast(dst)) net_for_each(own_any, &q);
         if (!q.hit) {
-            if (net6_forwarding(dev->netns)) forward6_locked(dev, p, plen + IP6_HLEN);
+            if (net6_forwarding(dev->netns) || dev->ip6_fwd) forward6_locked(dev, p, plen + IP6_HLEN);
             else g_rx6_drop++;
             return;
         }
@@ -715,6 +806,10 @@ int net_ping6(int ns, struct net_device* dev, const uint8_t dst[16], int count) 
     if (neigh_resolve(dev, nh, mac) != 0) { kprintf("ping6: neighbour unreachable\n"); return 0; }
     static uint16_t id = 0x6400;
     g_ping6_id = ++id;
+    /* the last reply's sequence number must not satisfy THIS ping's wait: a
+     * stale 1 from the previous ping made a ping with no answer at all report
+     * one (and a test that expected "unreachable" saw a reply) */
+    g_ping6_seq_got = 0;
     g_ping6_wait = 1;
     int got = 0;
     for (int seq = 1; seq <= count; seq++) {
@@ -872,6 +967,25 @@ static void cmd_ip6test(const char* args) {
     T6(net6_route_add(B, pfx, 64, a, vb) == 0 && net6_route(B, far, b) == vb && a6_eq(b, a),
        "a table route: fd00:99::/64 via A on v6b");
     T6(net6_route(C, a, NULL) == NULL && net_ping6(C, NULL, a, 1) <= 0, "a third namespace cannot reach A");
+    /* conf/<if>/disable_ipv6 through the VFS, as dockerd writes it */
+    {
+        struct net_device* lo0 = net_find_ns(net_cur_ns(), "lo");
+        char rb[8] = {0};
+        struct file* f = vfs_open("/proc/sys/net/ipv6/conf/lo/disable_ipv6", VFS_RDONLY);
+        long rn = f ? vfs_read(f, rb, sizeof rb - 1) : -1;
+        if (f) vfs_close(f);
+        f = vfs_open("/proc/sys/net/ipv6/conf/lo/disable_ipv6", VFS_RDWR);
+        long wn = f ? vfs_write(f, "1\n", 2) : -1;
+        if (f) vfs_close(f);
+        int dis_now = lo0 ? lo0->ip6_disabled : -1;
+        int pr = lo0 ? net_ping6(net_cur_ns(), lo0, IP6_LOOP, 1) : -9;
+        int off = lo0 && dis_now == 1 && pr <= 0;
+        f = vfs_open("/proc/sys/net/ipv6/conf/lo/disable_ipv6", VFS_RDWR);
+        if (f) { vfs_write(f, "0\n", 2); vfs_close(f); }
+        int on = lo0 && !lo0->ip6_disabled && net_ping6(net_cur_ns(), lo0, IP6_LOOP, 1) == 1;
+        T6(rn == 2 && rb[0] == '0' && wn == 2 && off && on,
+           "/proc/sys/net/ipv6/conf/lo/disable_ipv6 reads 0, and 1 silences lo until 0 again");
+    }
     net_ns_destroy(A);
     T6(net6_route(B, far, NULL) == NULL, "a device's end takes its routes");
     net_ns_destroy(B); net_ns_destroy(C);

@@ -295,6 +295,7 @@ int netvirt_rename(struct net_device* dev, const char* name) {
     struct net_device* other = net_find_ns(dev->netns, name);
     if (other && other != dev) return -2;
     s_cpy(V(dev)->name, name, VNAME_MAX);
+    net6_procfs_dev(dev);                           /* §M90 3a — conf/<new name>/ */
     return 0;
 }
 

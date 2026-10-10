@@ -145,6 +145,10 @@ struct net_device {
     uint8_t     ip6[4][16];
     uint8_t     ip6_plen[4];
     uint8_t     n_ip6;
+    /* §M90 3a — conf/<if>/: disable_ipv6 (honoured: the device neither sends
+     * nor accepts IPv6), forwarding (a packet ARRIVING here may be routed on),
+     * accept_ra (stored only: router advertisements are never processed). */
+    uint8_t     ip6_disabled, ip6_fwd, ip6_accept_ra;
 };
 #define NET_IP6_MAX 4
 
@@ -630,6 +634,7 @@ void net6_set_forwarding(int ns, int on);
 int  net6_disabled(int ns);
 void net6_set_disabled(int ns, int on);
 void net6_procfs_init(void);
+void net6_procfs_dev(struct net_device* dev);   /* conf/<name>/ files for a (re)named device */
 /* §M90 3a — ICMPv6 sockets (raw and ping): the message without its IP header. */
 typedef void (*icmp6_recv_fn)(const uint8_t* src6, const uint8_t* msg, uint32_t len, void* ctx);
 int  net6_icmp_listen(int ns, icmp6_recv_fn fn, void* ctx);

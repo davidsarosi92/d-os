@@ -150,7 +150,8 @@ struct task* procfs_target(void) {
 /* Generate the node's content into a fresh state for `f`. */
 static struct file_state* procfs_generate(struct file* f, struct procfs_node* node) {
     struct procfs_writer w = { 0 };
-    if (node->gen) node->gen(&w);
+    if (node->gen2) node->gen2(&w, node);
+    else if (node->gen) node->gen(&w);
     struct file_state* st = (struct file_state*)kcalloc(1, sizeof(*st));
     if (!st) { if (w.buf) kfree(w.buf); return NULL; }
     st->content = w.buf;
@@ -194,6 +195,11 @@ static ssize_t procfs_write(struct file* f, const void* buf, size_t n, uint64_t 
     (void)off;
     if (!f || !f->inode) return -1;
     struct procfs_node* node = (struct procfs_node*)f->inode->private;
+    if (node && node->write2) {                    /* §M90 3a — a sysctl that knows itself */
+        struct task* w2 = task_current();
+        if (!w2 || (!cred_is_admin(&w2->cred) && cred_uid(&w2->cred) != 0)) return -1;
+        return (ssize_t)node->write2(node, (const char*)buf, n);
+    }
     if (!node || !node->write) return -1;
     struct file_state* st = (struct file_state*)f->private;
     struct task* cur = task_current();
