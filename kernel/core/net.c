@@ -91,6 +91,7 @@
 #include "timer.h"
 #include "task.h"
 #include "procfs.h"
+#include "kmalloc.h"   /* §M90 3b — conf/<if>/ nodes */
 #include "fd.h"        /* fd_readiness_signal — wake poll/epoll waiters */
 #include <stdint.h>
 #include <stddef.h>
@@ -211,7 +212,6 @@ static struct net_rt g_rt[NET_RT_MAX];
  * every lookup matches within one, so there is no per-namespace copy of the
  * stack to keep in step: one table, filtered.  The slot table only says which
  * numbers are alive. */
-#define NET_NS_MAX 256
 static uint8_t g_ns_used[NET_NS_MAX] = { 1 };     /* 0 is always alive */
 static int g_next_ifindex = 1;
 
@@ -270,8 +270,10 @@ int net_register(struct net_device* dev) {
         while (n->next) n = n->next;
         n->next = dev;
     }
+    net4_dev_defaults(dev);                      /* §M90 3b — its namespace's conf/default */
     net_unlock(rf);
     net6_procfs_dev(dev);                        /* §M90 3a — conf/<name>/ */
+    net4_procfs_dev(dev);                        /* §M90 3b — ipv4/conf/<name>/ */
     char ipb[16], macb[18];
     net_fmt_ip(dev->ip, ipb); net_fmt_mac(dev->mac, macb);
     kprintf("net: registered %s mac=%s ip=%s\n", dev->name, macb, ipb);
@@ -959,6 +961,10 @@ int net_dev_set_ns(struct net_device* dev, int ns) {
     dev->netns = ns;
     dev->ip = dev->netmask = dev->gateway = 0;     /* addresses do not travel */
     dev->master = NULL;                           /* nor bridge membership   */
+    /* nor its conf/ settings: a device entering a namespace starts from THAT
+     * namespace's conf/default, as on Linux (the device is re-registered there) */
+    net4_dev_defaults(dev);
+    net6_dev_defaults(dev);
     net_routes_drop_dev(dev);
     arp_drop_dev_locked(dev);
     net_unlock(f);
@@ -2809,12 +2815,45 @@ static uint8_t  g_fwd_on[NET_NS_MAX];
 static uint32_t g_fwd_count, g_fwd_noarp, g_fwd_noroute, g_nat_out, g_nat_in, g_nat_full;
 static uint8_t  g_fwdbuf[ETH_MTU];
 
+/* §M90 3b — net/ipv4/conf/{all,default}: per namespace.  all/forwarding IS
+ * ip_forward; all/route_localnet is OR-ed with each device's (Linux's
+ * IN_DEV_ROUTE_LOCALNET); default/ is what a device entering the namespace
+ * starts with. */
+enum { IF4_FORWARD, IF4_LOCALNET, IF4_NKEYS };
+static uint8_t g_def4[NET_NS_MAX][IF4_NKEYS];
+static uint8_t g_all_localnet[NET_NS_MAX];
+static uint32_t g_martian;
+
 static void net_ns_settings_reset_locked(int ns) {
-    if (ns > 0 && ns < NET_NS_MAX) g_fwd_on[ns] = 0;
+    if (ns > 0 && ns < NET_NS_MAX) {
+        g_fwd_on[ns] = 0; g_all_localnet[ns] = 0;
+        for (int k = 0; k < IF4_NKEYS; k++) g_def4[ns][k] = 0;
+    }
     net6_ns_reset(ns);
+    netvirt_ns_reset(ns);                       /* §M90 3b — its br_netfilter switches */
 }
 int  net_ip_forward(int ns) { return ns >= 0 && ns < NET_NS_MAX ? g_fwd_on[ns] : 0; }
-void net_set_ip_forward(int ns, int on) { if (ns >= 0 && ns < NET_NS_MAX) g_fwd_on[ns] = on ? 1 : 0; }
+/* ip_forward and conf/all/forwarding: the namespace, its default AND every
+ * device in it (Linux's inet_forward_change) — so writing it keeps meaning
+ * "this machine routes", whatever a device's own switch said before. */
+void net_set_ip_forward(int ns, int on) {
+    if (ns < 0 || ns >= NET_NS_MAX) return;
+    uint8_t v = on ? 1 : 0;
+    uint32_t f = net_lock();
+    g_fwd_on[ns] = v;
+    g_def4[ns][IF4_FORWARD] = v;
+    for (struct net_device* d = g_head; d; d = d->next) if (d->netns == ns) d->ip4_fwd = v;
+    net_unlock(f);
+}
+void net4_dev_defaults(struct net_device* dev) {
+    int ns = dev->netns;
+    if (ns < 0 || ns >= NET_NS_MAX) return;
+    dev->ip4_fwd = g_def4[ns][IF4_FORWARD];
+    dev->ip4_route_localnet = g_def4[ns][IF4_LOCALNET];
+}
+static int dev_route_localnet(const struct net_device* d) {
+    return d->ip4_route_localnet || (d->netns >= 0 && d->netns < NET_NS_MAX && g_all_localnet[d->netns]);
+}
 
 #define NAT_MAX 256
 #define NAT_PORT_LO 20000u
@@ -2977,7 +3016,16 @@ static void fwd_emit_locked(int ns, struct net_device* in, uint32_t ihl, uint32_
     uint32_t dst = get_be32(ip + 16), src = get_be32(ip + 12);
     uint32_t nh = 0;
     struct net_device* out = net_route_ns(ns, dst, &nh);
-    if (!out || out == in || out->admin_down || (out->flags & NETDEV_F_LOOPBACK)) { g_fwd_noroute++; return; }
+    /* OUT == IN IS FORWARDED (§M90 3b): Linux routes a packet back out of the
+     * interface it came in on (and adds an ICMP redirect, which is not sent
+     * here).  It used to be refused — and that is exactly Docker's hairpin: a
+     * container reaching a port published on the host that is DNATed to
+     * another container on the SAME bridge. */
+    if (!out || out->admin_down || (out->flags & NETDEV_F_LOOPBACK)) { g_fwd_noroute++; return; }
+    /* §M90 3b — a 127/8 address on a wire is martian unless the device going
+     * out allows it (route_localnet): Docker's --userland-proxy=false DNATs
+     * 127.0.0.1:<port> to a container and turns this on for docker0. */
+    if (((src >> 24) == 127 || (dst >> 24) == 127) && !dev_route_localnet(out)) { g_martian++; return; }
     /* §M90 3b — with an nf_tables ruleset the namespace's rules decide
      * (FORWARD filters, POSTROUTING translates); the built-in masquerade is
      * the policy for a namespace WITHOUT one. */
@@ -3020,7 +3068,7 @@ static void net_forward_locked(struct net_device* dev, const uint8_t* src_mac,
                                const uint8_t* p, uint32_t len) {
     (void)src_mac;
     int ns = dev->netns;
-    if (!net_ip_forward(ns)) return;
+    if (!net_ip_forward(ns) || !dev->ip4_fwd) return;   /* §M90 3b — and THIS device forwards */
     uint32_t ihl = (p[0] & 0x0F) * 4u;
     uint32_t total = (uint32_t)p[2] << 8 | p[3];
     if (total > len || total > sizeof g_fwdbuf || ihl < 20 || ihl > total) return;
@@ -3083,6 +3131,13 @@ static void ipv4_input(struct net_device* dev, const uint8_t* src_mac,
         ih = (const struct ipv4_hdr*)p;
     }
     uint32_t dst = ntohl(ih->dst);
+    /* §M90 3b — 127/8 arriving on anything but a loopback is martian (Linux
+     * drops it in the route lookup), unless the device has route_localnet. */
+    if (!(dev->flags & NETDEV_F_LOOPBACK) &&
+        ((dst >> 24) == 127 || (ntohl(ih->src) >> 24) == 127) && !dev_route_localnet(dev)) {
+        g_martian++;
+        return;
+    }
     /* An UNCONFIGURED device (dev->ip == 0) accepts anything addressed to it,
      * because it does not yet know what it is addressed as.  That is not
      * laxity, it is the only way DHCP can work: the reply that TELLS us our
@@ -3098,13 +3153,19 @@ static void ipv4_input(struct net_device* dev, const uint8_t* src_mac,
         return;
     }
 
-    uint32_t src = ntohl(ih->src);
     uint16_t total = ntohs(ih->total_len);
     if (total > len) return;
     const uint8_t* l4 = p + ihl;
     uint32_t l4len = total - ihl;
-    /* §M90 3b — INPUT: the packet is ours; the ruleset may still refuse it */
+    /* §M90 3b — INPUT: the packet is ours; the ruleset may still refuse it.
+     * INPUT also un-DNATs a reply's SOURCE (Linux's LOCAL_IN source manip), so
+     * the addresses are read AFTER it: read before, TCP was handed the
+     * container's address with the published port, matched no connection and
+     * answered with a RST — which killed every `-p` connection made from the
+     * host itself (brnftest case 4, found by the nft-trace). */
     if (nftp && !nft_ip_hook(dev->netns, 2, NFT_HOOK_INPUT, dev, NULL, (uint8_t*)p, total)) return;
+    uint32_t src = ntohl(ih->src);
+    dst = ntohl(ih->dst);
 
     switch (ih->proto) {
         case IP_PROTO_ICMP:
@@ -3341,6 +3402,7 @@ static void gen_net_fwd(struct procfs_writer* w) {
     pw_puts(w, " masq-full "); pw_put_uint(w, nf);
     pw_puts(w, " arp-held "); pw_put_uint(w, g_arp_held);
     pw_puts(w, " arp-released "); pw_put_uint(w, g_arp_released);
+    pw_puts(w, " martian "); pw_put_uint(w, g_martian);
     pw_putc(w, '\n');
 }
 
@@ -3354,6 +3416,80 @@ static long write_ip_forward(struct task* target, const char* buf, size_t n) {
     if (!n || (buf[0] != '0' && buf[0] != '1')) return -22;
     net_set_ip_forward(net_cur_ns(), buf[0] == '1');
     return (long)n;
+}
+
+/* §M90 3b — /proc/sys/net/ipv4/conf/{all,default,<if>}/{forwarding,route_localnet}.
+ * Same shape as the IPv6 tree (net6.c): one node per interface NAME and key,
+ * made when a device of that name registers or is renamed; the device is
+ * found by name in the READER's namespace, a name nobody there carries reads
+ * empty and refuses writes (ENODEV), and the names a machine has used stay
+ * listed.  These two keys are the ones with semantics here; others Linux has
+ * (rp_filter, accept_redirects, ...) are absent rather than pretended. */
+static const char* const g_if4_key[IF4_NKEYS] = { "forwarding", "route_localnet" };
+struct if4_node { struct procfs_node node; char path[72]; char ifname[16]; int key; };
+#define IF4_MAX 96
+static struct if4_node* g_if4[IF4_MAX];
+static void if4_gen(struct procfs_writer* w, const struct procfs_node* self) {
+    const struct if4_node* n = (const struct if4_node*)self;
+    int ns = net_cur_ns();
+    if (ns < 0 || ns >= NET_NS_MAX) return;
+    unsigned v;
+    if (n->ifname[0] == 0) v = g_def4[ns][n->key];
+    else if (n->ifname[0] == '*') v = n->key == IF4_FORWARD ? g_fwd_on[ns] : g_all_localnet[ns];
+    else {
+        struct net_device* d = net_find_ns(ns, n->ifname);
+        if (!d) return;
+        v = n->key == IF4_FORWARD ? d->ip4_fwd : d->ip4_route_localnet;
+    }
+    pw_put_uint(w, v); pw_putc(w, '\n');
+}
+static long if4_write(const struct procfs_node* self, const char* buf, size_t len) {
+    const struct if4_node* n = (const struct if4_node*)self;
+    if (!len || (buf[0] != '0' && buf[0] != '1')) return -22;
+    uint8_t v = (uint8_t)(buf[0] - '0');
+    int ns = net_cur_ns();
+    if (ns < 0 || ns >= NET_NS_MAX) return -22;
+    if (n->ifname[0] == 0) { g_def4[ns][n->key] = v; return (long)len; }
+    if (n->ifname[0] == '*') {                           /* all/ */
+        if (n->key == IF4_FORWARD) net_set_ip_forward(ns, v);
+        else g_all_localnet[ns] = v;
+        return (long)len;
+    }
+    struct net_device* d = net_find_ns(ns, n->ifname);
+    if (!d) return -19;                                  /* ENODEV */
+    if (n->key == IF4_FORWARD) d->ip4_fwd = v; else d->ip4_route_localnet = v;
+    return (long)len;
+}
+/* `ifname` "" = default/, "*" = all/ */
+static void if4_make(const char* ifname, int key) {
+    for (int i = 0; i < IF4_MAX; i++)
+        if (g_if4[i] && g_if4[i]->key == key) {
+            const char* a = g_if4[i]->ifname; const char* b = ifname;
+            while (*a && *a == *b) { a++; b++; }
+            if (*a == *b) return;                        /* exists */
+        }
+    int slot = -1;
+    for (int i = 0; i < IF4_MAX; i++) if (!g_if4[i]) { slot = i; break; }
+    if (slot < 0) return;
+    struct if4_node* n = (struct if4_node*)kcalloc(1, sizeof *n);
+    if (!n) return;
+    int k = 0;
+    const char* pre = "sys/net/ipv4/conf/";
+    for (int i = 0; pre[i]; i++) n->path[k++] = pre[i];
+    const char* nm = ifname[0] == 0 ? "default" : ifname[0] == '*' ? "all" : ifname;
+    for (int i = 0; nm[i] && k < 50; i++) n->path[k++] = nm[i];
+    n->path[k++] = '/';
+    for (int i = 0; g_if4_key[key][i]; i++) n->path[k++] = g_if4_key[key][i];
+    n->path[k] = 0;
+    for (int i = 0; ifname[i] && i < 15; i++) n->ifname[i] = ifname[i];
+    n->key = key;
+    n->node.name = n->path; n->node.gen2 = if4_gen; n->node.write2 = if4_write;
+    g_if4[slot] = n;
+    if (procfs_register(&n->node) != 0) { g_if4[slot] = NULL; kfree(n); }
+}
+void net4_procfs_dev(struct net_device* dev) {
+    if (!dev || !dev->name || !dev->name[0]) return;
+    for (int k = 0; k < IF4_NKEYS; k++) if4_make(dev->name, k);
 }
 
 static struct procfs_node nd_net_dev   = { .name = "net/dev",   .gen = gen_net_dev   };
@@ -3374,6 +3510,9 @@ void net_procfs_init(void) {
     procfs_register(&nd_net_fwd);
     procfs_register(&nd_ip_forward);
     net6_procfs_init();                         /* §M90 3a — conf/all/{forwarding,disable_ipv6} */
+    for (int k = 0; k < IF4_NKEYS; k++) { if4_make("*", k); if4_make("", k); }
+    netvirt_procfs_init();                      /* §M90 3b — net/bridge/bridge-nf-call-* */
+    for (struct net_device* d = g_head; d; d = d->next) net4_procfs_dev(d);
 }
 
 CONFIG_KEY(ck_net_masq) = {
@@ -3381,3 +3520,45 @@ CONFIG_KEY(ck_net_masq) = {
     .help = "rewrite forwarded traffic leaving the machine to the machine's address (what Docker's "
             "iptables MASQUERADE rule does on Linux)",
 };
+
+/* §M90 3b — the 127/8 martian rule, falsified (netnstest).  `dev` is a
+ * non-loopback device with an address, `peer` an address routed out of it
+ * whose own device is `peer_dev`.  An echo request from 127.0.0.7 is fed to
+ * dev's receive path and one from 127.0.0.1 to the forwarding emit, each with
+ * route_localnet off (both must count as martian) and on (neither may).
+ * Returns 0 when all four held, else a bitmask of the failures. */
+int net_martian_selftest(struct net_device* dev, uint32_t peer, struct net_device* peer_dev) {
+    static uint8_t pkt[28];
+    int fails = 0;
+    uint8_t lin = dev->ip4_route_localnet, lpeer = peer_dev->ip4_route_localnet;
+    for (int pass = 0; pass < 4; pass++) {
+        int input = pass < 2, allow = pass & 1;
+        uint32_t src = input ? IPV4(127, 0, 0, 7) : IPV4(127, 0, 0, 1);
+        uint32_t dst = input ? dev->ip : peer;
+        for (unsigned i = 0; i < sizeof pkt; i++) pkt[i] = 0;
+        pkt[0] = 0x45; pkt[2] = 0; pkt[3] = sizeof pkt; pkt[8] = 64; pkt[9] = IP_PROTO_ICMP;
+        put_be32(pkt + 12, src); put_be32(pkt + 16, dst);
+        uint16_t c = net_checksum(pkt, 20);              /* stored as computed (as ipv4_emit_locked does) */
+        pkt[10] = ((uint8_t*)&c)[0]; pkt[11] = ((uint8_t*)&c)[1];
+        pkt[20] = 8;                                     /* echo request */
+        pkt[24] = 0x7f; pkt[26] = (uint8_t)pass;
+        uint16_t ic = net_checksum(pkt + 20, 8);
+        pkt[22] = ((uint8_t*)&ic)[0]; pkt[23] = ((uint8_t*)&ic)[1];
+        dev->ip4_route_localnet = (uint8_t)allow;
+        peer_dev->ip4_route_localnet = (uint8_t)allow;   /* the far end receives it too */
+        uint32_t f = net_lock();
+        uint32_t before = g_martian;
+        if (input) {
+            static const uint8_t zmac[ETH_ALEN];
+            ipv4_input(dev, zmac, pkt, sizeof pkt);
+        } else {
+            for (unsigned i = 0; i < sizeof pkt; i++) g_fwdbuf[i] = pkt[i];
+            fwd_emit_locked(dev->netns, NULL, 20, sizeof pkt, 0);
+        }
+        int counted = g_martian != before;
+        net_unlock(f);
+        if (counted == allow) fails |= 1 << pass;        /* martian iff not allowed */
+    }
+    dev->ip4_route_localnet = lin; peer_dev->ip4_route_localnet = lpeer;
+    return fails;
+}

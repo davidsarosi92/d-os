@@ -2102,6 +2102,55 @@ static long h_wait(struct abi_ctx* c) {
     return pid;
 }
 
+/* §M90 — waitid(idtype, id, siginfo, options, rusage).  Go's
+ * os.Process.Wait opens with waitid(P_PID, pid, WEXITED|WNOWAIT) to block
+ * until the child is waitable WITHOUT reaping it, then reaps with wait4; it
+ * tolerated our ENOSYS, but WNOWAIT is a real semantic (task_wait_ex4).
+ * The answer is a SIGCHLD siginfo: si_signo 17, si_code CLD_EXITED (1) or
+ * CLD_KILLED (2), si_pid / si_uid / si_status in the union, which starts at
+ * offset 12 on a 32-bit guest and 16 on a 64-bit one (pointer alignment).
+ * What is NOT here, said plainly: stop/continue reports (WSTOPPED and
+ * WCONTINUED alone are refused — the parent is never told of a stop) and
+ * P_PIDFD (no pidfds).  P_PGID waits for any child, as wait4 does with a
+ * group: groups are recorded, not yet used to select. */
+static long h_waitid(struct abi_ctx* c) {
+    int idtype = (int)c->a[0], id = (int)c->a[1];
+    unsigned long opt = c->a[3];
+    if (!(opt & 4 /* WEXITED */)) {
+        kprintf("waitid: only WEXITED is reported (options %x) — stops are not tracked\n",
+                (unsigned)opt);
+        return -22;                                       /* EINVAL */
+    }
+    int want;
+    if (idtype == 0 /* P_ALL */ || idtype == 2 /* P_PGID */) want = -1;
+    else if (idtype == 1 /* P_PID */) {
+        if (id <= 0) return -22;
+        want = ns_pid_resolve(task_current(), id);
+        if (want <= 0) return -10;                        /* ECHILD */
+    } else {
+        if (idtype == 3) kprintf("waitid: P_PIDFD refused — no pidfds\n");
+        return -22;
+    }
+    unsigned long si = c->a[2];
+    if (si && !abi_user_w_ok(si, 128)) return -ABI_EFAULT;
+    int code = 0, vnr = 0, sig = 0, uid = 0;
+    int pid = task_wait_ex4(want, &code, (int)(opt & 1 /* WNOHANG */), &vnr, &sig, &uid,
+                            (opt & 0x01000000 /* WNOWAIT */) != 0);
+    if (pid < 0) return -10;                              /* ECHILD */
+    if (si) {
+        uint8_t* b = (uint8_t*)(uintptr_t)si;
+        for (int i = 0; i < 128; i++) b[i] = 0;
+        if (pid == 0) return 0;          /* WNOHANG, nobody yet: si_pid 0 says so */
+        unsigned u = (c->map && c->map->word_bytes == 4) ? 12 : 16;
+        ((int*)b)[0] = 17;                                /* SIGCHLD */
+        ((int*)b)[2] = sig ? 2 /* CLD_KILLED */ : 1 /* CLD_EXITED */;
+        *(int*)(b + u)     = vnr ? vnr : pid;
+        *(int*)(b + u + 4) = uid;
+        *(int*)(b + u + 8) = sig ? (sig & 0x7F) : (code & 0xFF);
+    }
+    return 0;
+}
+
 /* execve(path, argv, envp) — §M89: envp IS honoured (it used to be dropped,
  * and a JRE's launcher, which sets LD_LIBRARY_PATH and re-executes itself,
  * looped forever).  Does not return on success. */
@@ -3682,6 +3731,7 @@ static const struct {
     [ABI_EPOLL_WAIT]      = { "epoll_wait",      h_epoll_wait      },
     [ABI_SIGPENDING]      = { "sigpending",      h_sigpending      },
     [ABI_WAIT]            = { "wait",            h_wait },
+    [ABI_WAITID]          = { "waitid",          h_waitid },
     [ABI_PIPE]            = { "pipe",            h_pipe },
     [ABI_PIPE2]           = { "pipe2",           h_pipe2 },
     [ABI_EXECVE]          = { "execve",          h_execve },

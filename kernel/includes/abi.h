@@ -261,6 +261,7 @@ enum abi_op {
     ABI_PAUSE, ABI_SIGSUSPEND,
     /* §M90 3b — select / pselect6 (nft waits for netlink replies with it) */
     ABI_SELECT, ABI_PSELECT6,
+    ABI_WAITID,             /* §M90 — waitid(2), incl. WNOWAIT */
 
     ABI_OP_MAX
 };

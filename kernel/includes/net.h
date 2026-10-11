@@ -149,6 +149,11 @@ struct net_device {
      * nor accepts IPv6), forwarding (a packet ARRIVING here may be routed on),
      * accept_ra (stored only: router advertisements are never processed). */
     uint8_t     ip6_disabled, ip6_fwd, ip6_accept_ra;
+    /* §M90 3b — net/ipv4/conf/<if>/: forwarding (a packet ARRIVING here may
+     * be routed on; ip_forward and conf/all/forwarding set every device's, as
+     * on Linux) and route_localnet (127/8 traffic on a non-loopback device is
+     * martian and dropped unless this — or conf/all's — is 1). */
+    uint8_t     ip4_fwd, ip4_route_localnet;
 };
 #define NET_IP6_MAX 4
 
@@ -635,6 +640,14 @@ int  net6_disabled(int ns);
 void net6_set_disabled(int ns, int on);
 void net6_procfs_init(void);
 void net6_procfs_dev(struct net_device* dev);
+void net4_procfs_dev(struct net_device* dev);      /* §M90 3b — net/ipv4/conf/<name>/ */
+void net4_dev_defaults(struct net_device* dev);
+#define NET_NS_MAX 256                              /* network namespaces (net.c) */
+void netvirt_procfs_init(void);                     /* §M90 3b — br_netfilter sysctls */
+void netvirt_ns_reset(int ns);
+/* §M90 3b — netnstest's falsifier for the 127/8 martian rule (0 = held) */
+int  net_martian_selftest(struct net_device* dev, uint32_t peer, struct net_device* peer_dev);
+void net6_dev_defaults(struct net_device* dev);
 void net6_ns_reset(int ns);                     /* a namespace's end: its IPv6 settings and routes */   /* conf/<name>/ files for a (re)named device */
 /* §M90 3a — ICMPv6 sockets (raw and ping): the message without its IP header. */
 typedef void (*icmp6_recv_fn)(const uint8_t* src6, const uint8_t* msg, uint32_t len, void* ctx);

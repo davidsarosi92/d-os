@@ -84,7 +84,7 @@ static const struct abi_nument linux_i386_ents[] = {
     /* §M90 — waitpid/wait4 were per-arch cases with the OLD status encoding
      * (no WIFSIGNALED, no WNOHANG, no pid-namespace translation): arm64 alone
      * had the engine's.  waitpid's three arguments are wait4's first three. */
-    {   7, ABI_WAIT },   { 114, ABI_WAIT },
+    {   7, ABI_WAIT },   { 114, ABI_WAIT },   { 284, ABI_WAITID },
     { 142, ABI_SELECT }, { 308, ABI_PSELECT6 },     /* _newselect, pselect6 — §M90 3b */
     { 326, ABI_TIMERFD_GETTIME },
     { 104, ABI_SETITIMER       },
@@ -228,6 +228,7 @@ static const struct abi_nument linux_amd64_ents[] = {
     {  14, ABI_SIGPROCMASK },       /* rt_sigprocmask */
     {  34, ABI_PAUSE },  { 130, ABI_SIGSUSPEND },   /* §M90 */
     {  61, ABI_WAIT },              /* wait4 — §M90, from the per-arch switch */
+    { 247, ABI_WAITID },            /* waitid */
     {  23, ABI_SELECT }, { 270, ABI_PSELECT6 },     /* §M90 3b */
     { 287, ABI_TIMERFD_GETTIME },
     {  38, ABI_SETITIMER       },
@@ -340,6 +341,7 @@ static const struct abi_nument linux_arm64_ents[] = {
     { 133, ABI_SIGSUSPEND },        /* §M90 — arm64 has no pause (libc: ppoll) */
     {  72, ABI_PSELECT6 },          /* §M90 3b — arm64 has no select */
     { 260, ABI_WAIT     },          /* wait4 */
+    {  95, ABI_WAITID   },          /* waitid */
     { 221, ABI_EXECVE   },
     {  59, ABI_PIPE2    },          /* arm64 has only pipe2 */
     /* §M53 stage 3 — timing. */

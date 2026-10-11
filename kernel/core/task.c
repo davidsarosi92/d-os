@@ -2639,7 +2639,8 @@ void task_start_init(void) {
  * at once — it releases master_lock before taking the queue lock). */
 static void wait_scan_locked(int parent_pid, int want,
                              int* any_alive, int* dead_pid, int* dead_code,
-                             const struct task* viewer, int* dead_vnr) {
+                             const struct task* viewer, int* dead_vnr,
+                             int* dead_uid) {
     /* §M90 — a wait is the PROCESS's (any thread may reap its children), and
      * a THREAD is not a child to wait for: it is joined through its CLEARTID
      * futex, and counting it as an "alive child" made wait(-1) block forever
@@ -2659,6 +2660,10 @@ static void wait_scan_locked(int parent_pid, int want,
                         /* §M90 — a death BY A SIGNAL rides along in bits 16+ */
                         *dead_code = (c->exit_code & 0xFFFF) | (c->exit_sig << 16);
                         if (dead_vnr) *dead_vnr = ns_vnr(viewer, c);   /* §M90 */
+                        if (dead_uid) {                 /* §M90 — waitid's si_uid */
+                            int u = cred_uid(&c->cred);
+                            *dead_uid = u < 0 ? 0 : u;
+                        }
                     }
                 } else {
                     *any_alive = 1;
@@ -2767,6 +2772,16 @@ int task_wait_ex2(int pid, int* code, int nohang, int* vnr_out) {
  * Callers that ask for it see the plain exit code beside it; the others keep
  * seeing 128 + signal, the number a shell prints. */
 int task_wait_ex3(int pid, int* code, int nohang, int* vnr_out, int* sig_out) {
+    return task_wait_ex4(pid, code, nohang, vnr_out, sig_out, NULL, 0);
+}
+/* §M90 — waitid's needs on top: the dead child's uid (siginfo's si_uid) and
+ * WNOWAIT — REPORT the child and leave it waitable.  Go's os.Process.Wait
+ * asks waitid(P_PID, pid, WEXITED|WNOWAIT) first and only then reaps with
+ * wait4, so a "peek" that reaped would make that wait4 answer ECHILD and lose
+ * the exit status.  A peeked child stays DEAD and unreaped; init's universal
+ * reaper skips reap-owned children, so it is still there for the real wait. */
+int task_wait_ex4(int pid, int* code, int nohang, int* vnr_out, int* sig_out,
+                  int* uid_out, int nowait) {
     struct task* self = task_current();
     if (!self) return -1;
     int me = task_tgid(self);                /* §M90 — the process waits */
@@ -2774,7 +2789,9 @@ int task_wait_ex3(int pid, int* code, int nohang, int* vnr_out, int* sig_out) {
     uint32_t f = waitq_lock(&child_exit_wq);
     for (;;) {
         int any_alive, dead_pid, dead_code, dead_vnr = 0;
-        wait_scan_locked(me, pid, &any_alive, &dead_pid, &dead_code, self, &dead_vnr);
+        int dead_uid = 0;
+        wait_scan_locked(me, pid, &any_alive, &dead_pid, &dead_code, self, &dead_vnr,
+                         &dead_uid);
 
         if (dead_pid >= 0) {
             /* Found a dead child.  Capture the code now (under the queue
@@ -2786,6 +2803,8 @@ int task_wait_ex3(int pid, int* code, int nohang, int* vnr_out, int* sig_out) {
             if (code) *code = dead_code & 0xFFFF;
             if (sig_out) *sig_out = dead_code >> 16;
             if (vnr_out) *vnr_out = dead_vnr;
+            if (uid_out) *uid_out = dead_uid;
+            if (nowait) return dead_pid;        /* reported, left to be reaped */
             /* §M73 — task_reap REFUSES while the child is still on its CPU
              * (DEAD is published just before its last context switch) and says
              * "caller retries" — and this caller did not.  A waiter is woken by

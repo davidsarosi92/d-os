@@ -7,6 +7,7 @@
  *     NOT kill a root process: EPERM
  *   - kill(pid, 0) probes existence under the same rule */
 #include <stdio.h>
+#include <string.h>
 #include <errno.h>
 #include <signal.h>
 #include <unistd.h>
@@ -71,6 +72,34 @@ static int run(void) {
         if (!sigismember(&now, SIGUSR1)) return fail("sigsuspend left the suspend mask in place");
         sigprocmask(SIG_SETMASK, &old, NULL);
         printf("kill: sigsuspend ran the handler and restored the mask\n");
+    }
+
+    /* waitid: WNOWAIT reports a dead child and LEAVES it (Go's
+     * os.Process.Wait peeks this way, then reaps with wait4); the siginfo says
+     * CLD_EXITED / CLD_KILLED with the status, si_uid the child's uid. */
+    {
+        pid_t w = fork();
+        if (w == 0) { setuid(77); _exit(5); }
+        siginfo_t si;
+        memset(&si, 0, sizeof si);
+        if (waitid(P_PID, w, &si, WEXITED | WNOWAIT) != 0) return fail("waitid WNOWAIT");
+        if (si.si_signo != SIGCHLD || si.si_code != CLD_EXITED || si.si_pid != w ||
+            si.si_status != 5 || si.si_uid != 77)
+            return fail("waitid siginfo (exit)");
+        int st2 = 0;
+        if (waitpid(w, &st2, 0) != w || !WIFEXITED(st2) || WEXITSTATUS(st2) != 5)
+            return fail("WNOWAIT reaped the child (wait4 after it lost the status)");
+        pid_t z = fork();
+        if (z == 0) { for (;;) pause(); }
+        kill(z, SIGKILL);
+        memset(&si, 0, sizeof si);
+        if (waitid(P_ALL, 0, &si, WEXITED) != 0) return fail("waitid P_ALL");
+        if (si.si_code != CLD_KILLED || si.si_status != SIGKILL || si.si_pid != z)
+            return fail("waitid siginfo (killed)");
+        memset(&si, 0, sizeof si);
+        if (waitid(P_ALL, 0, &si, WEXITED | WNOHANG) != -1 || errno != ECHILD)
+            return fail("waitid with no children is not ECHILD");
+        printf("kill: waitid WNOWAIT left the child, CLD_EXITED 5 uid 77, CLD_KILLED 9\n");
     }
 
     pid_t me = getpid();

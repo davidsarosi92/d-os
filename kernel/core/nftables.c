@@ -34,6 +34,7 @@
  * ============================================================================= */
 
 #include "nftables.h"
+#include "nft_hook.h"   /* ctnetlink */
 #include "net.h"
 #include "kmalloc.h"
 #include "printf.h"
@@ -842,6 +843,150 @@ static int apply(struct nft_net* n, int type, const uint8_t* m, uint32_t len, ui
     }
 }
 
+/* ---- ctnetlink (§M90 3b): the conntrack table over NETLINK_NETFILTER ----------
+ *
+ * Subsystem 1 (NFNL_SUBSYS_CTNETLINK).  GET dumps the namespace's connections
+ * (or finds one by tuple), DELETE removes the one a tuple names — or, with no
+ * tuple, flushes the family.  That is `conntrack -L/-D/-F`, and it is what
+ * dockerd does when a container goes: it dumps the table and deletes every
+ * flow touching the container's address, so that a new container given the
+ * same address does not inherit the old one's NAT state ("Failed to delete
+ * conntrack state ... operation not supported" until now).  Creating or
+ * updating an entry from userspace (NEW), statistics and the expectation
+ * subsystem's objects are not offered: NEW is refused by name, the
+ * expectation table dumps empty (there are no helpers, hence no expectations). */
+#define CTA_TUPLE_ORIG 1
+#define CTA_TUPLE_REPLY 2
+#define CTA_STATUS 3
+#define CTA_TIMEOUT 7
+#define CTA_MARK 8
+#define CTA_USE 11
+#define CTA_ID 12
+static void ct_tuple_out(struct nbuf* b, uint16_t type, int fam, uint8_t proto,
+                         const uint8_t* src, const uint8_t* dst, uint16_t sp, uint16_t dp, int reply) {
+    uint32_t t = nest_begin(b, type);
+    uint32_t ip = nest_begin(b, 1 /* CTA_TUPLE_IP */);
+    if (fam == 10) { attr(b, 3, src, 16); attr(b, 4, dst, 16); }
+    else           { attr(b, 1, src, 4);  attr(b, 2, dst, 4); }
+    nest_end(b, ip);
+    uint32_t pr = nest_begin(b, 2 /* CTA_TUPLE_PROTO */);
+    attr(b, 1, &proto, 1);
+    uint8_t p2[2];
+    if (proto == 1 || proto == 58) {                      /* echo: id, type, code */
+        int v6 = proto == 58;
+        p2[0] = (uint8_t)(sp >> 8); p2[1] = (uint8_t)sp;
+        attr(b, v6 ? 7 : 4, p2, 2);
+        uint8_t ty = v6 ? (reply ? 129 : 128) : (reply ? 0 : 8), code = 0;
+        attr(b, v6 ? 8 : 5, &ty, 1);
+        attr(b, v6 ? 9 : 6, &code, 1);
+    } else {
+        p2[0] = (uint8_t)(sp >> 8); p2[1] = (uint8_t)sp; attr(b, 2, p2, 2);
+        p2[0] = (uint8_t)(dp >> 8); p2[1] = (uint8_t)dp; attr(b, 3, p2, 2);
+    }
+    nest_end(b, pr);
+    nest_end(b, t);
+}
+static void ct_entry_out(struct nbuf* b, const struct nft_ct_view* v, uint32_t seq, uint32_t pid, uint16_t fl) {
+    uint32_t at = msg_begin(b, (uint16_t)(1 << 8 | 0 /* IPCTNL_MSG_CT_NEW */), fl, seq, pid, (uint8_t)v->fam, 0);
+    ct_tuple_out(b, CTA_TUPLE_ORIG, v->fam, v->proto, v->osrc, v->odst, v->osport, v->odport, 0);
+    ct_tuple_out(b, CTA_TUPLE_REPLY, v->fam, v->proto, v->rsrc, v->rdst, v->rsport, v->rdport, 1);
+    attr_be32(b, CTA_STATUS, v->status);
+    attr_be32(b, CTA_TIMEOUT, v->timeout_s);
+    attr_be32(b, CTA_MARK, v->mark);
+    attr_be32(b, CTA_USE, 1);
+    attr_be32(b, CTA_ID, v->id);
+    msg_end(b, at);
+}
+/* A CTA_TUPLE_* nest → addresses and ports; 0 = parsed. */
+static int ct_tuple_in(const uint8_t* t, uint16_t tl, int fam, uint8_t* src, uint8_t* dst,
+                       uint8_t* proto, uint16_t* sp, uint16_t* dp) {
+    uint16_t il, pl, l;
+    const uint8_t* ip = nla_find(t, tl, 1, &il);
+    const uint8_t* pr = nla_find(t, tl, 2, &pl);
+    if (!ip || !pr) return -22;
+    int n = fam == 10 ? 16 : 4;
+    const uint8_t* a = nla_find(ip, il, fam == 10 ? 3 : 1, &l);
+    if (!a || l != n) return -22;
+    for (int i = 0; i < n; i++) src[i] = a[i];
+    a = nla_find(ip, il, fam == 10 ? 4 : 2, &l);
+    if (!a || l != n) return -22;
+    for (int i = 0; i < n; i++) dst[i] = a[i];
+    a = nla_find(pr, pl, 1, &l);
+    if (!a || l < 1) return -22;
+    *proto = a[0];
+    if (*proto == 1 || *proto == 58) {
+        a = nla_find(pr, pl, *proto == 58 ? 7 : 4, &l);
+        if (!a || l != 2) return -22;
+        *sp = *dp = (uint16_t)(a[0] << 8 | a[1]);
+    } else {
+        a = nla_find(pr, pl, 2, &l); *sp = a && l == 2 ? (uint16_t)(a[0] << 8 | a[1]) : 0;
+        a = nla_find(pr, pl, 3, &l); *dp = a && l == 2 ? (uint16_t)(a[0] << 8 | a[1]) : 0;
+    }
+    return 0;
+}
+static void ctnl(int ns, const uint8_t* m, uint32_t len, uint32_t pid, struct nbuf* b) {
+    uint16_t type = le16(m + 4), flags = le16(m + 6);
+    uint32_t seq = le32(m + 8);
+    int fam = len > 16 ? m[16] : 0;
+    int sub = type >> 8, t = type & 0xFF;
+    const uint8_t* at = m + 20;
+    uint32_t al = len > 20 ? len - 20 : 0;
+    if (sub == 2) {                                        /* expectations: there are none */
+        if (t == 1 && (flags & NLM_F_DUMP_) == NLM_F_DUMP_) put_done(b, seq, pid);
+        else put_err(b, t == 1 ? -2 : -95, m, pid);
+        return;
+    }
+    if (t == 1 /* GET */ || t == 3 /* GET_CTRZERO */) {
+        struct nft_ct_view* v = (struct nft_ct_view*)kmalloc(sizeof *v * 512);
+        if (!v) { put_err(b, -12, m, pid); return; }
+        int k = nft_ct_list(ns, fam == 2 || fam == 10 ? fam : 0, v, 512);
+        if ((flags & NLM_F_DUMP_) == NLM_F_DUMP_) {
+            for (int i = 0; i < k; i++) ct_entry_out(b, &v[i], seq, pid, NLM_F_MULTI_);
+            put_done(b, seq, pid);
+        } else {
+            uint16_t tl; const uint8_t* tp = nla_find(at, al, CTA_TUPLE_ORIG, &tl);
+            int which = 0;
+            if (!tp) { tp = nla_find(at, al, CTA_TUPLE_REPLY, &tl); which = 1; }
+            uint8_t src[16], dst[16], proto = 0; uint16_t sp = 0, dp = 0;
+            int found = -1;
+            if (tp && (fam == 2 || fam == 10) && ct_tuple_in(tp, tl, fam, src, dst, &proto, &sp, &dp) == 0) {
+                int n = fam == 10 ? 16 : 4;
+                for (int i = 0; i < k && found < 0; i++) {
+                    const uint8_t* s0 = which ? v[i].rsrc : v[i].osrc;
+                    const uint8_t* d0 = which ? v[i].rdst : v[i].odst;
+                    uint16_t s1 = which ? v[i].rsport : v[i].osport, d1 = which ? v[i].rdport : v[i].odport;
+                    int eq = v[i].fam == fam && v[i].proto == proto && s1 == sp && d1 == dp;
+                    for (int j = 0; eq && j < n; j++) if (s0[j] != src[j] || d0[j] != dst[j]) eq = 0;
+                    if (eq) found = i;
+                }
+            }
+            if (found >= 0) {
+                ct_entry_out(b, &v[found], seq, pid, 0);
+                if (flags & NLM_F_ACK_) put_err(b, 0, m, pid);
+            } else put_err(b, tp ? -2 : -22, m, pid);
+        }
+        kfree(v);
+        return;
+    }
+    if (t == 2 /* DELETE */) {
+        uint16_t tl; const uint8_t* tp = nla_find(at, al, CTA_TUPLE_ORIG, &tl);
+        int which = 0;
+        if (!tp) { tp = nla_find(at, al, CTA_TUPLE_REPLY, &tl); which = 1; }
+        int rc;
+        if (!tp) { nft_ct_flush(ns, fam == 2 || fam == 10 ? fam : 0); rc = 0; }   /* conntrack -F */
+        else {
+            uint8_t src[16], dst[16], proto = 0; uint16_t sp = 0, dp = 0;
+            rc = (fam == 2 || fam == 10) ? ct_tuple_in(tp, tl, fam, src, dst, &proto, &sp, &dp) : -22;
+            if (rc == 0) rc = nft_ct_delete(ns, fam, proto, src, dst, sp, dp, which);
+        }
+        if (rc || (flags & NLM_F_ACK_)) put_err(b, rc, m, pid);
+        return;
+    }
+    kprintf("ctnetlink: message %d refused - %s\n", t,
+            t == 0 ? "entries are made by traffic, not by userspace" : "not implemented (statistics)");
+    put_err(b, -95, m, pid);
+}
+
 static uint32_t g_batches, g_aborts;
 
 /* A request stream from a NETLINK_NETFILTER socket made in namespace `ns`.
@@ -883,6 +1028,10 @@ void nft_netlink(int ns, uint32_t pid, const uint8_t* buf, uint32_t n, uint8_t**
             net_free(undo); undo = NULL;
             in_batch = 0;
             if (flags & NLM_F_ACK_) put_err(&b, 0, m, pid);
+            continue;
+        }
+        if (((type >> 8) == 1 || (type >> 8) == 2) && len >= 20 && !in_batch) {
+            ctnl(ns, m, len, pid, &b);                  /* §M90 3b — ctnetlink */
             continue;
         }
         if ((type >> 8) != NFNL_SUBSYS_NFTABLES_ || len < 20 || !net) {

@@ -799,6 +799,9 @@ int task_wait(int pid, int* code);
 int task_wait_ex(int pid, int* code, int nohang);
 int task_wait_ex2(int pid, int* code, int nohang, int* vnr_out);   /* §M90 */
 int task_wait_ex3(int pid, int* code, int nohang, int* vnr_out, int* sig_out);
+/* §M90 — plus the child's uid and WNOWAIT (report, do not reap): waitid. */
+int task_wait_ex4(int pid, int* code, int nohang, int* vnr_out, int* sig_out,
+                  int* uid_out, int nowait);
 void task_exit_signal(int sig) __attribute__((noreturn));          /* §M90 — killed by `sig` */
 void task_exit_group_signal(int sig) __attribute__((noreturn));    /* §M90 — the whole process */
 struct vmm_space;

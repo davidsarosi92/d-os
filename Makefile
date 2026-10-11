@@ -74,7 +74,8 @@ MUSL_PROG_BLOBS := user/muslhello_muslblob.o user/netmusl_muslblob.o \
                    user/epollmusl_muslblob.o user/netmuslserv_muslblob.o \
                    user/nxtest_muslblob.o user/mmaptest_muslblob.o \
                    user/sigmusl_muslblob.o user/cpuidmusl_muslblob.o \
-                   user/sock6musl_muslblob.o user/killmusl_muslblob.o
+                   user/sock6musl_muslblob.o user/killmusl_muslblob.o \
+                   user/nftmusl_muslblob.o
 # §M37 dynamic-linking artifacts — the ld.so blob + the dynamically linked tests.
 MUSL_DYN_BLOBS  := user/ldmusl_blob.o user/muslhellodyn_dynblob.o \
                    user/libgreet_blob.o user/solibtest_dynblob.o \
@@ -623,6 +624,7 @@ else ifeq ($(ARCH),aarch64)
                      user/cpuidmusl_muslblob.o \
                      user/sock6musl_muslblob.o \
                      user/killmusl_muslblob.o \
+                     user/nftmusl_muslblob.o \
                      user/pthreadtest_muslblob.o \
                      $(MUSL_COREUTIL_BLOBS)
 

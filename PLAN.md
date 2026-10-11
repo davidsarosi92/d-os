@@ -6182,20 +6182,21 @@ fixed-address Go binaries load at 0x200000, inside the low identity map):**
      address, and `tcptest` over ::1.  SLAAC/router advertisements are NOT in
      scope (QEMU's SLIRP offers them; a static/link-local setup is what Docker
      uses) — stated, not silently missing.
-  3b. **netfilter (same request).**  The fixed `net.masquerade` policy becomes
-     RULES: (a) a conntrack table (the NAT table generalised: TCP/UDP/ICMP
-     flows, states NEW/ESTABLISHED/RELATED, timeouts) — the masquerade then
-     reads from it; (b) hooks PREROUTING/INPUT/FORWARD/OUTPUT/POSTROUTING in
-     the IPv4 (and 3a's IPv6) paths; (c) nf_tables over NETLINK_NETFILTER:
-     tables, chains on hooks with priority/policy, rules as an expression VM
-     (payload/meta/cmp/immediate/ct/nat/counter/verdict), sets — the subset
-     `nft` and iptables-nft emit for Docker's ruleset; (d) DNAT, so `-p` works
-     WITHOUT docker-proxy (`--userland-proxy=false`).  Needs a userspace
-     (iptables-nft or nft, static, musl) in the image — built by a script like
-     the others, not vendored.  done = dockerd with `--iptables=true` creates
-     its DOCKER/DOCKER-FORWARD chains, `nft list ruleset` shows them, a
-     container reaches the internet through a MASQUERADE RULE (with
-     `net.masquerade` off) and `-p 8080:80` answers with the proxy disabled.
+  3b. **netfilter — SHIPPED 2026-10-11 (DOCS change log 2026-10-11).**
+     nf_tables over NETLINK_NETFILTER (batched transactions with rollback,
+     dumps, live counters), a compiled rule VM, conntrack with NAT at Linux's
+     priority points, hooks in the IPv4 and IPv6 paths, br_netfilter, per-device
+     `net/ipv4/conf/*/{forwarding,route_localnet}` with the 127/8 martian rule,
+     the unmodified static `nft` 1.1.1, `waitid`.  Tests: `nfttest`,
+     `brnftest`, netnstest's martian cases.  Docker's nftables firewall backend
+     (`--firewall-backend=nftables --userland-proxy=false`) creates its whole
+     ruleset (verdict maps, fib, ct, masquerade, per-network chains).  Lessons:
+     conntrack must recognise an already-translated packet at every later hook
+     (Linux attaches it to the packet instead); the INPUT hook rewrites the
+     source a transport layer reads; raw/conntrack/NAT are PRIORITIES among the
+     chains, not a prologue — each defect is falsified in the tests.  Open:
+     reject's RST/ICMP, ICMP-error inner headers, conntrack helpers, flowtables
+     and stateful objects (refused by name).
   4. Rung 6: `docker run -it` (pty/devpts), `docker build`, volumes.
   5. x86_64: waits for the higher-half kernel move.
   Open beside it: NEXT.md #14 (rare pthread_join hang) and #16 (a non-leader

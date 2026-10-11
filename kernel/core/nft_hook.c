@@ -30,6 +30,8 @@
 
 #include "nftables.h"
 #include "nft_vm.h"
+#include "nft_hook.h"
+#include "config.h"
 #include "net.h"
 #include "kmalloc.h"
 #include "printf.h"
@@ -141,8 +143,32 @@ static int tuple_is(const struct nft_tuple* t, struct nft_pkt* p, int fam) {
     return mcmp(t->src, p_src(p), (uint32_t)n) == 0 && mcmp(t->dst, p_dst(p), (uint32_t)n) == 0 &&
            t->sport == p_sport(p) && t->dport == p_dport(p);
 }
+/* Is (addr, port) the endpoint `a`/`ap` OR its translated twin `b`/`bp`? */
+static int ep_is(const uint8_t* addr, uint16_t port, const uint8_t* a, uint16_t ap,
+                 const uint8_t* b, uint16_t bp, int n) {
+    return (mcmp(addr, a, (uint32_t)n) == 0 && port == ap) ||
+           (mcmp(addr, b, (uint32_t)n) == 0 && port == bp);
+}
+/* A PACKET IS LOOKED UP AT EVERY HOOK IT PASSES, AND MAY ALREADY BE
+ * TRANSLATED (2026-10-11).  Linux attaches the connection to the packet after
+ * the first lookup, so a later hook never searches; here each hook searches
+ * afresh, and the first version matched only the exact original or reply
+ * tuple.  A packet DNATed at PREROUTING then matched NEITHER at FORWARD (its
+ * destination is already the new one), so it started a SECOND connection that
+ * never became established, and the reply matched both connections' reply
+ * tuples — whether it was un-DNATed depended on which slot came first.  The
+ * same on loopback, where an OUTPUT-DNATed packet comes back in through
+ * PREROUTING.  So each END of the packet may be either the original or the
+ * translated form: direction 0's source is orig.src or (after SNAT) reply.dst,
+ * its destination orig.dst or (after DNAT) reply.src; direction 1 mirrored.
+ * Every rewrite in ct_apply is idempotent, so a packet already translated is
+ * left as it is. */
 static struct nft_conn* ct_find(struct nft_pkt* p, int* dir) {
     uint64_t now = timer_ticks_ms();
+    int n = alen(p->fam);
+    const uint8_t* s = p_src(p);
+    const uint8_t* d = p_dst(p);
+    uint16_t sp = p_sport(p), dp = p_dport(p);
     for (int i = 0; i < CT_MAX; i++) {
         struct nft_conn* c = &g_ct[i];
         if (!c->used) continue;
@@ -150,6 +176,15 @@ static struct nft_conn* ct_find(struct nft_pkt* p, int* dir) {
         if (c->ns != p->ns || c->fam != p->fam || c->proto != p->l4proto) continue;
         if (tuple_is(&c->orig, p, p->fam))  { *dir = 0; return c; }
         if (tuple_is(&c->reply, p, p->fam)) { *dir = 1; return c; }
+        if (!(c->status & (IPS_SRC_NAT | IPS_DST_NAT))) continue;
+        if (ep_is(s, sp, c->orig.src, c->orig.sport, c->reply.dst, c->reply.dport, n) &&
+            ep_is(d, dp, c->orig.dst, c->orig.dport, c->reply.src, c->reply.sport, n)) {
+            *dir = 0; return c;
+        }
+        if (ep_is(s, sp, c->reply.src, c->reply.sport, c->orig.dst, c->orig.dport, n) &&
+            ep_is(d, dp, c->reply.dst, c->reply.dport, c->orig.src, c->orig.sport, n)) {
+            *dir = 1; return c;
+        }
     }
     return NULL;
 }
@@ -568,6 +603,30 @@ int nft_active(int ns) {
     return n && n->tables;
 }
 
+/* `debug.nft_trace` = 1: every IPv4 packet at every hook, AFTER the hook —
+ * hook, addresses and ports as they leave it, the connection's direction and
+ * state, and the verdict.  Linux's nftrace/conntrack -E in one line, for the
+ * question "which hook did what to this packet". */
+static int g_trace;
+static const char* const g_hookname[5] = { "PRE", "IN", "FWD", "OUT", "POST" };
+static void trace_pkt(struct nft_pkt* p, int hook, int verdict) {
+    if (p->fam != 2 || hook < 0 || hook > 4) return;
+    const uint8_t* s = p_src(p);
+    const uint8_t* d = p_dst(p);
+    kprintf("nft-trace ns %d %s %s%s%s %u.%u.%u.%u:%u > %u.%u.%u.%u:%u proto %u ct %s%s %s\n",
+            p->ns, g_hookname[hook],
+            p->in ? p->in->name : "-", "/", p->out ? p->out->name : "-",
+            s[0], s[1], s[2], s[3], (unsigned)p_sport(p), d[0], d[1], d[2], d[3], (unsigned)p_dport(p),
+            p->l4proto, p->ct ? (p->dir ? "reply" : "orig") : "none",
+            p->ctstate == CTS_NEW ? "/new" : p->ctstate == CTS_ESTABLISHED ? "/est" : "",
+            verdict == NF_ACCEPT_ ? "accept" : "DROP");
+}
+static void nft_trace_changed(const char* key, const char* value) {
+    (void)key;
+    g_trace = value && value[0] == '1';
+}
+CONFIG_WATCH(cw_nft_trace) = { .prefix = "debug.nft_trace", .changed = nft_trace_changed };
+
 /* THE ENTRY: one packet at one hook.  `nh` holds the network header and is
  * rewritten in place by NAT.  Returns NF_ACCEPT (1) or NF_DROP (0). */
 int nft_ip_hook(int ns, int fam, int hook, struct net_device* in, struct net_device* out,
@@ -599,28 +658,52 @@ int nft_ip_hook(int ns, int fam, int hook, struct net_device* in, struct net_dev
     }
     uint32_t f = nft_lock();
     g_evals++;
-    ct_classify(&p);
+    /* THE CHAINS RUN IN PRIORITY ORDER AND CONNTRACK AND NAT HAVE PRIORITIES
+     * TOO (2026-10-11).  Linux: raw -300, conntrack -200, the destination NAT
+     * point -100 (PREROUTING, OUTPUT), the source NAT point 100 (INPUT,
+     * POSTROUTING).  This hook used to classify the packet and apply an
+     * established connection's translation BEFORE any chain — so Docker's
+     * raw-PREROUTING rule `ip daddr 172.17.0.2 iifname != "docker0" drop`
+     * ("drop direct access") saw a masqueraded ping REPLY already
+     * un-translated to the container's address and dropped every one of them:
+     * no container could reach the outside under Docker's nftables backend.
+     * Now a chain below -200 sees the packet untracked, a chain below the NAT
+     * point sees it untranslated, and a nat-type chain decides a connection's
+     * FIRST packet while an established one's translation is applied at that
+     * same point.  FORWARD has no NAT point (Linux translates nothing there). */
     int pre = hook == 0 /* PREROUTING */ || hook == 3 /* OUTPUT */;
-    if (pre) ct_apply(&p, 1);
+    int srcside = hook == 1 /* INPUT */ || hook == 4 /* POSTROUTING */;
+    int32_t nat_prio = pre ? -100 : 100;
+    int classified = 0, translated = !(pre || srcside);
     struct nft_chain* cs[16]; struct nft_table* ts[16];
     int k = hook_chains(n, fam, hook, cs, ts, 16);
     int verdict = NF_ACCEPT_;
-    int first = p.ct && p.ctstate == CTS_NEW && p.dir == 0 &&
-                !(p.ct->status & (pre ? IPS_DST_NAT : IPS_SRC_NAT));
     for (int i = 0; i < k; i++) {
+        int32_t pr = cs[i]->prio;
         int is_nat = s_eq(cs[i]->type, "nat");
-        if (is_nat && !first) continue;            /* NAT is decided by a connection's first packet */
+        if (!classified && (pr >= -200 || is_nat)) { ct_classify(&p); classified = 1; }
+        if (!translated && pr > nat_prio) { ct_apply(&p, pre); translated = 1; }
+        if (is_nat) {
+            int first = p.ct && p.ctstate == CTS_NEW && p.dir == 0 &&
+                        !(p.ct->status & (pre ? IPS_DST_NAT : IPS_SRC_NAT));
+            if (!first) {                          /* decided already: applied here */
+                if (!translated) { ct_apply(&p, pre); translated = 1; }
+                continue;
+            }
+        }
         g_cur_table = ts[i];
         p.nat = 0;
         int v = run_chain(cs[i], &p, 0);
         if (v == NFT_RETURN) v = cs[i]->policy == 0 ? NF_DROP_ : NF_ACCEPT_;
         if (v == NF_DROP_) { verdict = NF_DROP_; break; }
-        if (is_nat && p.nat) ct_bind_nat(&p);
+        if (is_nat && p.nat) { ct_bind_nat(&p); translated = 1; }
     }
-    if (verdict == NF_ACCEPT_ && !pre) ct_apply(&p, 0);
+    if (!classified) ct_classify(&p);
+    if (verdict == NF_ACCEPT_ && !translated) ct_apply(&p, pre);
     if (p.ct && p.mark != p.ct->mark && p.mark) p.ct->mark = p.mark;
     if (verdict == NF_DROP_) g_dropped++;
     nft_unlock(f);
+    if (g_trace) trace_pkt(&p, hook, verdict);
     return verdict;
 }
 
@@ -629,6 +712,58 @@ void nft_ct_ns_gone(int ns) {
     uint32_t f = nft_lock();
     for (int i = 0; i < CT_MAX; i++) if (g_ct[i].used && g_ct[i].ns == ns) g_ct[i].used = 0;
     nft_unlock(f);
+}
+
+/* ---- ctnetlink's access (§M90 3b) ------------------------------------------- */
+int nft_ct_list(int ns, int fam, struct nft_ct_view* v, int max) {
+    int k = 0;
+    uint64_t now = timer_ticks_ms();
+    uint32_t f = nft_lock();
+    for (int i = 0; i < CT_MAX && k < max; i++) {
+        struct nft_conn* c = &g_ct[i];
+        if (!c->used || c->ns != ns || (fam && c->fam != fam)) continue;
+        uint64_t age = now - c->last_ms, to = ct_timeout_ms(c);
+        if (age > to) continue;
+        struct nft_ct_view* o = &v[k++];
+        int n = alen(c->fam);
+        o->fam = c->fam; o->proto = c->proto;
+        for (int j = 0; j < 16; j++) o->osrc[j] = o->odst[j] = o->rsrc[j] = o->rdst[j] = 0;
+        mcpy(o->osrc, c->orig.src, (uint32_t)n); mcpy(o->odst, c->orig.dst, (uint32_t)n);
+        mcpy(o->rsrc, c->reply.src, (uint32_t)n); mcpy(o->rdst, c->reply.dst, (uint32_t)n);
+        o->osport = c->orig.sport; o->odport = c->orig.dport;
+        o->rsport = c->reply.sport; o->rdport = c->reply.dport;
+        o->status = c->status; o->mark = c->mark;
+        o->timeout_s = (uint32_t)((to - age) / 1000);
+        o->id = (uint32_t)i + 1;
+    }
+    nft_unlock(f);
+    return k;
+}
+int nft_ct_delete(int ns, int fam, uint8_t proto, const uint8_t* src, const uint8_t* dst,
+                  uint16_t sport, uint16_t dport, int which) {
+    int r = -2;
+    uint32_t f = nft_lock();
+    for (int i = 0; i < CT_MAX; i++) {
+        struct nft_conn* c = &g_ct[i];
+        if (!c->used || c->ns != ns || c->fam != fam || c->proto != proto) continue;
+        const struct nft_tuple* t = which ? &c->reply : &c->orig;
+        int n = alen(fam);
+        if (mcmp(t->src, src, (uint32_t)n) || mcmp(t->dst, dst, (uint32_t)n) ||
+            t->sport != sport || t->dport != dport) continue;
+        c->used = 0;
+        r = 0;
+        break;
+    }
+    nft_unlock(f);
+    return r;
+}
+int nft_ct_flush(int ns, int fam) {
+    int k = 0;
+    uint32_t f = nft_lock();
+    for (int i = 0; i < CT_MAX; i++)
+        if (g_ct[i].used && g_ct[i].ns == ns && (!fam || g_ct[i].fam == fam)) { g_ct[i].used = 0; k++; }
+    nft_unlock(f);
+    return k;
 }
 
 void nft_hook_stats(uint32_t* evals, uint32_t* dropped, uint32_t* ct_new, uint32_t* nat_bind, uint32_t* ct_live) {
