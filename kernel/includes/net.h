@@ -634,12 +634,13 @@ void net6_set_forwarding(int ns, int on);
 int  net6_disabled(int ns);
 void net6_set_disabled(int ns, int on);
 void net6_procfs_init(void);
-void net6_procfs_dev(struct net_device* dev);   /* conf/<name>/ files for a (re)named device */
+void net6_procfs_dev(struct net_device* dev);
+void net6_ns_reset(int ns);                     /* a namespace's end: its IPv6 settings and routes */   /* conf/<name>/ files for a (re)named device */
 /* §M90 3a — ICMPv6 sockets (raw and ping): the message without its IP header. */
 typedef void (*icmp6_recv_fn)(const uint8_t* src6, const uint8_t* msg, uint32_t len, void* ctx);
 int  net6_icmp_listen(int ns, icmp6_recv_fn fn, void* ctx);
 void net6_icmp_unlisten(void* ctx);
-int  net6_icmp_send(int ns, struct net_device* scope, const uint8_t dst[16], uint8_t* msg, uint32_t len);
+int  net6_icmp_send(int ns, struct net_device* scope, const uint8_t dst[16], uint8_t* msg, uint32_t len, int hops);
 /* Echo `count` times; replies received.  `dev` names the link for a
  * link-local destination (NULL = route). */
 int  net_ping6(int ns, struct net_device* dev, const uint8_t dst[16], int count);

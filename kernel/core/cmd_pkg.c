@@ -223,6 +223,10 @@ static int is_linux_elf(const uint8_t* img, size_t len, const char* real) {
          * and GNU_STACK.  A statically linked Go binary (docker, dockerd,
          * runc) is the case this exists for. */
         if (t == 4) return 1;                                    /* PT_NOTE   */
+        /* §M90 — a STATIC-PIE program (musl's -static-pie: nft) has neither:
+         * it carries PT_DYNAMIC (its own relocations) and GNU_RELRO, which no
+         * native program here is linked with. */
+        if (t == 2 || t == 0x6474e552u) return 1;               /* PT_DYNAMIC, GNU_RELRO */
     }
     return 0;
 }

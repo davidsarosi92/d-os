@@ -2748,6 +2748,94 @@ static long h_ppoll(struct abi_ctx* c) {
     return r < 0 ? -ABI_EFAULT : r;
 }
 
+/* §M90 3b — select / pselect6, on top of poll.  The fd_sets are bitmaps
+ * (fd N = bit N%8 of byte N/8 on these little-endian guests, whatever their
+ * word size); every set bit becomes a pollfd, and the sets are rewritten
+ * from the answers.  pselect6's sixth argument ({sigset*, size}) swaps the
+ * signal mask around the wait, as epoll_pwait's does. */
+static int abi_sigset_read(struct abi_ctx* c, unsigned long p, uint64_t* out);
+static int abi_user_r_ok(unsigned long uptr, unsigned long len);
+static long select_common(struct abi_ctx* c, int ms) {
+    int n = (int)c->a[0];
+    if (n < 0 || n > 1024) return -ABI_EINVAL;
+    unsigned nb = (unsigned)(n + 7) / 8;
+    unsigned long sets[3] = { c->a[1], c->a[2], c->a[3] };
+    uint8_t in[3][128];
+    for (int k = 0; k < 3; k++) {
+        for (unsigned i = 0; i < nb; i++) in[k][i] = 0;
+        if (sets[k]) {
+            if (!abi_user_r_ok(sets[k], nb ? nb : 1) || !abi_w_ok(sets[k], nb ? nb : 1)) return -ABI_EFAULT;
+            for (unsigned i = 0; i < nb; i++) in[k][i] = ((const uint8_t*)(uintptr_t)sets[k])[i];
+        }
+    }
+    int cnt = 0;
+    for (int fd = 0; fd < n; fd++)
+        if ((in[0][fd / 8] | in[1][fd / 8] | in[2][fd / 8]) & (1 << (fd % 8))) cnt++;
+    struct pollfd* p = cnt ? (struct pollfd*)kmalloc(sizeof(struct pollfd) * (size_t)cnt) : NULL;
+    if (cnt && !p) return -12;
+    int k = 0;
+    for (int fd = 0; fd < n; fd++) {
+        uint8_t m = (uint8_t)(1 << (fd % 8));
+        short ev = 0;
+        if (in[0][fd / 8] & m) ev |= POLLIN;
+        if (in[1][fd / 8] & m) ev |= POLLOUT;
+        if (in[2][fd / 8] & m) ev |= 0x002;               /* POLLPRI */
+        if (!ev) continue;
+        p[k].fd = fd; p[k].events = ev; p[k].revents = 0; k++;
+    }
+    int r = sys_poll_k(p, cnt, ms);
+    if (r < 0) { kfree(p); return r == -4 ? -4 : -ABI_EINVAL; }
+    for (int s2 = 0; s2 < 3; s2++)
+        if (sets[s2]) for (unsigned i = 0; i < nb; i++) ((uint8_t*)(uintptr_t)sets[s2])[i] = 0;
+    int bits = 0;
+    for (int i = 0; i < cnt; i++) {
+        int fd = p[i].fd; short rv = p[i].revents;
+        if (rv & 0x020 /* POLLNVAL */) { kfree(p); return -ABI_EBADF; }
+        uint8_t m = (uint8_t)(1 << (fd % 8));
+        if (sets[0] && (p[i].events & POLLIN) && (rv & (POLLIN | POLLHUP | POLLERR))) { ((uint8_t*)(uintptr_t)sets[0])[fd / 8] |= m; bits++; }
+        if (sets[1] && (p[i].events & POLLOUT) && (rv & (POLLOUT | POLLERR))) { ((uint8_t*)(uintptr_t)sets[1])[fd / 8] |= m; bits++; }
+        if (sets[2] && (p[i].events & 0x002) && (rv & 0x002)) { ((uint8_t*)(uintptr_t)sets[2])[fd / 8] |= m; bits++; }
+    }
+    kfree(p);
+    return bits;
+}
+static long h_select(struct abi_ctx* c) {                  /* timeout: struct timeval */
+    int ms = -1;
+    if (c->a[4]) {
+        unsigned w = (!c->map || c->map->word_bytes != 4) ? 8 : 4;
+        if (!abi_r_ok(c->a[4], 2 * w)) return -ABI_EFAULT;
+        uint64_t s = abi_get_word(c, c->a[4], 0), us = abi_get_word(c, c->a[4], 1);
+        uint64_t t = s * 1000ull + (us + 999ull) / 1000ull;
+        ms = t > 0x7FFFFFFF ? 0x7FFFFFFF : (int)t;
+    }
+    return select_common(c, ms);
+}
+static long h_pselect6(struct abi_ctx* c) {                /* timeout: struct timespec */
+    int ms = -1;
+    if (c->a[4]) {
+        unsigned w = (!c->map || c->map->word_bytes != 4) ? 8 : 4;
+        if (!abi_r_ok(c->a[4], 2 * w)) return -ABI_EFAULT;
+        uint64_t s = abi_get_word(c, c->a[4], 0), ns = abi_get_word(c, c->a[4], 1);
+        uint64_t t = s * 1000ull + (ns + 999999ull) / 1000000ull;
+        ms = t > 0x7FFFFFFF ? 0x7FFFFFFF : (int)t;
+    }
+    struct task* t = task_current();
+    uint64_t saved = 0; int swapped = 0;
+    if (c->a[5] && t) {
+        unsigned w = (!c->map || c->map->word_bytes != 4) ? 8 : 4;
+        if (abi_r_ok(c->a[5], 2 * w)) {
+            unsigned long sp = (unsigned long)abi_get_word(c, c->a[5], 0);
+            uint64_t m = 0;
+            if (sp && abi_sigset_read(c, sp, &m)) {
+                saved = lnx_sig_blocked64(t); lnx_sig_set_blocked64(t, m); swapped = 1;
+            }
+        }
+    }
+    long r = select_common(c, ms);
+    if (swapped) lnx_sig_set_blocked64(t, saved);
+    return r;
+}
+
 /* §M90 — set_tid_address(tidptr): RECORD the address as this thread's
  * clear-child-tid (zeroed and futex-woken at its exit — task_exit_code), as
  * Linux does; it used to be dropped.  Returns the tid as the caller's pid
@@ -3343,6 +3431,14 @@ static long h_sendmsg(struct abi_ctx* c) {
     } else if (name && abi_fd_is_inet6(fd)) {               /* §M90 3a */
         struct sockaddr_k ka;
         int e = abi_sa_in(name, *(uint32_t*)(uintptr_t)(um + 8), &ka);
+        /* IPV6_PKTINFO (level 41, type 50): in6_pktinfo { addr[16], ifindex }
+         * names the link — how Go's ndp sends its unsolicited NA */
+        uint64_t ctl = *(uint64_t*)(uintptr_t)(um + 32), clen = *(uint64_t*)(uintptr_t)(um + 40);
+        if (!e && ctl && clen >= 16 + 20 && abi_user_r_ok(ctl, 16 + 20)) {
+            const uint8_t* cm = (const uint8_t*)(uintptr_t)ctl;
+            if (*(const uint32_t*)(cm + 8) == 41 && *(const uint32_t*)(cm + 12) == 50 && !ka.scope)
+                ka.scope = *(const uint32_t*)(cm + 16 + 16);
+        }
         r = e ? abi_sa_err(e) : sys_sendto_sa_k(fd, k, (size_t)total, &ka);
     } else if (name) {
         uint32_t ip; int port;
@@ -3452,11 +3548,12 @@ static long h_shutdown(struct abi_ctx* c) {
  * not be a no-op: Go sets it on every "tcp6" listener, and Docker's proxy
  * opens [::]:P beside 0.0.0.0:P relying on it. */
 static long h_setsockopt(struct abi_ctx* c) {
-    if ((int)c->a[1] == 41 && (int)c->a[2] == 26) {
-        if (c->a[4] < 4 || !abi_user_r_ok(c->a[3], 4)) return -ABI_EINVAL;
-        int on = *(const int32_t*)(uintptr_t)c->a[3];
-        int r = sys_netsock_v6only((int)c->a[0], on ? 1 : 0);
-        return r < 0 ? (r == -1 ? -92 : r) : 0;       /* ENOPROTOOPT on a non-v6 socket */
+    if ((int)c->a[1] == 41) {                          /* IPPROTO_IPV6 (§M90 3a) */
+        int v = 0;
+        if (c->a[4] >= 4 && abi_user_r_ok(c->a[3], 4)) v = *(const int32_t*)(uintptr_t)c->a[3];
+        else if ((int)c->a[2] != 20 && (int)c->a[2] != 21) return -ABI_EINVAL;
+        int r = sys_netsock_setopt6((int)c->a[0], (int)c->a[2], v);
+        return r;
     }
     return 0;
 }
@@ -3565,6 +3662,8 @@ static const struct {
     [ABI_SET_TID_ADDRESS] = { "set_tid_address", h_settid },
     [ABI_SIGPROCMASK]     = { "sigprocmask",     h_sigprocmask },
     [ABI_PAUSE]           = { "pause",           h_pause },
+    [ABI_SELECT]          = { "select",          h_select },
+    [ABI_PSELECT6]        = { "pselect6",        h_pselect6 },
     [ABI_SIGSUSPEND]      = { "sigsuspend",      h_sigsuspend },
     [ABI_TIMERFD_CREATE]  = { "timerfd_create",  h_timerfd_create  },
     [ABI_EVENTFD]         = { "eventfd2",        h_eventfd         },

@@ -1872,6 +1872,8 @@ struct netsock {
     int      fam6, v6only, peer_is4;
     uint8_t  local6[16], peer6[16];
     uint32_t scope;
+    uint32_t mcast_if;                  /* IPV6_MULTICAST_IF: the link for ff00::/8 */
+    int      hops;                      /* IPV6_{UNICAST,MULTICAST}_HOPS, 0 = default */
 };
 
 static uint16_t g_ephem_port = 0xC000;
@@ -2723,6 +2725,21 @@ int sys_socket6(int type, int proto) {
     if (ns) ns->fam6 = 1;                          /* ... in the other family */
     return fd;
 }
+/* §M90 3a — IPPROTO_IPV6 socket options.  0, or a negative errno. */
+int sys_netsock_setopt6(int fd, int opt, int val) {
+    struct netsock* ns = nsock_of(fd);
+    if (!ns || !ns->fam6) return -92;              /* ENOPROTOOPT */
+    switch (opt) {
+    case 26: return sys_netsock_v6only(fd, val ? 1 : 0) < 0 ? -22 : 0;   /* IPV6_V6ONLY */
+    case 17: ns->mcast_if = (uint32_t)val; return 0;                      /* IPV6_MULTICAST_IF */
+    case 16: case 18: ns->hops = val < 0 ? 0 : val > 255 ? 255 : val; return 0;   /* *_HOPS */
+    case 7:  case 19: case 20: case 21: case 49: case 50: return 0;
+        /* IPV6_CHECKSUM (the kernel computes ICMPv6 sums anyway), MULTICAST_LOOP,
+         * JOIN/LEAVE_GROUP (every 33:33 multicast frame is accepted already),
+         * RECVPKTINFO/PKTINFO (no ancillary data is delivered — said) */
+    }
+    return -92;
+}
 int sys_netsock_fam(int fd) {
     struct netsock* ns = nsock_of(fd);
     return ns ? (ns->fam6 ? 10 : 2) : -1;
@@ -2849,15 +2866,17 @@ long sys_sendto_sa_k(int fd, const void* buf, size_t n, const struct sockaddr_k*
             if (n < 8 || m[0] != 128) { kfree(m); return -22; }
             m[4] = (uint8_t)(ns->local_port >> 8); m[5] = (uint8_t)ns->local_port;
         }
-        struct net_device* sc6 = to->scope ? net_by_index(ns->netns, (int)to->scope) : NULL;
-        int r6 = net6_icmp_send(ns->netns, sc6, to->a6, m, (uint32_t)n);
+        uint32_t sid = to->scope ? to->scope : (to->a6[0] == 0xff ? ns->mcast_if : 0);
+        struct net_device* sc6 = sid ? net_by_index(ns->netns, (int)sid) : NULL;
+        int r6 = net6_icmp_send(ns->netns, sc6, to->a6, m, (uint32_t)n, ns->hops);
         kfree(m);
         return r6 == 0 ? (long)n : r6;
     }
     if (ns->type != SOCK_DGRAM) return -95;        /* EOPNOTSUPP */
     if (ns_ensure_bound(ns, 0) != 0) return -1;
     if (n > 65487u) return -90;
-    struct net_device* sc = to->scope ? net_by_index(ns->netns, (int)to->scope) : NULL;
+    uint32_t sid = to->scope ? to->scope : (to->a6[0] == 0xff ? ns->mcast_if : 0);
+    struct net_device* sc = sid ? net_by_index(ns->netns, (int)sid) : NULL;
     int r = net_udp_send6_ns(ns->netns, sc, to->a6, ns->local_port, to->port, buf, (uint32_t)n);
     return r == 0 ? (long)n : r;
 }

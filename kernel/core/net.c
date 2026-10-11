@@ -81,6 +81,8 @@
 #include "settings.h"
 #include "net.h"
 #include "packet.h"
+#include "nft_hook.h"
+#include "nftables.h"
 #include "hal.h"
 #include "hal_api.h"
 #include "printf.h"
@@ -221,6 +223,7 @@ int net_ns_alive(int ns) { return ns >= 0 && ns < NET_NS_MAX && g_ns_used[ns]; }
 
 static void arp_drop_dev_locked(struct net_device* dev);
 
+static void net_ns_settings_reset_locked(int ns);
 int net_ns_create(void) {
     int id = 0;
     uint32_t f = net_lock();
@@ -245,8 +248,14 @@ void net_ns_destroy(int ns) {
     for (struct net_device* n = g_head; n; n = n->next)
         if (n->netns == ns) { n->netns = 0; n->ip = n->netmask = n->gateway = 0; n->master = NULL; }
     for (int i = 0; i < NET_RT_MAX; i++) if (g_rt[i].used && g_rt[i].ns == ns) g_rt[i].used = 0;
+    /* §M90 — and every per-namespace setting goes too: a namespace number is
+     * reused, and the next namespace with it must not inherit a forwarding
+     * switch, an IPv6 setting or a firewall it never asked for */
+    net_ns_settings_reset_locked(ns);
     g_ns_used[ns] = 0;
     net_unlock(f);
+    nft_ns_gone(ns);                              /* §M90 3b — its ruleset ... */
+    nft_ct_ns_gone(ns);                           /* ... and its connections */
 }
 
 int net_register(struct net_device* dev) {
@@ -2718,6 +2727,8 @@ const uint8_t* net_http_body(uint32_t* len_out) {
 
 /* ----------------------- IPv4 --------------------------------------------- */
 
+static uint32_t get_be32_early(const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+static void nft_reroute_local_locked(int ns, const uint8_t* pkt, uint32_t total);
 static int ipv4_emit_locked(struct net_device* dev, const uint8_t* via_mac,
                             uint32_t src_ip, uint32_t dst_ip, uint8_t proto,
                             const void* payload, uint32_t len) {
@@ -2743,6 +2754,17 @@ static int ipv4_emit_locked(struct net_device* dev, const uint8_t* via_mac,
     const uint8_t* pl = (const uint8_t*)payload;
     for (uint32_t i = 0; i < len; i++) pkt[sizeof(struct ipv4_hdr) + i] = pl[i];
 
+    /* §M90 3b — nf_tables OUTPUT and POSTROUTING for a packet made here.  A
+     * DNAT in OUTPUT changes where it goes: it is then routed anew, the way a
+     * forwarded packet is (without the TTL decrement). */
+    if (nft_active(dev->netns)) {
+        if (!nft_ip_hook(dev->netns, 2, NFT_HOOK_OUTPUT, NULL, dev, pkt, total)) return -1;
+        if (get_be32_early(pkt + 16) != dst_ip) {
+            nft_reroute_local_locked(dev->netns, pkt, total);
+            return 0;
+        }
+        if (!nft_ip_hook(dev->netns, 2, NFT_HOOK_POSTROUTING, NULL, dev, pkt, total)) return -1;
+    }
     return eth_send_locked(dev, via_mac, ETHERTYPE_IPV4, pkt, total);
 }
 
@@ -2787,6 +2809,10 @@ static uint8_t  g_fwd_on[NET_NS_MAX];
 static uint32_t g_fwd_count, g_fwd_noarp, g_fwd_noroute, g_nat_out, g_nat_in, g_nat_full;
 static uint8_t  g_fwdbuf[ETH_MTU];
 
+static void net_ns_settings_reset_locked(int ns) {
+    if (ns > 0 && ns < NET_NS_MAX) g_fwd_on[ns] = 0;
+    net6_ns_reset(ns);
+}
 int  net_ip_forward(int ns) { return ns >= 0 && ns < NET_NS_MAX ? g_fwd_on[ns] : 0; }
 void net_set_ip_forward(int ns, int on) { if (ns >= 0 && ns < NET_NS_MAX) g_fwd_on[ns] = on ? 1 : 0; }
 
@@ -2952,9 +2978,22 @@ static void fwd_emit_locked(int ns, struct net_device* in, uint32_t ihl, uint32_
     uint32_t nh = 0;
     struct net_device* out = net_route_ns(ns, dst, &nh);
     if (!out || out == in || out->admin_down || (out->flags & NETDEV_F_LOOPBACK)) { g_fwd_noroute++; return; }
-    if (nat && masq_wanted(out, src) && nat_out_locked(ns, out, ip, ihl, total) != 0) return;
-    if (ip[8] <= 1) return;                            /* TTL expired (no ICMP sent) */
-    ip[8]--;
+    /* §M90 3b — with an nf_tables ruleset the namespace's rules decide
+     * (FORWARD filters, POSTROUTING translates); the built-in masquerade is
+     * the policy for a namespace WITHOUT one. */
+    int nftp = nft_active(ns);
+    if (nftp && in && !nft_ip_hook(ns, 2, NFT_HOOK_FORWARD, in, out, ip, total)) return;
+    if (!nftp && nat && masq_wanted(out, src) && nat_out_locked(ns, out, ip, ihl, total) != 0) return;
+    if (in) {                                          /* forwarded: a router hop */
+        if (ip[8] <= 1) return;                        /* TTL expired (no ICMP sent) */
+        ip[8]--;
+    }
+    if (nftp && !nft_ip_hook(ns, 2, NFT_HOOK_POSTROUTING, in, out, ip, total)) return;
+    dst = get_be32(ip + 16);
+    if (nftp) {                                        /* SNAT/DNAT may have moved the next hop */
+        out = net_route_ns(ns, dst, &nh);
+        if (!out) { g_fwd_noroute++; return; }
+    }
     ip_fix(ip, ihl);
     uint8_t mac[ETH_ALEN];
     if (arp_cache_get(out, nh, mac) != 0) {
@@ -2967,6 +3006,14 @@ static void fwd_emit_locked(int ns, struct net_device* in, uint32_t ihl, uint32_
     }
     eth_send_locked(out, mac, ETHERTYPE_IPV4, ip, total);
     g_fwd_count++;
+}
+
+/* A packet made here whose destination an OUTPUT DNAT changed: routed anew
+ * through the forwarding emit (POSTROUTING included, no TTL decrement). */
+static void nft_reroute_local_locked(int ns, const uint8_t* pkt, uint32_t total) {
+    if (total > sizeof g_fwdbuf) return;
+    for (uint32_t i = 0; i < total; i++) g_fwdbuf[i] = pkt[i];
+    fwd_emit_locked(ns, NULL, (uint32_t)(pkt[0] & 0x0F) * 4u, total, 0);
 }
 
 static void net_forward_locked(struct net_device* dev, const uint8_t* src_mac,
@@ -3022,13 +3069,26 @@ static void ipv4_input(struct net_device* dev, const uint8_t* src_mac,
     uint32_t ihl = (ih->ver_ihl & 0x0F) * 4;
     if (ihl < sizeof(struct ipv4_hdr) || ihl > len) return;
 
+    /* §M90 3b — nf_tables PREROUTING: on a writable copy, because a DNAT (or
+     * the reverse of a masquerade) rewrites the destination — and the decision
+     * below (ours, or forwarded) is made on the REWRITTEN packet. */
+    static uint8_t nftbuf[ETH_MTU];
+    int nftp = nft_active(dev->netns);
+    if (nftp) {
+        uint32_t tot = (uint32_t)p[2] << 8 | p[3];
+        if (tot > len || tot > sizeof nftbuf || tot < ihl) return;
+        for (uint32_t i = 0; i < tot; i++) nftbuf[i] = p[i];
+        if (!nft_ip_hook(dev->netns, 2, NFT_HOOK_PREROUTING, dev, NULL, nftbuf, tot)) return;
+        p = nftbuf; len = tot;
+        ih = (const struct ipv4_hdr*)p;
+    }
     uint32_t dst = ntohl(ih->dst);
     /* An UNCONFIGURED device (dev->ip == 0) accepts anything addressed to it,
      * because it does not yet know what it is addressed as.  That is not
      * laxity, it is the only way DHCP can work: the reply that TELLS us our
      * address is itself addressed to that address. */
     /* §M90 rung 5d — a reply to a masqueraded flow is the container's, not ours. */
-    if (net_unmasq_locked(dev, p, len)) return;
+    if (!nftp && net_unmasq_locked(dev, p, len)) return;
     /* §M90 rung 5 — any address of the device's NAMESPACE is ours (Linux's
      * weak host model: the host's eth0 address is reachable from a container
      * through the bridge).  Anything else is somebody else's: forwarded, when
@@ -3043,6 +3103,8 @@ static void ipv4_input(struct net_device* dev, const uint8_t* src_mac,
     if (total > len) return;
     const uint8_t* l4 = p + ihl;
     uint32_t l4len = total - ihl;
+    /* §M90 3b — INPUT: the packet is ours; the ruleset may still refuse it */
+    if (nftp && !nft_ip_hook(dev->netns, 2, NFT_HOOK_INPUT, dev, NULL, (uint8_t*)p, total)) return;
 
     switch (ih->proto) {
         case IP_PROTO_ICMP:

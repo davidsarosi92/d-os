@@ -259,6 +259,8 @@ enum abi_op {
      * wait of every shell).  pause returned ENOSYS and a `for (;;) pause();`
      * child spun at full speed. */
     ABI_PAUSE, ABI_SIGSUSPEND,
+    /* §M90 3b — select / pselect6 (nft waits for netlink replies with it) */
+    ABI_SELECT, ABI_PSELECT6,
 
     ABI_OP_MAX
 };

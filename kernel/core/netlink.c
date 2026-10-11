@@ -34,6 +34,7 @@
  * ============================================================================= */
 
 #include "netlink.h"
+#include "nftables.h"
 #include "net.h"
 #include "kmalloc.h"
 #include "waitq.h"
@@ -712,7 +713,8 @@ static void handle(struct nlsock* s, const uint8_t* m, uint32_t len, struct nlb*
 /* ---- the socket ---------------------------------------------------------------- */
 
 struct nlsock* nl_create(int proto) {
-    if (proto != 0 /* NETLINK_ROUTE */) return NULL;
+    /* NETLINK_ROUTE (0) and, §M90 3b, NETLINK_NETFILTER (12) — nf_tables */
+    if (proto != 0 && proto != 12) return NULL;
     struct nlsock* s = (struct nlsock*)kcalloc(1, sizeof *s);
     if (!s) return NULL;
     s->proto = proto;
@@ -741,8 +743,45 @@ uint32_t nl_portid(struct nlsock* s) { return s ? s->portid : 0; }
 
 int nl_can_read(struct nlsock* s) { return s && s->count > 0; }
 
+/* Queue `len` bytes of replies as datagrams of at most NL_DGRAM, cut at
+ * message boundaries (a dump can be longer than one datagram). */
+static long nl_queue_split(struct nlsock* s, const uint8_t* r, uint32_t len) {
+    uint32_t off = 0;
+    while (off < len) {
+        uint32_t take = 0;
+        while (off + take + 16 <= len) {
+            uint32_t ml = r32(r + off + take);
+            uint32_t al = (ml + 3u) & ~3u;
+            if (ml < 16 || off + take + al > len) { take = len - off; break; }
+            if (take + al > NL_DGRAM && take) break;
+            take += al;
+        }
+        if (!take) take = len - off;
+        uint8_t* d = (uint8_t*)kmalloc(take);
+        if (!d) return -12;
+        for (uint32_t i = 0; i < take; i++) d[i] = r[off + i];
+        uint32_t f = waitq_lock(&s->wq);
+        if (s->count == NL_MAXQ) { waitq_unlock(&s->wq, f); kfree(d); return -105; }
+        s->q[(s->head + s->count) % NL_MAXQ].data = d;
+        s->q[(s->head + s->count) % NL_MAXQ].len  = take;
+        s->count++;
+        waitq_wake_all(&s->wq);
+        waitq_unlock(&s->wq, f);
+        off += take;
+    }
+    fd_readiness_changed(s->owner);
+    return 0;
+}
+
 long nl_send(struct nlsock* s, const void* buf, size_t n) {
     if (!s) return -9;
+    if (s->proto == 12) {                         /* §M90 3b — nf_tables (nftables.c) */
+        uint8_t* out = NULL; uint32_t olen = 0;
+        nft_netlink(s->netns, s->portid, (const uint8_t*)buf, (uint32_t)n, &out, &olen);
+        long r = out && olen ? nl_queue_split(s, out, olen) : 0;
+        kfree(out);
+        return r < 0 ? r : (long)n;
+    }
     const uint8_t* m = (const uint8_t*)buf;
     struct nlb b = { (uint8_t*)kmalloc(NL_DGRAM), 0, NL_DGRAM, 0 };
     if (!b.p) return -12;

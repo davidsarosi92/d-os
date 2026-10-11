@@ -858,6 +858,9 @@ CORE_C_SRCS := \
     kernel/core/netlink.c \
     kernel/core/packet.c \
     kernel/core/net6.c \
+    kernel/core/nftables.c \
+    kernel/core/nft_eval.c \
+    kernel/core/nft_hook.c \
     kernel/core/itimer.c \
     kernel/core/epoll.c \
     kernel/core/abi_engine.c \
@@ -920,6 +923,9 @@ CORE_C_SRCS := \
     kernel/core/netlink.c \
     kernel/core/packet.c \
     kernel/core/net6.c \
+    kernel/core/nftables.c \
+    kernel/core/nft_eval.c \
+    kernel/core/nft_hook.c \
     kernel/core/itimer.c \
     kernel/core/epoll.c \
     kernel/core/abi_engine.c \
@@ -1243,6 +1249,9 @@ CORE_C_SRCS := \
     kernel/core/netlink.c \
     kernel/core/packet.c \
     kernel/core/net6.c \
+    kernel/core/nftables.c \
+    kernel/core/nft_eval.c \
+    kernel/core/nft_hook.c \
     kernel/core/itimer.c \
     kernel/core/epoll.c \
     kernel/core/abi_engine.c \

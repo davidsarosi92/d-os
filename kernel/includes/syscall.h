@@ -295,6 +295,7 @@ int  task_may_signal(struct task* me, struct task* t);   /* §M90 — the one ki
 int  sys_socket6(int type, int proto);
 int  sys_netsock_fam(int fd);                 /* 2, 10, or -1: not an AF_INET(6) socket */
 int  sys_netsock_v6only(int fd, int set);     /* set < 0: query */
+int  sys_netsock_setopt6(int fd, int opt, int val);   /* IPPROTO_IPV6 options */
 int  sys_bind_sa(int fd, const struct sockaddr_k* a);
 int  sys_connect_sa(int fd, const struct sockaddr_k* a);
 int  sys_accept_sa(int fd, struct sockaddr_k* peer);

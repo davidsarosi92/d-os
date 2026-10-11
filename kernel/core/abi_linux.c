@@ -85,6 +85,7 @@ static const struct abi_nument linux_i386_ents[] = {
      * (no WIFSIGNALED, no WNOHANG, no pid-namespace translation): arm64 alone
      * had the engine's.  waitpid's three arguments are wait4's first three. */
     {   7, ABI_WAIT },   { 114, ABI_WAIT },
+    { 142, ABI_SELECT }, { 308, ABI_PSELECT6 },     /* _newselect, pselect6 — §M90 3b */
     { 326, ABI_TIMERFD_GETTIME },
     { 104, ABI_SETITIMER       },
     /* §M24 — sockets.  i386 has BOTH: these direct numbers (since 4.3) and the
@@ -227,6 +228,7 @@ static const struct abi_nument linux_amd64_ents[] = {
     {  14, ABI_SIGPROCMASK },       /* rt_sigprocmask */
     {  34, ABI_PAUSE },  { 130, ABI_SIGSUSPEND },   /* §M90 */
     {  61, ABI_WAIT },              /* wait4 — §M90, from the per-arch switch */
+    {  23, ABI_SELECT }, { 270, ABI_PSELECT6 },     /* §M90 3b */
     { 287, ABI_TIMERFD_GETTIME },
     {  38, ABI_SETITIMER       },
     /* §M24 — sockets. */
@@ -336,6 +338,7 @@ static const struct abi_nument linux_arm64_ents[] = {
     { 178, ABI_GETTID   },
     { 135, ABI_SIGPROCMASK },
     { 133, ABI_SIGSUSPEND },        /* §M90 — arm64 has no pause (libc: ppoll) */
+    {  72, ABI_PSELECT6 },          /* §M90 3b — arm64 has no select */
     { 260, ABI_WAIT     },          /* wait4 */
     { 221, ABI_EXECVE   },
     {  59, ABI_PIPE2    },          /* arm64 has only pipe2 */

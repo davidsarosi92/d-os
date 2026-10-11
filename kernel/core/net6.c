@@ -40,6 +40,7 @@
  * ============================================================================= */
 
 #include "net.h"
+#include "nft_hook.h"
 #include "printf.h"
 #include "kmalloc.h"
 #include "timer.h"
@@ -396,12 +397,18 @@ static int ip6_emit_locked(struct net_device* dev, const uint8_t* via_mac, const
                            const uint8_t* payload, uint32_t len) {
     static uint8_t pkt[ETH_MTU];
     if (net6_disabled(dev->netns) || dev->ip6_disabled) return -97;   /* EAFNOSUPPORT, as Linux: disabled */
+    int nftp = nft_active(dev->netns);
     if (len + IP6_HLEN > dev->mtu || len + IP6_HLEN > sizeof pkt) return -90;   /* EMSGSIZE */
     pkt[0] = 0x60; pkt[1] = 0; pkt[2] = 0; pkt[3] = 0;
     pkt[4] = (uint8_t)(len >> 8); pkt[5] = (uint8_t)len;
     pkt[6] = nh; pkt[7] = hops;
     a6_cpy(pkt + 8, src); a6_cpy(pkt + 24, dst);
     for (uint32_t i = 0; i < len; i++) pkt[IP6_HLEN + i] = payload[i];
+    /* §M90 3b — nf_tables OUTPUT + POSTROUTING (NDP passes untouched) */
+    if (nftp) {
+        if (!nft_ip_hook(dev->netns, 10, NFT_HOOK_OUTPUT, NULL, dev, pkt, IP6_HLEN + len)) return -1;
+        if (!nft_ip_hook(dev->netns, 10, NFT_HOOK_POSTROUTING, NULL, dev, pkt, IP6_HLEN + len)) return -1;
+    }
     return net_eth_send_locked(dev, via_mac, ETHERTYPE_IPV6, pkt, IP6_HLEN + len);
 }
 
@@ -493,6 +500,10 @@ static void forward6_locked(struct net_device* in, const uint8_t* p, uint32_t le
     if (len > sizeof buf || len > out->mtu) return;
     for (uint32_t i = 0; i < len; i++) buf[i] = p[i];
     buf[7]--;                                         /* hop limit (not checksummed) */
+    if (nft_active(ns)) {                             /* §M90 3b — FORWARD, POSTROUTING */
+        if (!nft_ip_hook(ns, 10, NFT_HOOK_FORWARD, in, out, buf, len)) return;
+        if (!nft_ip_hook(ns, 10, NFT_HOOK_POSTROUTING, in, out, buf, len)) return;
+    }
     uint8_t mac[ETH_ALEN];
     if (neigh_get_locked(out, nh, mac) == 0) {
         net_eth_send_locked(out, mac, ETHERTYPE_IPV6, buf, len);
@@ -606,6 +617,12 @@ static void if6_make(const char* ifname, int key) {
 }
 /* A device registered (or renamed): its conf/<name>/ files exist, and a new
  * device takes its namespace's defaults. */
+void net6_ns_reset(int ns) {
+    if (ns <= 0 || ns >= NET6_NS_MAX) return;
+    g_fwd6[ns] = 0; g_dis6[ns] = 0;
+    for (int k = 0; k < IF6_NKEYS; k++) g_def6[ns][k] = 0;
+    for (int i = 0; i < RT6_MAX; i++) if (g_rt6[i].used && g_rt6[i].ns == ns) g_rt6[i].used = 0;
+}
 void net6_procfs_dev(struct net_device* dev) {
     if (!dev || !dev->name || !dev->name[0]) return;
     for (int k = 0; k < IF6_NKEYS; k++) if6_make(dev->name, k);
@@ -647,7 +664,7 @@ void net6_icmp_unlisten(void* ctx) {
 }
 /* Send an ICMPv6 message built by a socket: the checksum is the kernel's (as
  * Linux does for ICMPv6 raw sockets).  Blocks for neighbour discovery. */
-int net6_icmp_send(int ns, struct net_device* scope, const uint8_t dst[16], uint8_t* m, uint32_t len) {
+int net6_icmp_send(int ns, struct net_device* scope, const uint8_t dst[16], uint8_t* m, uint32_t len, int hops) {
     struct net_device* dev = NULL;
     uint8_t mac[ETH_ALEN], src[16];
     if (len < 4 || len > ETH_MTU - IP6_HLEN) return -90;
@@ -655,7 +672,10 @@ int net6_icmp_send(int ns, struct net_device* scope, const uint8_t dst[16], uint
     if (pr) return pr == -1 ? -101 : -113;
     uint32_t f = net_lock();
     icmp6_fill_csum(m, len, src, dst);
-    int r = ip6_emit_locked(dev, mac, src, dst, NH_ICMP6, 64, m, len);
+    /* NDP messages travel with hop limit 255 (a receiver checks it: they
+     * cannot have crossed a router); otherwise the socket's choice or 64 */
+    uint8_t hl = (m[0] >= 133 && m[0] <= 137) ? 255 : hops > 0 ? (uint8_t)hops : 64;
+    int r = ip6_emit_locked(dev, mac, src, dst, NH_ICMP6, hl, m, len);
     net_unlock(f);
     return r;
 }
@@ -734,6 +754,14 @@ void ipv6_input(struct net_device* dev, const uint8_t* src_mac, const uint8_t* p
     if (net6_disabled(dev->netns) || dev->ip6_disabled) { g_rx6_drop++; return; }   /* disable_ipv6 */
     uint32_t plen = (uint32_t)(p[4] << 8 | p[5]);
     if (plen + IP6_HLEN > len) { g_rx6_drop++; return; }
+    /* §M90 3b — PREROUTING on a writable copy (a DNAT rewrites the destination) */
+    static uint8_t nftbuf6[ETH_MTU];
+    int nftp = nft_active(dev->netns);
+    if (nftp && plen + IP6_HLEN <= sizeof nftbuf6) {
+        for (uint32_t i = 0; i < plen + IP6_HLEN; i++) nftbuf6[i] = p[i];
+        if (!nft_ip_hook(dev->netns, 10, NFT_HOOK_PREROUTING, dev, NULL, nftbuf6, plen + IP6_HLEN)) return;
+        p = nftbuf6;
+    }
     const uint8_t* src = p + 8;
     const uint8_t* dst = p + 24;
     /* Linux's weak host: an address of ANY device of the namespace is ours,
@@ -748,6 +776,7 @@ void ipv6_input(struct net_device* dev, const uint8_t* src_mac, const uint8_t* p
         }
     }
     g_rx6++;
+    if (nftp && !nft_ip_hook(dev->netns, 10, NFT_HOOK_INPUT, dev, NULL, (uint8_t*)p, plen + IP6_HLEN)) return;
     uint8_t nh = p[6];
     const uint8_t* l4 = p + IP6_HLEN;
     if (nh == NH_HOPBYHOP) {                             /* skip it (MLD reports carry one) */
