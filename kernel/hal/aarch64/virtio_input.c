@@ -17,15 +17,18 @@
  *                 mouse listener (mouse_set_listener), the same seam the GUI
  *                 compositor registers on (gui_mouse).
  *
- * Polling (not IRQ) keeps it simple and sidesteps per-slot GIC INTID wiring;
- * the task yields between drains so it never hogs a CPU.  DMA on QEMU is
- * cache-coherent, so no maintenance around the shared rings.
+ * §M90 rung 6 — interrupt-driven (it polled with task_yield, which on an idle
+ * CPU is a spin — see input_poll_task).  DMA on QEMU is cache-coherent, so no
+ * maintenance around the shared rings.
  * ============================================================================= */
 
 #include "keymap.h"
 #include "mouse.h"
 #include "printf.h"
 #include "task.h"
+#include "timer.h"
+#include "ktimer.h"
+#include "waitq.h"
 #include "hal_api.h"
 #include "board.h"   /* §M85 — virtio slots from the device tree */   /* kptr_phys — device addresses are PHYSICAL (§M86) */
 #include <stdint.h>
@@ -103,6 +106,7 @@ struct in_dev {
     struct virtio_input_event ev[QSIZE] __attribute__((aligned(16)));
     uint16_t last_used;
     uint16_t qsz;
+    int      slot;                  /* §M90 rung 6 — its virtio-MMIO slot (the SPI) */
 };
 
 #define MAX_INDEV 4
@@ -255,15 +259,57 @@ static void drain_device(struct in_dev* d) {
     if (r32(d->base, R_INTSTATUS) & 1) w32(d->base, R_INTACK, 1);
 }
 
-/* ---- polling task ----------------------------------------------------------
- * A dedicated scheduler task drains input events and yields between passes.
- * Polling (vs. a per-slot GIC IRQ) keeps the driver simple; the task_yield
- * lets other tasks run.  (pid 0 becomes the idle task after boot, so this task
- * is not starved.) */
+/* ---- the input task (§M90 rung 6: interrupt-driven) -------------------------
+ *
+ * It POLLED: drain, task_yield, drain again — and on a CPU with nothing else
+ * to run a yield returns at once, so the loop spun a whole core forever (ps:
+ * "input  263608 ms" after four and a half minutes of a Docker run).  Waiting
+ * must not cost what computing costs (§M49, §M55).  Now each device's SPI
+ * acknowledges the device and wakes this task, which drains and sleeps again.
+ * An interrupt SEQUENCE sampled before a drain and re-checked under the queue
+ * lock means one arriving during the drain is never lost, and a 50 ms
+ * backstop means a line that never fires costs latency, not input. */
+void gic_register_handler(uint32_t intid, void (*fn)(uint32_t));
+void gic_enable_irq(uint32_t intid);
+static struct waitq g_inwq = WAITQ_INIT;
+static volatile uint32_t g_inseq;
+
+static void in_irq(uint32_t intid) {
+    for (int i = 0; i < g_ndev; i++) {
+        struct in_dev* d = &g_dev[i];
+        if (board_virtio_intid(d->slot) != intid) continue;
+        uint32_t st = r32(d->base, R_INTSTATUS);
+        if (!st) return;                              /* not ours */
+        w32(d->base, R_INTACK, st);
+        uint32_t fl = waitq_lock(&g_inwq);
+        g_inseq++;
+        waitq_wake_all(&g_inwq);
+        waitq_unlock(&g_inwq, fl);
+        return;
+    }
+}
+static void in_backstop(struct ktimer* t) {
+    (void)t;
+    uint32_t fl = waitq_lock(&g_inwq);
+    waitq_wake_all(&g_inwq);
+    waitq_unlock(&g_inwq, fl);
+}
+static int in_pending(void) {
+    for (int i = 0; i < g_ndev; i++)
+        if (g_dev[i].last_used != *(volatile uint16_t*)&g_dev[i].used.idx) return 1;
+    return 0;
+}
 static void input_poll_task(void) {
     for (;;) {
+        uint32_t seq = g_inseq;
         for (int i = 0; i < g_ndev; i++) drain_device(&g_dev[i]);
-        task_yield();
+        struct ktimer t = { 0, 0, 0, 0, 0 };
+        ktimer_arm(&t, timer_now_ns() + 50000000ull, in_backstop, NULL);
+        uint32_t fl = waitq_lock(&g_inwq);
+        dsb();
+        if (seq == g_inseq && !in_pending()) waitq_block(&g_inwq);
+        waitq_unlock(&g_inwq, fl);
+        ktimer_cancel(&t);
     }
 }
 
@@ -317,7 +363,10 @@ int virtio_input_init(void) {
         if (*(volatile uint32_t*)(base + R_DEVICEID) != VIRTIO_DEVID_INPUT) continue;
         if (input_dev_init(&g_dev[g_ndev], base) == 0) {
             kprintf("virtio-input: device at slot %d (base %p)\n", i, (void*)base);
-            g_ndev++;
+            g_dev[g_ndev].slot = i;
+            g_ndev++;                                 /* the handler may see it now */
+            gic_register_handler(board_virtio_intid(i), in_irq);
+            gic_enable_irq(board_virtio_intid(i));
         }
     }
     if (g_ndev > 0) task_spawn("input", input_poll_task);
