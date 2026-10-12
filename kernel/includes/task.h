@@ -839,6 +839,12 @@ void task_signal_wake(struct task* t);   /* §M89 — wake a sleeper for a signa
  * currently scheduled task.  Used by procfs to render `/proc/tasks`. */
 typedef void (*task_iter_fn)(const struct task* t, int is_current, void* ctx);
 void task_for_each(task_iter_fn fn, void* ctx);
+/* §M90 — the name a forked child or a new thread starts with: the CALLER's
+ * (Linux's comm is inherited by fork and clone and changed only by exec or
+ * prctl).  They were all "forked" / "thread", so every Go daemon's threads,
+ * dockerd's children and runc's re-execs looked alike in ps, the reap log
+ * and every trace. */
+const char* task_inherited_name(void);
 /* Swap `t->mm` under the task-list lock; returns the old space, which the
  * caller destroys afterwards.  Every write of another walker-visible task's
  * `mm` goes through this (see task.c). */

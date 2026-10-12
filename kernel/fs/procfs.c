@@ -37,7 +37,8 @@
 #include "percpu.h"      /* §M90 — smp_ncpus */
 #include "cgroupfs.h"
 #include "nsproxy.h"
-#include "fd.h"      /* §M90 — fd_nth_open */    /* §M90 — /proc/self/cgroup */
+#include "fd.h"      /* §M90 — fd_nth_open */
+#include "syscall.h" /* §M90 — sys_clock_gettime_k (/proc/stat btime) */    /* §M90 — /proc/self/cgroup */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -386,7 +387,12 @@ static void gen_meminfo(struct procfs_writer* w) {
     uint32_t us  = pmm_used_frames();
     /* §M90 — Linux's own lines FIRST: programs written for Linux (dockerd, a
      * JVM sizing its heap) look for "MemTotal:" and friends by name; the
-     * system's own detail follows and is skipped by them. */
+     * system's own detail follows and is skipped by them.
+     * EVERY line is Linux's shape — "Name: <number>[ kB]", two or three
+     * fields — because parsers reject the whole file otherwise: Prometheus
+     * procfs (BuildKit's per-step sampler) indexed field 1 of
+     * "pmm.reserve.refused:0" and PANICKED, taking dockerd down mid-build,
+     * and refuses the eight-field NUMA line as malformed. */
     pw_puts(w, "MemTotal:       "); pw_put_uint(w, mgr * 4u); pw_puts(w, " kB\n");
     pw_puts(w, "MemFree:        "); pw_put_uint(w, fr * 4u);  pw_puts(w, " kB\n");
     pw_puts(w, "MemAvailable:   "); pw_put_uint(w, fr * 4u);  pw_puts(w, " kB\n");
@@ -401,7 +407,7 @@ static void gen_meminfo(struct procfs_writer* w) {
         pmm_reserve_stats(&rkb, &refused, &low);
         pw_puts(w, "pmm.reserve.kib:    "); pw_put_uint(w, rkb);     pw_putc(w, '\n');
         pw_puts(w, "pmm.reserve.low:    "); pw_put_uint(w, (unsigned)low); pw_putc(w, '\n');
-        pw_puts(w, "pmm.reserve.refused:"); pw_put_uint(w, refused); pw_putc(w, '\n');
+        pw_puts(w, "pmm.reserve.refused: "); pw_put_uint(w, refused); pw_putc(w, '\n');
     }
     {   /* §M74 rung 1 — how much of the resident user memory is IN USE */
         struct memage_stats ms;
@@ -417,11 +423,13 @@ static void gen_meminfo(struct procfs_writer* w) {
     for (int nd = 0; nd < pmm_node_count(); nd++) {
         struct pmm_node_info ni;
         pmm_node_stats(nd, &ni);
-        pw_puts(w, "pmm.node"); pw_put_uint(w, (unsigned)nd);
-        pw_puts(w, ".mib.total: "); pw_put_uint(w, (ni.managed * 4) / 1024);
-        pw_puts(w, " free: ");      pw_put_uint(w, (ni.free * 4) / 1024);
-        pw_puts(w, " local: ");     pw_put_uint(w, ni.hit);
-        pw_puts(w, " fallback: ");  pw_put_uint(w, ni.miss); pw_putc(w, '\n');
+        /* one value per line (see the format rule above) */
+        static const char* const nm[4] = { ".mib.total: ", ".mib.free: ", ".local: ", ".fallback: " };
+        unsigned v4[4] = { (ni.managed * 4) / 1024, (ni.free * 4) / 1024, ni.hit, ni.miss };
+        for (int k = 0; k < 4; k++) {
+            pw_puts(w, "pmm.node"); pw_put_uint(w, (unsigned)nd);
+            pw_puts(w, nm[k]); pw_put_uint(w, v4[k]); pw_putc(w, '\n');
+        }
     }
 
     /* Heap */
@@ -637,15 +645,74 @@ static void gen_cpuinfo(struct procfs_writer* w) {
 }
 static struct procfs_node nd_cpuinfo = { .name = "cpuinfo", .gen = gen_cpuinfo };
 
+/* §M90 — /proc/stat, the counters every resource sampler reads (BuildKit's
+ * build history samples it per step and FAILS the build when it is absent —
+ * "open /proc/stat: no such file or directory" after the image was written;
+ * top, vmstat and the Go/JVM runtimes read it too).  Units are USER_HZ
+ * (1/100 s).  What this kernel keeps: per CPU, the time it EXECUTED a
+ * non-idle task (busy minus halted, as sysmon reports it) — and that is
+ * reported as `user`; system/irq time is not kept apart, so those columns
+ * are 0 rather than a guess, and `idle` is the rest of the uptime. */
+static void ps_u64(struct procfs_writer* w, uint64_t x) {
+    char b[24]; int n = 0;
+    do { b[n++] = (char)('0' + (int)(x % 10)); x /= 10; } while (x);
+    while (n) pw_putc(w, b[--n]);
+}
+static void ps_cpu_line(struct procfs_writer* w, const char* name, uint64_t user, uint64_t idle) {
+    pw_puts(w, name);
+    pw_putc(w, ' '); ps_u64(w, user);                 /* user       */
+    pw_puts(w, " 0 0 ");                              /* nice system */
+    ps_u64(w, idle);                                  /* idle       */
+    pw_puts(w, " 0 0 0 0 0 0\n");                     /* iowait irq softirq steal guest guest_nice */
+}
+struct ps_count { unsigned all, running; };
+static void ps_count_fn(const struct task* t, int is_current, void* c) {
+    (void)is_current;
+    struct ps_count* k = (struct ps_count*)c;
+    k->all++;
+    if (t->state == TASK_RUNNABLE) k->running++;
+}
+static void gen_stat(struct procfs_writer* w) {
+    int n = smp_ncpus();
+    uint64_t up = timer_ticks_ms() / 10, tu = 0, ti = 0, ctxt = 0;
+    uint64_t u[64], id[64];
+    if (n > 64) n = 64;
+    for (int i = 0; i < n; i++) {
+        struct percpu* pc = percpu_at(i);
+        uint64_t halt = pc ? pc->halt_ns / 1000000u : 0, busy = pc ? pc->busy_ms : 0;
+        uint64_t ex = (busy > halt ? busy - halt : 0) / 10;
+        if (ex > up) ex = up;
+        u[i] = ex; id[i] = up - ex;
+        tu += u[i]; ti += id[i];
+        ctxt += pc ? pc->switches : 0;
+    }
+    ps_cpu_line(w, "cpu ", tu, ti);
+    for (int i = 0; i < n; i++) {
+        char nm[8] = "cpu"; int k = 3;
+        if (i >= 10) nm[k++] = (char)('0' + i / 10);
+        nm[k++] = (char)('0' + i % 10); nm[k] = 0;
+        ps_cpu_line(w, nm, u[i], id[i]);
+    }
+    struct ktimespec now;
+    sys_clock_gettime_k(CLOCK_REALTIME, &now);
+    struct ps_count c = { 0, 0 };
+    task_for_each(ps_count_fn, &c);
+    pw_puts(w, "intr 0\nctxt "); ps_u64(w, ctxt);
+    pw_puts(w, "\nbtime "); ps_u64(w, (uint64_t)now.sec - timer_ticks_ms() / 1000);
+    pw_puts(w, "\nprocesses "); ps_u64(w, c.all);
+    pw_puts(w, "\nprocs_running "); ps_u64(w, c.running ? c.running : 1);
+    pw_puts(w, "\nprocs_blocked 0\nsoftirq 0 0 0 0 0 0 0 0 0 0 0\n");
+}
+static struct procfs_node nd_stat = { .name = "stat", .gen = gen_stat };
+
 /* §M90 — the mount table in Linux's two shapes.  dockerd reads
  * /proc/self/mountinfo to find the parent mount of its data root (to set
  * propagation), runc and containerd read it to decide what is already
  * mounted; with no file they warn and fall back, or refuse.
  *
- * There are no mount NAMESPACES here, so "self" is the same table for every
- * process — the file lives at /proc/self/mountinfo as a plain node (procfs has
- * no per-pid directories), which is exactly what a reader opening "self" gets
- * on Linux when it has never unshared.
+ * §M90 rung 6 — it is the READER's table (its root and mount namespace,
+ * binds included: vfs_mount_view); this said "there are no mount namespaces
+ * here", true when written and not since rung 2.
  *
  * /proc and /dev are not entries in the VFS mount table — procfs and devfs
  * hang their nodes off ramfs directories (see the header).  To a Linux reader
@@ -654,34 +721,41 @@ static struct procfs_node nd_cpuinfo = { .name = "cpuinfo", .gen = gen_cpuinfo }
  * with those types.  Device numbers are synthetic (0:<id>): there is no dev_t
  * here, and nothing that reads this file compares them with stat(). */
 static void mi_line(struct procfs_writer* w, int id, int parent, const char* mp,
-                    const char* type, const char* src, int info) {
+                    const char* type, const char* src, int info, int ro) {
+    const char* opt = ro ? "ro" : "rw";
     if (info) {
         pw_put_uint(w, (uint32_t)id); pw_putc(w, ' ');
         pw_put_uint(w, (uint32_t)parent); pw_puts(w, " 0:");
         pw_put_uint(w, (uint32_t)id); pw_puts(w, " / ");
-        pw_puts(w, mp); pw_puts(w, " rw,relatime shared:"); pw_put_uint(w, (uint32_t)id);
+        pw_puts(w, mp); pw_putc(w, ' '); pw_puts(w, opt); pw_puts(w, ",relatime shared:"); pw_put_uint(w, (uint32_t)id);
         pw_puts(w, " - "); pw_puts(w, type); pw_putc(w, ' ');
-        pw_puts(w, src); pw_puts(w, " rw\n");
+        pw_puts(w, src); pw_putc(w, ' '); pw_puts(w, opt); pw_putc(w, '\n');
     } else {
         pw_puts(w, src); pw_putc(w, ' '); pw_puts(w, mp); pw_putc(w, ' ');
-        pw_puts(w, type); pw_puts(w, " rw,relatime 0 0\n");
+        pw_puts(w, type); pw_putc(w, ' '); pw_puts(w, opt); pw_puts(w, ",relatime 0 0\n");
     }
 }
+/* §M90 rung 6 — the reader's OWN table (vfs_mount_view): its root, the real
+ * mounts below it and the binds its mount namespace sees — a container lists
+ * its overlay root, its /proc, its tmpfs and devpts and its volumes, the host
+ * its own.  /proc and /dev are named for the host as before (procfs and devfs
+ * are ramfs directories there, not mounts); a container has its own binds of
+ * both. */
 static void gen_mounts_common(struct procfs_writer* w, int info) {
-    int n = vfs_mount_count();
-    int root_id = 1;
-    for (int i = 0; i < n; i++) {
-        const struct vfs_mount* m = vfs_mount_at(i);
-        if (!m) continue;
-        int id = i + 1;
-        int is_root = (m->path[0] == '/' && m->path[1] == 0);
-        if (is_root) root_id = id;
-        mi_line(w, id, is_root ? 0 : root_id, m->path,
-                m->fs_name ? m->fs_name : "none",
-                m->dev_name[0] ? m->dev_name : (m->fs_name ? m->fs_name : "none"), info);
+    char mp[128], type[24], src[24];
+    int id = 0, have_proc = 0, have_dev = 0;
+    for (int i = 0; ; i++) {
+        int ro = 0;
+        int r = vfs_mount_view(i, mp, sizeof mp, type, sizeof type, src, sizeof src, &ro);
+        if (r < 0) break;
+        if (r == 0) continue;
+        id++;
+        if (mp[0] == '/' && mp[1] == 'p' && mp[2] == 'r' && mp[3] == 'o' && mp[4] == 'c' && !mp[5]) have_proc = 1;
+        if (mp[0] == '/' && mp[1] == 'd' && mp[2] == 'e' && mp[3] == 'v' && !mp[4]) have_dev = 1;
+        mi_line(w, id, id == 1 ? 0 : 1, mp, type, src, info, ro);
     }
-    mi_line(w, n + 1, root_id, "/proc", "proc", "proc", info);
-    mi_line(w, n + 2, root_id, "/dev", "devtmpfs", "devtmpfs", info);
+    if (!have_proc) mi_line(w, ++id, 1, "/proc", "proc", "proc", info, 0);
+    if (!have_dev)  mi_line(w, ++id, 1, "/dev", "devtmpfs", "devtmpfs", info, 0);
 }
 static void gen_mountinfo(struct procfs_writer* w) { gen_mounts_common(w, 1); }
 static void gen_mounts(struct procfs_writer* w)    { gen_mounts_common(w, 0); }
@@ -792,10 +866,18 @@ static void gen_selfstat(struct procfs_writer* w) {
     v[0]  = (unsigned)st_vnr_of(rd, lead->ppid);       /* ppid      */
     v[1]  = (unsigned)st_vnr_of(rd, lead->pgid);       /* pgrp      */
     v[2]  = (unsigned)st_vnr_of(rd, lead->sid);        /* session   */
-    v[11] = lead->cpu_ms / 10;                         /* utime     */
-    v[15] = 20;                                        /* priority  */
-    v[17] = (unsigned)c.threads;                       /* threads   */
-    v[19] = lead->start_ms / 10;                       /* starttime */
+    /* v[i] is field i + 4 of proc(5) (field 1 = pid, 2 = comm, 3 = state).
+     * These four sat one slot to the right — utime in cutime, starttime in
+     * vsize — so starttime read as 0: runc's hasInit compares it with the
+     * start time it has NOT recorded yet (0) when a prestart hook asks for
+     * the state before procReady, took the init for an already-recorded one
+     * and failed "invalid state transition from stopped to created" (every
+     * BuildKit RUN step, which has the libnetwork-setkey hook). */
+    v[10] = lead->cpu_ms / 10;                         /* 14 utime     */
+    v[14] = 20;                                        /* 18 priority  */
+    v[15] = 0;                                         /* 19 nice      */
+    v[16] = (unsigned)c.threads;                       /* 20 threads   */
+    v[18] = lead->start_ms / 10 + 1;   /* 22 starttime (+1: never 0, the "unrecorded" value) */
     for (int i = 0; i < 50; i++) {
         pw_putc(w, ' ');
         unsigned long long x = v[i];
@@ -1057,6 +1139,7 @@ void procfs_init(void) {
     attach_node(&nd_uptime);
     attach_node(&nd_cap_last_cap);                 /* §M90 */
     attach_node(&nd_meminfo);
+    attach_node(&nd_stat);
     attach_node(&nd_cpuinfo);
     attach_node(&nd_mountinfo);
     attach_node(&nd_selfcgroup);

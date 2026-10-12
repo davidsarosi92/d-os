@@ -805,7 +805,7 @@ int proc_clone(uintptr_t entry, uintptr_t stack) {
     b->fdt         = fdtable_share(parent);
     if (!b->fdt) { kfree(b); return -1; }
 
-    struct task* t = task_spawn_arg_held("thread", clone_bootstrap, b);
+    struct task* t = task_spawn_arg_held(task_inherited_name(), clone_bootstrap, b);
     if (!t) {
         fdtable_put(b->fdt);
         kfree(b);

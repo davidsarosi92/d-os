@@ -24,6 +24,7 @@
 #include "waitq.h"
 #include "task.h"
 #include "cred.h"
+#include "printf.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -133,7 +134,22 @@ int usock_pair(struct usock** a, struct usock** b) {
  * Returns bytes written, or -1 if the peer has closed.  Fills + wakes under
  * the PEER's read wait-queue lock so a blocked recv(peer) sees the data and
  * cannot miss the wakeup. */
+int fifo_trace_on(void);                    /* debug.fifo_trace (fifo.c) */
+static void pipe_trace(struct usock* s, const char* what, long v) {
+    struct task* t = task_current();
+    kprintf("pipe-trace pipe:[%u] %s %ld by %d '%s'\n", s->pipe_id, what, v,
+            t ? t->pid : -1, t ? t->name : "?");
+}
 long usock_send(struct usock* s, const void* buf, size_t n, struct ofile* passfile) {
+    if (s && s->is_pipe && fifo_trace_on()) {
+        pipe_trace(s, (!s->peer || s->wr_shut || s->peer->eof) ? "write-to-closed" : "write", (long)n);
+        if (n && n <= 200) {                 /* short writes: the text itself (error messages) */
+            char t[201]; size_t i = 0;
+            for (; i < n; i++) { char ch = ((const char*)buf)[i]; t[i] = (ch >= 32 && ch < 127) ? ch : '.'; }
+            t[i] = 0;
+            kprintf("pipe-trace   \"%s\"\n", t);
+        }
+    }
     if (!s || !s->peer || s->wr_shut || s->peer->eof) return -1;
     struct usock* p = s->peer;
 
@@ -334,6 +350,7 @@ int usock_shutdown(struct usock* s, int how) {
 static void reg_remove(struct usock* s);
 void usock_close(struct usock* s) {
     if (!s) return;
+    if (s->is_pipe && fifo_trace_on()) pipe_trace(s, "close", s->count);
     if (s->path[0] || s->listening) reg_remove(s);
     for (int i = 0; i < s->acc_n; i++) usock_close(s->accq[i]);   /* never accepted */
     s->acc_n = 0;

@@ -24,6 +24,7 @@
 #include <sys/sysmacros.h>
 #include <sys/epoll.h>
 #include <pthread.h>
+#include <sched.h>
 
 static int fail(const char* what) { printf("pty: FAIL - %s (errno %d)\n", what, errno); return 1; }
 
@@ -224,8 +225,18 @@ int main(void) {
             return fail("the slave is not inode N+3, 136:N");
         close(pm);
         if (stat(sp, &sb) == 0) return fail("the slave's name outlived its master");
+        /* the mount is in the reader's own table, with its type */
+        char mt[4096]; int mf = open("/proc/mounts", O_RDONLY), mn = mf >= 0 ? (int)read(mf, mt, sizeof mt - 1) : -1;
+        if (mf >= 0) close(mf);
+        if (mn <= 0) return fail("read /proc/mounts");
+        mt[mn] = 0;
+        if (!strstr(mt, " /tmp/ptsi devpts ")) { printf("pty: /proc/mounts:\n%s", mt); return fail("/proc/mounts does not list the devpts mount"); }
         umount("/tmp/ptsi");
-        printf("pty: devpts instance - ptmx inode 2 (5:2, magic 1cd1), pts/0 inode 3 (136:0), name gone with the master\n");
+        mf = open("/proc/mounts", O_RDONLY); mn = mf >= 0 ? (int)read(mf, mt, sizeof mt - 1) : -1;
+        if (mf >= 0) close(mf);
+        mt[mn > 0 ? mn : 0] = 0;
+        if (strstr(mt, "/tmp/ptsi")) return fail("/proc/mounts still lists it after umount");
+        printf("pty: devpts instance - ptmx inode 2 (5:2, magic 1cd1), pts/0 inode 3 (136:0), name gone with the master, listed in /proc/mounts until umount\n");
     }
     /* the console is a terminal too: isatty, a size, raw mode times out */
     {
@@ -272,6 +283,125 @@ int main(void) {
         if (g_rd_ret != 4 || memcmp(g_rdbuf, "late", 4)) { printf("pty: read after close gave %d\n", g_rd_ret); return fail("a read blocked on a pipe whose fd another thread closed"); }
         if (g_ep_ret != 0 && g_ep_ret != 1) { printf("pty: epoll_wait after close gave %d\n", g_ep_ret); return fail("an epoll_wait whose set another thread closed"); }
         printf("pty: a close under a blocked read / epoll_wait - the read got its data, the wait ended (%d)\n", g_ep_ret);
+    }
+    /* /proc/self/stat read the way runc reads it (skip past the LAST ')',
+     * then field 22 = starttime): the fields after 12 sat one slot to the
+     * right, so starttime read 0 and runc took an unrecorded init for a
+     * recorded one ("invalid state transition from stopped to created"). */
+    {
+        char sb[1024]; int fd = open("/proc/self/stat", O_RDONLY);
+        int n = fd >= 0 ? (int)read(fd, sb, sizeof sb - 1) : -1;
+        if (fd >= 0) close(fd);
+        if (n <= 0) return fail("read /proc/self/stat");
+        sb[n] = 0;
+        char* p = strrchr(sb, ')');
+        if (!p) return fail("/proc/self/stat has no comm");
+        p += 2;                                          /* field 3, the state */
+        char st = *p;
+        for (int f = 3; f < 22 && p; f++) { p = strchr(p, ' '); if (p) p++; }
+        unsigned long long start = p ? strtoull(p, NULL, 10) : 0;
+        p = strrchr(sb, ')') + 2;
+        for (int f = 3; f < 20 && p; f++) { p = strchr(p, ' '); if (p) p++; }
+        long thr = p ? strtol(p, NULL, 10) : 0;
+        if (st != 'R' && st != 'S') return fail("/proc/self/stat field 3 is not the state");
+        if (start == 0) return fail("/proc/self/stat field 22 (starttime) is 0");
+        if (thr < 1) return fail("/proc/self/stat field 20 (num_threads) is not >= 1");
+        printf("pty: /proc/self/stat field 3 = %c, 20 = %ld threads, 22 = starttime %llu\n", st, thr, start);
+    }
+    /* A bind made in ANOTHER mount namespace does not pin the name in this
+     * one (Linux's is_local_mountpoint): BuildKit removes the resolv.conf
+     * stub runc bound over inside the build container, and got EBUSY.  A
+     * bind made in our own namespace still does (the control). */
+    {
+        mkdir("/tmp", 0755);
+        int fs = open("/tmp/bsrc", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        int ft = open("/tmp/btgt", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (fs < 0 || ft < 0) return fail("create /tmp/bsrc /tmp/btgt");
+        write(fs, "src\n", 4); write(ft, "tgt\n", 4); close(fs); close(ft);
+        int up[2], down[2];
+        if (pipe(up) || pipe(down)) return fail("pipe");
+        pid_t ch = fork();
+        if (ch == 0) {
+            char c = 'x';
+            if (unshare(CLONE_NEWNS) == 0 && mount("/tmp/bsrc", "/tmp/btgt", NULL, MS_BIND, NULL) == 0) {
+                char b[8] = {0}; int fd = open("/tmp/btgt", O_RDONLY);
+                if (fd >= 0 && read(fd, b, 4) == 4 && b[0] == 's') c = 'b';
+                if (fd >= 0) close(fd);
+            }
+            write(up[1], &c, 1);
+            read(down[0], &c, 1);                        /* hold the namespace */
+            _exit(0);
+        }
+        char c = 0;
+        read(up[0], &c, 1);
+        if (c != 'b') { write(down[1], "x", 1); return fail("bind inside an unshared mount namespace"); }
+        int r = unlink("/tmp/btgt");
+        int e = errno;
+        write(down[1], "x", 1);
+        waitpid(ch, NULL, 0);
+        if (r != 0) { errno = e; return fail("unlink of a name bound only in ANOTHER namespace"); }
+        ft = open("/tmp/btgt", O_CREAT | O_WRONLY, 0644); if (ft >= 0) close(ft);
+        if (mount("/tmp/bsrc", "/tmp/btgt", NULL, MS_BIND, NULL) != 0) return fail("bind in our own namespace");
+        r = unlink("/tmp/btgt"); e = errno;
+        umount("/tmp/btgt");
+        unlink("/tmp/btgt"); unlink("/tmp/bsrc");
+        if (r == 0 || e != EBUSY) { printf("pty: own-namespace unlink gave %d errno %d\n", r, e); return fail("unlink of a name bound in OUR namespace must be EBUSY"); }
+        printf("pty: a bind in another mount namespace does not pin the name; one in ours is EBUSY\n");
+    }
+    /* runc 1.5 (pathrs) reads /proc/<pid>/stat by opening it O_PATH and
+     * re-opening it through /proc/thread-self/fd/N.  The re-open must stay on
+     * THAT process: it answered for the caller, so runc compared its own
+     * start time and called every created container "stopped". */
+    {
+        int sp[2];
+        if (pipe(sp)) return fail("pipe");
+        pid_t ch = fork();
+        if (ch == 0) { char c; read(sp[0], &c, 1); _exit(0); }
+        char path[64], via[64], sb[512];
+        snprintf(path, sizeof path, "/proc/%d/stat", (int)ch);
+        int h = open(path, O_PATH | O_CLOEXEC);
+        int ok = 0, got = -1;
+        if (h >= 0) {
+            snprintf(via, sizeof via, "/proc/thread-self/fd/%d", h);
+            int fd = open(via, O_RDONLY | O_CLOEXEC);
+            if (fd >= 0) {
+                int n = (int)read(fd, sb, sizeof sb - 1);
+                if (n > 0) { sb[n] = 0; got = atoi(sb); ok = got == (int)ch; }
+                close(fd);
+            }
+            close(h);
+        }
+        write(sp[1], "x", 1);
+        waitpid(ch, NULL, 0);
+        if (!ok) { printf("pty: re-opened /proc/%d/stat answered for pid %d\n", (int)ch, got); return fail("/proc/<pid>/stat re-opened through /proc/thread-self/fd"); }
+        printf("pty: /proc/<pid>/stat re-opened through its O_PATH handle stays on pid %d\n", got);
+    }
+    /* /proc/meminfo the way Prometheus procfs parses it (BuildKit samples it
+     * per build step): every line "Name: <number>[ kB]" — one stray line
+     * PANICKED dockerd mid-build.  And /proc/stat exists with a "cpu" line. */
+    {
+        FILE* f = fopen("/proc/meminfo", "r");
+        if (!f) return fail("open /proc/meminfo");
+        char line[256]; int lines = 0;
+        while (fgets(line, sizeof line, f)) {
+            char a[96], b[96], c[96], d[96];
+            int n = sscanf(line, "%95s %95s %95s %95s", a, b, c, d);
+            int num = n >= 2 && b[0];
+            for (char* q = b; num && *q; q++) if (*q < '0' || *q > '9') num = 0;
+            if (n < 2 || n > 3 || !num || (n == 3 && strcmp(c, "kB")) || a[strlen(a) - 1] != ':') {
+                fclose(f);
+                printf("pty: /proc/meminfo line not Linux-shaped: %s", line);
+                return fail("/proc/meminfo format");
+            }
+            lines++;
+        }
+        fclose(f);
+        f = fopen("/proc/stat", "r");
+        unsigned long long u = 0, ni = 0, sy = 0, id = 0;
+        int ok = f && fscanf(f, "cpu %llu %llu %llu %llu", &u, &ni, &sy, &id) == 4;
+        if (f) fclose(f);
+        if (!ok) return fail("/proc/stat has no \"cpu\" line");
+        printf("pty: /proc/meminfo %d Linux-shaped lines; /proc/stat cpu %llu user %llu idle\n", lines, u, id);
     }
     printf("pty: PASS\n");
     return 0;

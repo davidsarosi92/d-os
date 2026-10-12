@@ -1,6 +1,6 @@
-# RESUME HERE (updated 2026-10-11)
+# RESUME HERE (updated 2026-10-12)
 
-**§M90 Docker, ~80 %.**  `docker run --network host busybox:musl echo hi`
+**§M90 Docker, ~90 %.**  `docker run --network host busybox:musl echo hi`
 prints `hi` on aarch64 (rungs 1-2 done); cgroup limits and inotify done (rung 3); overlayfs + Docker's overlay2 done (rung 4); container networking done (rung 5: bridge, NAT, `-p`).  Next, in order — details and the
 test recipe in PLAN.md §M90 "RESUME HERE":
 
@@ -9,7 +9,7 @@ test recipe in PLAN.md §M90 "RESUME HERE":
 3. ~~networking (net namespace, veth, bridge, NAT, `-p`)~~ — DONE 2026-10-10; its gaps closed the same day (ICMP ping/raw sockets, AF_PACKET, sockets keep their namespace, ARP hold queue, FDB ageing, connections reset when their device goes)
 3a. ~~IPv6~~ — DONE 2026-10-10 (addresses, NDP, ICMPv6, routes, forwarding, TCP/UDP, AF_INET6 sockets, rtnetlink v6, per-interface conf/; `docker --ipv6` gives a container a v6 address)
 3b. ~~netfilter~~ — DONE 2026-10-11 (nf_tables over netlink, conntrack + NAT, br_netfilter, the real `nft`; Docker's nftables firewall backend — `nfttest`, `brnftest`)
-4. `docker run -it` (pty), `docker build`, volumes
+4. ~~`docker run -it` (pty), `docker build`, volumes~~ — DONE 2026-10-12 (ptys, devpts, the console as a terminal; legacy + BuildKit builds via the real docker-buildx; bind/named/tmpfs volumes; seven defects fixed — DOCS change log)
 5. x86_64 after the higher-half kernel move
 
 **After §M90: §M93** — installing downloaded software: the user downloads the

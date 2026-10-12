@@ -878,6 +878,11 @@ static void task_notify_change(void) {
  * M22.7 — `arg` is stashed in t->start_arg BEFORE the task is enqueued
  * (so it is visible even if another CPU picks the task up immediately),
  * readable by the entry via task_start_arg(). */
+const char* task_inherited_name(void) {
+    struct task* me = task_current();
+    return me && me->name[0] ? me->name : "thread";
+}
+
 static struct task* spawn_common_ex(const char* name, void (*entry)(void),
                                     int ppid_override, void* arg, void* console,
                                     int hold);

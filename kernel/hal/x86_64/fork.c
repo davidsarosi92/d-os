@@ -81,7 +81,7 @@ int proc_fork(struct user_regs* parent_regs) {
     b->regs.rax    = 0;                      /* child: fork() returns 0         */
     fd_snapshot_for_fork(parent, b->fds, b->cloexec);   /* §M90 — under the table lock */
 
-    struct task* child = task_spawn_arg_held("forked", fork_child_bootstrap, b);
+    struct task* child = task_spawn_arg_held(task_inherited_name(), fork_child_bootstrap, b);
     if (!child) {
         for (int i = 0; i < TASK_MAX_FDS; i++)
             if (b->fds[i]) ofile_unref(b->fds[i]);
@@ -178,7 +178,7 @@ int proc_clone_thread(struct user_regs* parent_regs, uintptr_t child_stack,
     b->fdt     = fdtable_share(parent);   /* §M89 — CLONE_FILES: one table */
     if (!b->fdt) { kfree(b); return -1; }
 
-    struct task* child = task_spawn_arg_held("thread", clone_thread_bootstrap, b);
+    struct task* child = task_spawn_arg_held(task_inherited_name(), clone_thread_bootstrap, b);
     if (!child) {
         fdtable_put(b->fdt);
         kfree(b);

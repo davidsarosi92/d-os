@@ -232,7 +232,7 @@ fixed first, whatever it touches.
 | queued UI | ✅ done (§4.116) — Memory page, System information, translations 73 → 0 | — |
 | §M88 | ✅ (§4.118) | open: a taskbar per monitor |
 | §M89 | ◐ → core ✅ | Java: `java Hello.java` from the unmodified JDK on x86_64 + aarch64 (DOCS §4.119); open: `app install` end to end, host-side delivery, rung 5 measurements |
-| §M90 | ◐ ~80 % (2026-10-10) | Docker itself on d-os (dockerd + containerd + runc + the CLI), no Docker Desktop — rungs 1-2 ✅ (`docker run … echo hi` prints `hi`, aarch64); cgroup limits + inotify ✅ (OOMKilled true/137); overlayfs + overlay2 ✅ (run/diff/commit); networking ✅ (default bridge, NAT, `-p`); next: `-it`/build/volumes, x86_64 — resume order in §M90 |
+| §M90 | ◐ ~90 % (2026-10-12) | Docker itself on d-os (dockerd + containerd + runc + the CLI), no Docker Desktop — rungs 1-2 ✅ (`docker run … echo hi` prints `hi`, aarch64); cgroup limits + inotify ✅ (OOMKilled true/137); overlayfs + overlay2 ✅ (run/diff/commit); networking ✅ (default bridge, NAT, `-p`); IPv6 + netfilter ✅; `-it`/build/volumes ✅; next: x86_64 — resume order in §M90 |
 | §M91 | — | the ABI as its own project: d-os, Linux and NT personalities over one common language (ReactOS's pattern) — designed, not started |
 | §M92 | — | a driver engine for d-os, Linux and Windows drivers — an OPEN QUESTION, recorded, not decided |
 | §M93 | — | installing software as a user: DOWNLOAD from the vendor (`wget`) → `app install` → run, no OCI image required — the guide plus the `.tar.gz` install, glibc decision, manifest, service registration; **next after §M90**, before §M91/§M92 |
@@ -6197,7 +6197,12 @@ fixed-address Go binaries load at 0x200000, inside the low identity map):**
      chains, not a prologue — each defect is falsified in the tests.  Open:
      reject's RST/ICMP, ICMP-error inner headers, conntrack helpers, flowtables
      and stateful objects (refused by name).
-  4. Rung 6: `docker run -it` (pty/devpts), `docker build`, volumes.
+  4. ~~Rung 6: `docker run -it` (pty/devpts), `docker build`, volumes.~~  DONE
+     2026-10-12 (DOCS change log): ptys + devpts instances + the controlling
+     terminal, the console as a VT100 terminal, legacy and BuildKit builds
+     (real docker-buildx), bind/named/tmpfs volumes.  Open: pidfd, clone3,
+     openat2, open_tree, seccomp (ENOSYS, callers fall back); the BuildKit
+     "session healthcheck failed fatally" log line, not yet explained.
   5. x86_64: waits for the higher-half kernel move.
   Open beside it: NEXT.md #14 (rare pthread_join hang) and #16 (a non-leader
   thread's execve keeps its pid); `noexec` accepted, not enforced.

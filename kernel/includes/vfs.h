@@ -549,6 +549,11 @@ int  vfs_mount_count(void);
 const struct vfs_mount* vfs_mount_at(int i);
 /* Longest-prefix match: /mnt/foo answers with the exFAT mount, not the root. */
 const struct vfs_mount* vfs_mount_for(const char* path);
+/* §M90 rung 6 — entry `i` of the mount table AS THE CALLER SEES IT (its root,
+ * its mount namespace, binds included): 1 = an entry, 0 = not visible, -1 =
+ * past the end.  Index 0 is "/". */
+int vfs_mount_view(int i, char* mp, size_t mcap, char* type, size_t tcap,
+                   char* src, size_t scap, int* ro);
 
 /* Does the filesystem holding `path` actually STORE ownership, or are the bits
  * above only true until the power goes off?  1 / 0, or -1 when the path is on

@@ -103,7 +103,7 @@ int proc_fork(struct user_regs* parent_regs) {
     __asm__ volatile ("mrs %0, tpidr_el0" : "=r"(b->tpidr));
     fd_snapshot_for_fork(parent, b->fds, b->cloexec);   /* §M90 — under the table lock */
 
-    struct task* child = task_spawn_arg_held("forked", fork_child_bootstrap, b);
+    struct task* child = task_spawn_arg_held(task_inherited_name(), fork_child_bootstrap, b);
     if (!child) {
         for (int i = 0; i < TASK_MAX_FDS; i++)
             if (b->fds[i]) ofile_unref(b->fds[i]);
@@ -187,7 +187,7 @@ int proc_clone_thread(struct user_regs* parent_regs, uintptr_t child_stack,
     b->fdt = fdtable_share(parent);
     if (!b->fdt) { kfree(b); return -1; }
 
-    struct task* child = task_spawn_arg_held("thread", thread_child_bootstrap, b);
+    struct task* child = task_spawn_arg_held(task_inherited_name(), thread_child_bootstrap, b);
     if (!child) { fdtable_put(b->fdt); kfree(b); return -1; }
     child->mm_shared = 1;                   /* set early: it may run at once */
     child->linux_abi = parent->linux_abi;

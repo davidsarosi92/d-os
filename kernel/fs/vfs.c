@@ -1080,7 +1080,14 @@ static struct file* vfs_open_unlocked(const char* path, int flags) {
     f->magic  = VFS_FILE_MAGIC;
     /* §M90 — /proc/<pid>: the directory is /proc/self answering for that
      * process; the file keeps the NUMBERED path, so *at calls relative to it
-     * (runc reads "stat" through a /proc/<pid> handle) name the same process. */
+     * (runc reads "stat" through a /proc/<pid> handle) name the same process.
+     * So does every file UNDER it (/proc/<pid>/stat): runc 1.5's pathrs opens
+     * it O_PATH and re-opens it through /proc/thread-self/fd/N, and that
+     * re-open resolves the file's path — "/proc/self/stat" after the alias,
+     * i.e. the CALLER's stat.  runc create then recorded its own start time
+     * as the init's and runc start, a different process, compared its own:
+     * "cannot start a container that has stopped" for every `docker run`
+     * (hidden while field 22 read 0 for everyone). */
     {
         char pb[256];
         const char* pc = vfs_canon_plain(path, pb, sizeof pb);
@@ -1090,7 +1097,15 @@ static struct file* vfs_open_unlocked(const char* path, int flags) {
         if (pc && !pp[q] && pc[q] >= '0' && pc[q] <= '9') {
             size_t r = q;
             while (pc[r] >= '0' && pc[r] <= '9') r++;
-            if (!pc[r]) {
+            /* not the magic links under it (fd/N, exe, cwd, root): those
+             * opened ANOTHER file, whose own path is the right one */
+            const char* rest = pc[r] == '/' ? pc + r + 1 : "";
+            int magic = (rest[0] == 'f' && rest[1] == 'd' && rest[2] == '/') ||
+                        (rest[0] == 'e' && rest[1] == 'x' && rest[2] == 'e' && !rest[3]) ||
+                        (rest[0] == 'c' && rest[1] == 'w' && rest[2] == 'd' && !rest[3]) ||
+                        (rest[0] == 'r' && rest[1] == 'o' && rest[2] == 'o' && rest[3] == 't');
+            if (!pc[r] || (pc[r] == '/' && !magic)) {
+                while (pc[r]) r++;
                 f->vpath = (char*)kmalloc(r + 1);
                 if (f->vpath) for (size_t i = 0; i <= r; i++) f->vpath[i] = pc[i];
                 crossed = 0;
@@ -1581,7 +1596,16 @@ static int unlink_core(struct dentry* parent, const char* last, int check) {
     struct dentry*  d    = parent->children;
     while (d && !streq(d->name, last)) { link = &d->sibling; d = d->sibling; }
     if (!d || !d->inode) return -1;
-    if (d->bound) return -6;          /* §M90 — a bind's target: busy (EBUSY) */
+    /* §M90 — a bind's target is busy (EBUSY) only where the bind is SEEN:
+     * Linux's is_local_mountpoint.  A bind made in another mount namespace —
+     * typically a container's, alive or long gone — does not pin the host's
+     * name: the unlink succeeds and the bind goes with the dentry
+     * (binds_forget below; Linux detaches such mounts the same way).  It
+     * refused unconditionally, so BuildKit could never remove the
+     * /etc/resolv.conf and /etc/hosts stubs runc had bound over inside the
+     * build container ("Failed to remove mount stub … device or resource
+     * busy" after every RUN step). */
+    if (d->bound && bind_visible(d)) return -6;
     if (d->inode->type == INODE_DIR && d->children &&
         !(d->inode->vflags & VFS_IF_OWN_CHILDREN)) return -2;   /* not empty */
     if (d->inode->type == INODE_DEVICE) return -1;               /* devfs nodes */
@@ -2501,6 +2525,93 @@ int vfs_anon_fs(const char* kind, char* out, size_t cap) {
         kind = out + 9;                              /* (unreachable in practice) */
     }
     return -1;
+}
+
+/* §M90 rung 6 — the MOUNT TABLE AS THE CALLER SEES IT, for /proc/mounts and
+ * /proc/self/mountinfo.  The table those files printed was the VFS's list of
+ * real filesystems plus /proc and /dev — and no binds, while every tmpfs,
+ * devpts, mqueue and overlay mount here IS a bind of an anonymous directory,
+ * and so is every Docker volume.  Inside a container that meant the host's
+ * table: `--tmpfs /scratch` worked and /proc/mounts did not list it.
+ *
+ * Entry 0 is "/" (the caller's root); then the real mounts below that root;
+ * then the binds visible in the caller's mount namespace whose MOUNT POINT is
+ * below its root — the SOURCE may well be outside it (that is what a volume
+ * is), so it is classified by its GLOBAL path and never printed as a path.
+ * Returns 1 for an entry, 0 for an index that is not the caller's to see,
+ * -1 past the end. */
+static void mv_put(char* d, size_t cap, const char* s) {
+    size_t i = 0;
+    for (; s && s[i] && i + 1 < cap; i++) d[i] = s[i];
+    d[i] = 0;
+}
+static int mv_under(const char* g, const char* p) {
+    size_t n = 0;
+    while (p[n]) { if (g[n] != p[n]) return 0; n++; }
+    return g[n] == 0 || g[n] == '/';
+}
+static void mv_classify(const char* g, char* type, size_t tc, char* src, size_t sc) {
+    if (mv_under(g, "/.mounts")) {                   /* vfs_anon_fs: /.mounts/<kind>-N */
+        char k[24]; size_t n = 0;
+        const char* q = g + 9;
+        while (q[n] && q[n] != '-' && q[n] != '/' && n + 1 < sizeof k) { k[n] = q[n]; n++; }
+        k[n] = 0;
+        mv_put(type, tc, k); mv_put(src, sc, k);
+        return;
+    }
+    if (mv_under(g, "/proc"))          { mv_put(type, tc, "proc");     mv_put(src, sc, "proc");     return; }
+    if (mv_under(g, "/sys/fs/cgroup")) { mv_put(type, tc, "cgroup2");  mv_put(src, sc, "cgroup2");  return; }
+    if (mv_under(g, "/sys"))           { mv_put(type, tc, "sysfs");    mv_put(src, sc, "sysfs");    return; }
+    if (mv_under(g, "/dev/pts"))       { mv_put(type, tc, "devpts");   mv_put(src, sc, "devpts");   return; }
+    if (mv_under(g, "/dev"))           { mv_put(type, tc, "devtmpfs"); mv_put(src, sc, "devtmpfs"); return; }
+    const struct vfs_mount* m = NULL;
+    int best = -1;
+    for (int i = 0; i < g_nmounts; i++) {
+        const char* mp = g_mounts[i].path;
+        int n = 0; while (mp[n]) n++;
+        int root_mp = mp[0] == '/' && mp[1] == 0;
+        if ((root_mp || mv_under(g[0] ? g : "/", mp)) && n > best) { best = n; m = &g_mounts[i]; }
+    }
+    const char* t = m && m->fs_name ? m->fs_name : "ramfs";
+    mv_put(type, tc, t);
+    mv_put(src, sc, m && m->dev_name[0] ? m->dev_name : t);
+}
+int vfs_mount_view(int i, char* mp, size_t mcap, char* type, size_t tcap,
+                   char* src, size_t scap, int* ro) {
+    if (ro) *ro = 0;
+    if (i < 0) return -1;
+    kmutex_lock(&ns_lock);
+    struct dentry* top = cred_fs_root();
+    if (!top) top = root;
+    char g[256];
+    int r = -1;
+    if (i == 0) {                                    /* "/" */
+        if (dentry_path_from(top, root, g, sizeof g) != 0) g[0] = 0;
+        mv_classify(g, type, tcap, src, scap);
+        mv_put(mp, mcap, "/");
+        r = 1;
+    } else if (i <= g_nmounts) {                     /* a real mount below the root */
+        const struct vfs_mount* m = &g_mounts[i - 1];
+        r = 0;
+        if (m->mp && !(m->path[0] == '/' && m->path[1] == 0) &&
+            dentry_path_from(m->mp, top, mp, mcap) == 0 && mp[0]) {
+            mv_put(type, tcap, m->fs_name ? m->fs_name : "none");
+            mv_put(src, scap, m->dev_name[0] ? m->dev_name : (m->fs_name ? m->fs_name : "none"));
+            r = 1;
+        }
+    } else if (i <= g_nmounts + g_nbinds) {          /* a bind visible here */
+        int b = i - 1 - g_nmounts;
+        r = 0;
+        struct dentry* T = g_binds[b].tgt;
+        if (T && T->bound && bind_visible(T) && dentry_path_from(T, top, mp, mcap) == 0 && mp[0] &&
+            g_binds[b].src && dentry_path_from(g_binds[b].src, root, g, sizeof g) == 0) {
+            mv_classify(g, type, tcap, src, scap);
+            if (ro) *ro = T->ro ? 1 : 0;
+            r = 1;
+        }
+    }
+    kmutex_unlock(&ns_lock);
+    return r;
 }
 
 int vfs_bind_count(void) { return g_nbinds; }

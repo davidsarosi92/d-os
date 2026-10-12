@@ -56,6 +56,8 @@
 #include "lock.h"
 #include "task.h"
 #include "syscall.h"
+#include "config.h"
+#include "printf.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -74,6 +76,23 @@ struct fifo {
 
 static spinlock_t g_fifo_lock = SPINLOCK_INIT;
 
+/* `debug.fifo_trace` = 1: every open, close, EOF and write of a named pipe,
+ * with the task and the pipe's reader/writer counts after it — for the
+ * question "which end is still open" when a reader never sees its EOF
+ * (Docker's attach copy, which gives up two seconds after the exit). */
+static int g_ftrace;
+int fifo_trace_on(void) { return g_ftrace; }   /* usock.c traces pipes under the same key */
+static void ftrace_changed(const char* key, const char* value) {
+    (void)key;
+    g_ftrace = value && value[0] == '1';
+}
+CONFIG_WATCH(cw_fifo_trace) = { .prefix = "debug.fifo_trace", .changed = ftrace_changed };
+static void ftrace(struct fifo* p, const char* what, long v) {
+    struct task* t = task_current();
+    kprintf("fifo-trace %p %s %ld by %d '%s' (r %d w %d n %u)\n", (void*)p, what, v,
+            t ? t->pid : -1, t ? t->name : "?", p->readers, p->writers, (unsigned)p->count);
+}
+
 static void fifo_changed(struct fifo* p) {
     /* Called with p->wq held: wake every parked reader, writer and opener —
      * each re-checks its own condition — and tell poll/epoll waiters.  The
@@ -88,6 +107,7 @@ static void fifo_put(struct fifo* p, unsigned role) {
     if (role & FIFO_R) p->readers--;
     if (role & FIFO_W) p->writers--;
     fifo_changed(p);
+    if (g_ftrace) ftrace(p, "close", (long)role);
     waitq_unlock(&p->wq, f);
     fd_readiness_changed(NULL);
 
@@ -154,6 +174,7 @@ int fifo_attach(struct ofile* o, unsigned role, int nonblock) {
         while (p->readers == 0 && p->r_gen == r_seen && !(killed = task_should_stop()))
             waitq_block(&p->wq);
     }
+    if (g_ftrace) ftrace(p, nonblock ? "open-nb" : "open", (long)role);
     o->fifo_role  = role;
     o->fifo_wseen = (role == FIFO_R && nonblock) ? w_seen : w_seen - 1;
     waitq_unlock(&p->wq, f);
@@ -191,7 +212,10 @@ long fifo_read(struct ofile* o, void* buf, size_t n, int block) {
             fd_readiness_changed(NULL);
             return (long)k;
         }
-        if (p->writers == 0) { waitq_unlock(&p->wq, f); return 0; }   /* EOF */
+        if (p->writers == 0) {                                          /* EOF */
+            if (g_ftrace) ftrace(p, "eof", 0);
+            waitq_unlock(&p->wq, f); return 0;
+        }
         if (!block)          { waitq_unlock(&p->wq, f); return -11; } /* EAGAIN */
         if (task_should_stop()) { waitq_unlock(&p->wq, f); return -4; }
         waitq_block(&p->wq);
@@ -228,6 +252,7 @@ long fifo_write(struct ofile* o, const void* buf, size_t n, int block) {
         if (task_should_stop()) { waitq_unlock(&p->wq, f); return done ? (long)done : -4; }
         waitq_block(&p->wq);
     }
+    if (g_ftrace) ftrace(p, "wrote", (long)done);
     waitq_unlock(&p->wq, f);
     fd_readiness_changed(NULL);
     return (long)done;
