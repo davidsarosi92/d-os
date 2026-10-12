@@ -89,6 +89,8 @@ extern const unsigned char _binary_user_sock6musl_muslelf_start[] __attribute__(
 extern const unsigned char _binary_user_sock6musl_muslelf_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_killmusl_muslelf_start[] __attribute__((weak));
 extern const unsigned char _binary_user_killmusl_muslelf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_ptymusl_muslelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_ptymusl_muslelf_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_nftmusl_muslelf_start[] __attribute__((weak));
 extern const unsigned char _binary_user_nftmusl_muslelf_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_epollmusl_muslelf_start[] __attribute__((weak));
@@ -997,6 +999,22 @@ static void cmd_nfttest(const char* args) {
             rc, ev, dr, cn, nb, live);
 }
 
+/* §M90 rung 6 — `ptytest`: terminals from a musl program (user/ptymusl.c):
+ * ptmx/unlockpt/ptsname, the line discipline, raw mode, VTIME, window size,
+ * the controlling terminal and its signals, hangup both ways, kill(-pgid). */
+static void cmd_ptytest(const char* args) {
+    (void)args;
+    const unsigned char* a = _binary_user_ptymusl_muslelf_start;
+    const unsigned char* b = _binary_user_ptymusl_muslelf_end;
+    if (!a || !b) { console_write("ptytest: not embedded for this arch\n"); return; }
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf(a, (unsigned long)(b - a));
+    if (me) me->linux_abi = prev;
+    kprintf("ptytest: returned rc=%d\n", rc);
+}
+
 static void cmd_musltest(void) {
     if (!_binary_user_muslhello_muslelf_start) {
         console_write("musltest: not embedded — run `make musl` then rebuild\n");
@@ -1242,6 +1260,7 @@ TEST(epollmusltest, t_epollmusltest, "", "epoll through unmodified musl");
 static void t_nxtest(const char* a) { cmd_nxtest(a); }
 TEST(nxtest, t_nxtest, "[excursion]", "no-execute: data and stack pages must not run");
 TEST(killtest, cmd_killtest, "", "kill permission: same uid or CAP_KILL, not the process tree (§M90)");
+TEST(ptytest, cmd_ptytest, "", "terminals: ptys, line discipline, controlling tty, job-control signals (§M90 rung 6)");
 TEST(nfttest, cmd_nfttest, "", "nf_tables: filter, DNAT + un-DNAT, ct state, batch rollback (§M90 3b)");
 TEST(sock6test, cmd_sock6test, "", "AF_INET6 sockets: dual-stack, v4-mapped, V6ONLY, UDP (§M90 3a)");
 TEST(cpuidtest, cmd_cpuidtest, "", "uname, /proc/self/auxv, emulated arm64 ID registers from a musl program (§M90)");

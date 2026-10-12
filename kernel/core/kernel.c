@@ -58,6 +58,7 @@
 #include "driver.h"
 #include "vfs.h"
 #include "devfs.h"
+#include "tty.h"
 #include "clipboard.h"
 #include "random.h"
 #include "procfs.h"
@@ -142,6 +143,7 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
      * (ramfs created /dev) and after module/driver init (so all
      * registrations are queued). */
     devfs_init();
+    tty_init();                  /* §M90 rung 6 — /dev/tty, /dev/ptmx, /dev/pts */
     /* §M59 — the clipboard as a file: `cat x > /dev/clipboard` works, and ring 3
      * reaches it without waiting for a syscall to be defined for it. */
     clipboard_devfs_init();

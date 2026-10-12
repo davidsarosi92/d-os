@@ -31,7 +31,8 @@ enum fd_kind { FD_VFS, FD_SHM, FD_SOCK, FD_NETSOCK, FD_TIMER, FD_EPOLL, FD_CONSO
                FD_NETLINK /* §M90 */, FD_FIFO /* §M90 — a named pipe end, fifo.c */,
                FD_BPF /* §M90 — an eBPF program, bpf.c */,
                FD_INOTIFY /* §M90 — an inotify instance, inotify.c */,
-               FD_PACKET /* §M90 — an AF_PACKET socket, packet.c */ };
+               FD_PACKET /* §M90 — an AF_PACKET socket, packet.c */,
+               FD_PTY /* §M90 rung 6 — a terminal end: pty master or slave, tty.c */ };
 
 struct netsock;                 /* network (AF_INET) socket — usyscall.c        */
 struct timerfd;                 /* §M53 stage 3 — a deadline behind a descriptor */
@@ -80,6 +81,12 @@ struct ofile {
     struct inotify*  ino;
     /* §M90 — APPENDED.  FD_PACKET: the link-layer socket (packet.c), owned. */
     struct pktsock*  pkt;
+    /* §M90 rung 6 — APPENDED.  FD_PTY: the terminal (tty.c) and which end
+     * this description is (TTY_MASTER / TTY_SLAVE).  `file` stays the VFS
+     * open of the node it came through (/dev/ptmx, /dev/pts/N, /dev/tty), so
+     * fstat and the cgroup device check see the device, as for any node. */
+    struct tty*      tty;
+    int              tty_side;
 };
 struct ofile* ofile_from_bpf(struct bpf_prog* p);   /* §M90 — takes a reference */
 struct inotify;

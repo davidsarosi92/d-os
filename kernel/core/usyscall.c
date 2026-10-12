@@ -35,7 +35,8 @@
 
 #include "version.h"
 #include "packet.h"
-#include "fsnotify.h"   /* §M90 — FD_INOTIFY */
+#include "fsnotify.h"
+#include "tty.h"       /* §M90 rung 6 — FD_PTY */   /* §M90 — FD_INOTIFY */
 #include "syscall.h"
 #include "task.h"
 #include "vfs.h"
@@ -371,6 +372,7 @@ long sys_write_k(int fd, const void* buf, size_t n) {
     if (o->kind == FD_NETLINK) return nl_send(o->nl, buf, n);                      /* §M90 */
     if (o->kind == FD_PACKET) return packet_send(o->pkt, buf, n, 0, NULL, 0);      /* §M90 */
     if (o->kind == FD_FIFO) return fifo_write(o, buf, n, !o->nonblock);            /* §M90 */
+    if (o->kind == FD_PTY) return tty_write(o, buf, n, !o->nonblock);              /* §M90 rung 6 */
     if (o->kind == FD_SHM && o->shm) {             /* §M90 — a memfd is written like a file */
         long w = shm_write(o->shm, o->shm_pos, buf, n);
         if (w > 0) o->shm_pos += (uint64_t)w;
@@ -464,6 +466,7 @@ long sys_read_k(int fd, void* buf, size_t n) {
     if (o->kind == FD_NETLINK) return nl_recv(o->nl, buf, n, block, 0, 0); /* §M90 */
     if (o->kind == FD_PACKET) return packet_recv(o->pkt, buf, n, block, NULL); /* §M90 */
     if (o->kind == FD_FIFO) return fifo_read(o, buf, n, block);           /* §M90 */
+    if (o->kind == FD_PTY) return tty_read(o, buf, n, block);             /* §M90 rung 6 */
     if (o->kind == FD_INOTIFY) return inotify_read(o->ino, buf, n, block); /* §M90 */
     if (o->kind == FD_SHM && o->shm) {             /* §M90 — and read like one */
         size_t r = shm_read(o->shm, o->shm_pos, buf, n);
@@ -568,7 +571,8 @@ long sys_open_ex_k(const char* kpath, int flags, int nonblock, int opath) {
         }
     }
     int oerr = -2;
-    struct file* f = vfs_open_ex(kpath, (flags ? flags : VFS_RDONLY) & (opath ? ~0 : ~VFS_NOFOLLOW), &oerr);
+    struct file* f = vfs_open_ex(kpath, ((flags & ~VFS_NOCTTY) ? (flags & ~VFS_NOCTTY) : VFS_RDONLY) &
+                                        (opath ? ~0 : ~VFS_NOFOLLOW), &oerr);
     if (!f) return oerr;                                  /* -2, or -30 EROFS */
     /* §M90 — a DEVICE opened by a Linux process: its cgroup's device programs
      * (bpf.c, runc's allow-list) decide.  O_PATH only names it, as on Linux. */
@@ -590,6 +594,12 @@ long sys_open_ex_k(const char* kpath, int flags, int nonblock, int opath) {
     struct ofile* o = ofile_from_file(f);
     if (!o) { vfs_close(f); return -12; }
     o->nonblock = nonblock ? 1 : 0;
+    /* §M90 rung 6 — a device whose node turns the open into something else
+     * (a pty end: /dev/ptmx, /dev/pts/N, /dev/tty — tty.c) */
+    if (!opath && f->inode && f->inode->type == INODE_DEVICE) {
+        int e = devfs_open_hook(f->inode, o, (flags & VFS_NOCTTY) != 0);
+        if (e < 0) { if (o->kind == FD_PTY) o->kind = FD_VFS; ofile_unref(o); return e; }
+    }
     if (!opath && f->inode && f->inode->type == INODE_FIFO) {
         unsigned role = 0;
         if (flags & VFS_RDONLY) role |= FIFO_R;
@@ -971,6 +981,8 @@ static void stat_full_of(const struct inode* in, struct kstat_full* o) {
         uint32_t ma = 0, mi = 0;
         if (devfs_devnum((struct inode*)in, &ma, &mi) == 0) fmt = KS_IFBLK;
         o->rdev_major = ma; o->rdev_minor = mi;
+        uint64_t fino = devfs_ino((struct inode*)in);  /* §M90 rung 6 — devpts's fixed numbers */
+        if (fino) o->ino = fino;
     }
     o->mode = fmt | perm;
     /* §M90 — a namespace handle reports its NAMESPACE's number (procfs.c). */
@@ -1006,6 +1018,7 @@ int sys_fstat_full_k(int fd, struct kstat_full* out) {
     switch (o->kind) {
     case FD_VFS:
     case FD_FIFO:                                   /* §M90 — the FIFO's own inode */
+    case FD_PTY:                                    /* §M90 rung 6 — the device node it came through */
         if (o->file && o->file->inode) {
             stat_full_of(o->file->inode, out);
             /* §M90 — an open namespace handle: the namespace it was opened on */
@@ -1468,6 +1481,10 @@ uint32_t fd_readiness_of(int fd, struct ofile* o) {
     /* §M90 — a named pipe end: Linux pipe_poll's rules (fifo.c). */
     case FD_FIFO:
         r |= fifo_readiness(o);
+        break;
+    /* §M90 rung 6 — a terminal end (tty.c): the line discipline decides */
+    case FD_PTY:
+        r |= tty_readiness(o);
         break;
     /* §M56 — an AF_INET socket used to fall through to "always ready", so a
      * loop polling one span at full speed and every epoll_wait on it returned
@@ -3096,7 +3113,7 @@ void fd_unshare_table(void) {
  * a directory), as the caller sees it.  0, or -1. */
 int sys_fd_path(int fd, char* out, size_t cap) {
     struct ofile* o = fd_lookup(fd);
-    if (!o || (o->kind != FD_VFS && o->kind != FD_FIFO) || !o->file || !o->file->dentry) return -1;
+    if (!o || (o->kind != FD_VFS && o->kind != FD_FIFO && o->kind != FD_PTY) || !o->file || !o->file->dentry) return -1;
     if (o->file->inode && o->file->inode->unlink_dir) return -1;   /* deleted */
     return vfs_file_path(o->file, out, cap) == 0 ? 0 : -1;
 }
@@ -3153,6 +3170,9 @@ int sys_fd_link_of(struct task* t, int fd, char* out, size_t cap) {
     case FD_BPF:     tag = "anon_inode:bpf-prog"; break;
     case FD_INOTIFY: tag = "anon_inode:inotify"; break;
     case FD_CONSOLE: tag = "/dev/console"; break;
+    case FD_PTY:                                    /* §M90 rung 6 — /dev/pts/N, /dev/ptmx */
+        if (tty_name(f, out, cap) == 0) { ofile_unref(f); return 0; }
+        tag = "/dev/ptmx"; break;
     default:         tag = "anon_inode:[?]"; break;
     }
     lk_put(out, cap, &o, tag);
@@ -3184,7 +3204,7 @@ const char* fd_vfs_vpath(int fd) {
         return v;
     }
     o = fd_lookup(fd);
-    return (o && (o->kind == FD_VFS || o->kind == FD_FIFO) && o->file) ? o->file->vpath : NULL;
+    return (o && (o->kind == FD_VFS || o->kind == FD_FIFO || o->kind == FD_PTY) && o->file) ? o->file->vpath : NULL;
 }
 struct dentry* fd_vfs_dentry(int fd) {
     /* §M90 — /proc/<another pid>/fd/N names THAT process's descriptor (the
@@ -3195,14 +3215,14 @@ struct dentry* fd_vfs_dentry(int fd) {
     if (tg && me && tg != me && task_tgid(tg) != task_tgid(me)) {
         o = fd_ref_in(tg, fd);
         if (!o) return NULL;
-        struct dentry* d = ((o->kind == FD_VFS || o->kind == FD_FIFO) && o->file &&
+        struct dentry* d = ((o->kind == FD_VFS || o->kind == FD_FIFO || o->kind == FD_PTY) && o->file &&
                             o->file->dentry && !(o->file->inode && o->file->inode->unlink_dir))
                          ? o->file->dentry : NULL;
         ofile_unref(o);
         return d;
     }
     o = fd_lookup(fd);
-    if (!o || (o->kind != FD_VFS && o->kind != FD_FIFO) || !o->file || !o->file->dentry) return NULL;
+    if (!o || (o->kind != FD_VFS && o->kind != FD_FIFO && o->kind != FD_PTY) || !o->file || !o->file->dentry) return NULL;
     if (o->file->inode && o->file->inode->unlink_dir) return NULL;
     return o->file->dentry;
 }

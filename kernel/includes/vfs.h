@@ -76,6 +76,10 @@ enum inode_type {
 /* §M90 — do not follow a symbolic link in the LAST component (O_PATH|O_NOFOLLOW:
  * the link itself is opened). */
 #define VFS_NOFOLLOW 0x10
+/* §M90 rung 6 — O_NOCTTY: opening a terminal does not make it the session's
+ * controlling terminal.  Consumed by the open path (sys_open_ex_k), never
+ * seen by a filesystem. */
+#define VFS_NOCTTY  0x20
 
 /* Forward decls — full layouts in vfs.c. */
 struct inode;

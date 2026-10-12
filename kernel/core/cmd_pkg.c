@@ -26,6 +26,8 @@
 /* §M43 — the on-device C compiler: an embedded musl ELF run under the Linux
  * personality with the shell args as argv.  tcc reads the source and headers
  * off the VFS and writes a runnable ELF back to it. */
+extern const unsigned char _binary_user_ptyrun_muslelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_ptyrun_muslelf_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_dostcc_start[] __attribute__((weak));
 extern const unsigned char _binary_user_dostcc_end[]   __attribute__((weak));
 
@@ -56,6 +58,40 @@ static void cmd_pkgrun(const char* line) {
 
     int rc = pkg_backend_active()->run(argc, (const char* const*)argv);
     kprintf("pkgrun: '%s' returned rc=%d\n", argv[0], rc);
+}
+
+/* §M90 rung 6 — `ptyrun '<keys>' <cmd> [args]`: the command on a fresh pty,
+ * as its controlling terminal, typed at with <keys> (user/ptyrun.c).  Quotes
+ * group an argument, as in pkgrun; the program sees argv[0] = "ptyrun". */
+static void cmd_ptyrun(const char* line) {
+    if (!_binary_user_ptyrun_muslelf_start) { console_write("ptyrun: not embedded for this arch\n"); return; }
+    static char scratch[512];
+    const char* argv[24];
+    int argc = 0;
+    argv[argc++] = "ptyrun";
+    int n = 0;
+    while (line[n] && n < 511) { scratch[n] = line[n]; n++; }
+    scratch[n] = '\0';
+    int i = 0;
+    while (scratch[i] && argc < 24) {
+        while (scratch[i] == ' ') i++;
+        if (!scratch[i]) break;
+        char q = 0;
+        if (scratch[i] == '"' || scratch[i] == '\'') { q = scratch[i]; i++; }
+        argv[argc++] = &scratch[i];
+        if (q) { while (scratch[i] && scratch[i] != q) i++; }
+        else   { while (scratch[i] && scratch[i] != ' ') i++; }
+        if (scratch[i]) scratch[i++] = '\0';
+    }
+    if (argc < 3) { console_write("usage: ptyrun '<keys>' <cmd> [args...]\n"); return; }
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf_argv(_binary_user_ptyrun_muslelf_start,
+                                (size_t)(_binary_user_ptyrun_muslelf_end - _binary_user_ptyrun_muslelf_start),
+                                argc, (const char* const*)argv);
+    if (me) me->linux_abi = prev;
+    kprintf("ptyrun: returned rc=%d\n", rc);
 }
 
 static void cmd_tcc(const char* args) {
@@ -178,6 +214,8 @@ SHELL_CMD(pkg)     = { "pkg", "[list|install <name>|gc|profile]", "the package s
                        SHELL_G_PKG, cmd_pkg, SHELL_P_ADMIN };
 SHELL_CMD(pkgrun)  = { "pkgrun", "<name> [args]", "run a program from the store",
                        SHELL_G_PKG, cmd_pkgrun, SHELL_P_ANY };
+SHELL_CMD(ptyrun)  = { "ptyrun", "'<keys>' <cmd> [args]", "run a command on a pty and type at it",
+                       SHELL_G_PKG, cmd_ptyrun, SHELL_P_ANY };
 SHELL_CMD(exec)    = { "exec", "<path>", "run an ELF from the filesystem",
                        SHELL_G_PKG, cmd_exec, SHELL_P_ADMIN };
 SHELL_CMD(tcc)     = { "tcc", "<src.c> -o <out> [args]", "compile C on the machine itself",

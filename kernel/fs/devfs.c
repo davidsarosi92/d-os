@@ -71,9 +71,10 @@ static const struct file_ops devfs_file_ops = {
 
 /* Allocate an inode + dentry pair for `node` and hang it under /dev.
  * Returns 0 on success.  Caller guarantees `dev_dir` is non-NULL. */
-static int attach_node(struct devfs_node* node) {
+struct inode* devfs_attach_into(struct dentry* dir, struct devfs_node* node) {
+    if (!dir || !node) return NULL;
     struct inode* ino = (struct inode*)kcalloc(1, sizeof(struct inode));
-    if (!ino) return -1;
+    if (!ino) return NULL;
 
     ino->type    = INODE_DEVICE;
     vfs_inode_defaults(ino);   /* §M32 — ONE initialiser, every site */
@@ -81,11 +82,26 @@ static int attach_node(struct devfs_node* node) {
     ino->ops     = &devfs_file_ops;
     ino->private = node;
 
-    if (!vfs_attach_child(dev_dir, node->name, ino)) {
+    if (!vfs_attach_child(dir, node->name, ino)) {
         kfree(ino);
-        return -2;
+        return NULL;
     }
-    return 0;
+    node->_inode = ino;
+    return ino;
+}
+static int attach_node(struct devfs_node* node) {
+    return devfs_attach_into(dev_dir, node) ? 0 : -2;
+}
+struct inode* devfs_node_inode(struct devfs_node* node) { return node ? node->_inode : NULL; }
+uint64_t devfs_ino(struct inode* in) {
+    if (!in || in->ops != &devfs_file_ops || !in->private) return 0;
+    return ((struct devfs_node*)in->private)->ino;
+}
+int devfs_open_hook(struct inode* in, struct ofile* o, int noctty) {
+    if (!in || in->ops != &devfs_file_ops || !in->private) return 1;
+    struct devfs_node* n = (struct devfs_node*)in->private;
+    if (!n->open) return 1;
+    return n->open(n->ctx, o, noctty);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -139,24 +155,8 @@ static struct devfs_node node_full = {
     ._next = NULL,
 };
 
-/* §M90 — /dev/tty: the CONTROLLING terminal of the caller.  There is no
- * controlling-terminal concept here yet (no ptys, no sessions bound to a
- * terminal), so reading or writing it answers ENXIO — what Linux answers a
- * process that has none.  The node exists because a container's /dev is
- * expected to carry it. */
-static ssize_t tty_read(void* ctx, void* buf, size_t n, uint64_t off) {
-    (void)ctx; (void)buf; (void)n; (void)off;
-    return -6;                                   /* ENXIO */
-}
-static ssize_t tty_write(void* ctx, const void* buf, size_t n, uint64_t off) {
-    (void)ctx; (void)buf; (void)n; (void)off;
-    return -6;
-}
-static struct devfs_node node_tty = {
-    .name = "tty", .kind = DEVFS_CHAR,
-    .read = tty_read, .write = tty_write, .ioctl = NULL, .ctx = NULL,
-    ._next = NULL,
-};
+/* §M90 rung 6 — /dev/tty is tty.c's now (the controlling terminal, opened
+ * through the node's open hook); it used to answer ENXIO from here. */
 
 /* ---------------------------------------------------------------------- */
 /* Public API.                                                            */
@@ -200,6 +200,13 @@ int devfs_unregister(struct devfs_node* node) {
     return 0;
 }
 
+void devfs_detach_from(struct dentry* dir, struct devfs_node* node) {
+    if (!dir || !node) return;
+    struct inode* ino = vfs_orphan_child(dir, node->name);
+    if (ino) ino->private = &node_gone;
+    node->_inode = NULL;
+}
+
 void devfs_init(void) {
     /* Resolve /dev — must exist (ramfs creates it at mount). */
     struct file* f = vfs_open("/dev", VFS_RDONLY);
@@ -214,7 +221,6 @@ void devfs_init(void) {
     attach_node(&node_null);
     attach_node(&node_zero);
     attach_node(&node_full);                     /* §M90 */
-    attach_node(&node_tty);                      /* §M90 */
 
     /* Flush any driver registrations queued before init. */
     int flushed = 0;
@@ -237,6 +243,7 @@ void devfs_init(void) {
 int devfs_devnum(struct inode* in, uint32_t* major, uint32_t* minor) {
     if (!in || in->ops != &devfs_file_ops || !in->private) return -1;
     const struct devfs_node* n = (const struct devfs_node*)in->private;
+    if (n->has_devnum) { *major = n->dev_major; *minor = n->dev_minor; return n->kind == DEVFS_BLOCK ? 0 : 1; }
     static const struct { const char* name; uint32_t maj, min; } tab[] = {
         { "null", 1, 3 }, { "zero", 1, 5 }, { "full", 1, 7 }, { "random", 1, 8 },
         { "urandom", 1, 9 }, { "tty", 5, 0 }, { "console", 5, 1 }, { "ptmx", 5, 2 },

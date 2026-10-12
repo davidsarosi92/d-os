@@ -41,6 +41,8 @@ enum devfs_kind {
     DEVFS_BLOCK,                /* fixed-size addressable units (later)   */
 };
 
+struct ofile;   /* §M90 rung 6 — the open hook's argument */
+struct inode;
 struct devfs_node {
     const char*     name;       /* path component under /dev, no slashes */
     enum devfs_kind kind;
@@ -68,7 +70,35 @@ struct devfs_node {
     /* Internal use — link in the pending-or-live list.  Drivers should not
      * touch this; devfs.c manages it. */
     struct devfs_node* _next;
+
+    /* §M90 rung 6 — APPENDED.  `open` makes an open of this node something
+     * other than a stream of read/write calls: it receives the new ofile and
+     * may turn it into another kind (a pty end — tty.c).  `noctty` is
+     * O_NOCTTY.  0, or a negative errno that fails the open. */
+    int     (*open)(void* ctx, struct ofile* o, int noctty);
+    /* The Linux device number, when the name table in devfs_devnum does not
+     * know it (/dev/pts/N is 136:N). */
+    int      has_devnum;
+    uint32_t dev_major, dev_minor;
+    struct inode* _inode;       /* devfs.c: the inode it was attached as */
+    /* §M90 rung 6 — APPENDED.  The inode number stat reports, 0 = derived.
+     * devpts has fixed ones (ptmx 2, pty N is N+3) and runc VERIFIES the
+     * ptmx handle it is given against them ("ptmx handle has wrong inode
+     * number") before it trusts it with a container's console. */
+    uint64_t ino;
 };
+struct ofile;
+struct dentry;
+/* §M90 rung 6 — a node in ANOTHER directory than /dev (a devpts instance):
+ * the inode it became, or NULL; and its removal (open handles fail cleanly,
+ * as after devfs_unregister). */
+struct inode* devfs_attach_into(struct dentry* dir, struct devfs_node* node);
+void          devfs_detach_from(struct dentry* dir, struct devfs_node* node);
+struct inode* devfs_node_inode(struct devfs_node* node);
+/* The open hook of a devfs inode: 1 = it has none, else what the hook said. */
+int           devfs_open_hook(struct inode* in, struct ofile* o, int noctty);
+/* The fixed inode number a node declares (0 = none). */
+uint64_t      devfs_ino(struct inode* in);
 
 /* §M90 — Linux major:minor of a devfs inode (devfs.c); 1 char, 0 block, -1 not ours. */
 struct inode;

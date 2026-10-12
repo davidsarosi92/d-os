@@ -14,6 +14,7 @@
 #include "fsnotify.h"   /* §M90 rung 3 — inotify */
 #include "lnx_signal.h"   /* §M89 */
 #include "abi.h"
+#include "tty.h"   /* §M90 rung 6 */
 #include "nsproxy.h"
 #include "procfs.h"
 #include "bpf.h"
@@ -621,6 +622,7 @@ static int abi_open_flags(unsigned long lf) {
     if (lf & 0100u)  vf |= VFS_CREATE;
     if (lf & 01000u) vf |= VFS_TRUNC;
     if (lf & 0100000u) vf |= VFS_NOFOLLOW;                /* §M90 — O_NOFOLLOW */
+    if (lf & 0400u)    vf |= VFS_NOCTTY;                  /* §M90 rung 6 — O_NOCTTY, same bit everywhere */
     return vf;
 }
 static long abi_open_common(struct abi_ctx* c, unsigned long upath, unsigned long flags) {
@@ -1090,6 +1092,9 @@ static long h_mount(struct abi_ctx* c) {
         } else if (mnt_eq(fst, "tmpfs") || mnt_eq(fst, "devpts") || mnt_eq(fst, "mqueue") ||
                    mnt_eq(fst, "ramfs")) {
             if (vfs_anon_fs(fst, from, sizeof from) != 0) return -12;
+            /* §M90 rung 6 — a devpts mount is a new pty INSTANCE: its ptmx
+             * node, and a node per pty opened through it (tty.c) */
+            if (mnt_eq(fst, "devpts") && devpts_instance_new(from) != 0) return -12;
             anon = 1;
         } else if (mnt_eq(fst, "overlay")) {
             /* §M90 rung 4 — overlayfs (kernel/fs/overlayfs.c): mounted on a
@@ -1603,6 +1608,7 @@ static long h_setsid(struct abi_ctx* c) {
     if (!t) return -1;
     if (t->pgid == t->pid) return -1;    /* EPERM: already a group leader */
     t->sid = t->pgid = t->pid;
+    t->ctty_id = 0;                      /* §M90 rung 6 — a new session has no terminal */
     /* §M90 — a new session is how a Linux program DETACHES (daemon(3),
      * setsid(1)): it outlives its parent instead of dying with it (task.c's
      * "a parent takes its subtree down" rule), adopted by a subreaper or init. */
@@ -1764,7 +1770,46 @@ static long h_readv(struct abi_ctx* c) {
  * ENOTTY as "this is not a terminal" and carries on with block buffering,
  * while ENOSYS is an unknown-call error it has no story for.  Answering the
  * question correctly is not the same as implementing the call. */
-static long h_ioctl(struct abi_ctx* c) { (void)c; return -ABI_ENOTTY; }
+/* §M90 rung 6 — and now the calls that ARE implemented: the generic ones
+ * every descriptor answers (FIONBIO, FIOCLEX/FIONCLEX, FIONREAD on a pipe or
+ * a stream socket), and a terminal end's (tty.c), whose argument the engine
+ * marshals: tty_ioctl_size names its size and direction, the structure is
+ * copied in through a kernel buffer before and out after — tty.c never
+ * touches a guest pointer.  Everything else is still ENOTTY. */
+static int abi_user_r_ok(unsigned long uptr, unsigned long len);
+static long h_ioctl(struct abi_ctx* c) {
+    int fd = (int)c->a[0];
+    unsigned cmd = (unsigned)c->a[1];
+    unsigned long arg = c->a[2];
+    struct ofile* o = fd_lookup(fd);
+    if (!o && (fd < 0 || fd > 2)) return -9;                 /* EBADF */
+    switch (cmd) {
+    case 0x5421u: {                                           /* FIONBIO */
+        if (!abi_user_r_ok(arg, sizeof(int))) return -ABI_EFAULT;
+        int v = *(const int*)(uintptr_t)arg;
+        if (o) o->nonblock = v != 0;
+        return 0;
+    }
+    case 0x5451u: return fd_set_cloexec(fd, 1) == 0 ? 0 : -9;   /* FIOCLEX  */
+    case 0x5450u: return fd_set_cloexec(fd, 0) == 0 ? 0 : -9;   /* FIONCLEX */
+    default: break;
+    }
+    if (!o || o->kind != FD_PTY) return -ABI_ENOTTY;
+    int dir = 0;
+    int sz = tty_ioctl_size(cmd, &dir);
+    if (sz < 0) return -ABI_ENOTTY;
+    uint8_t k[48];
+    for (int i = 0; i < (int)sizeof k; i++) k[i] = 0;
+    if (sz && dir == 2) {
+        if (!abi_user_r_ok(arg, (size_t)sz)) return -ABI_EFAULT;
+        for (int i = 0; i < sz; i++) k[i] = ((const uint8_t*)(uintptr_t)arg)[i];
+    }
+    if (sz && dir == 1 && !abi_user_w_ok(arg, (size_t)sz)) return -ABI_EFAULT;
+    long r = tty_ioctl(o, cmd, k, arg);
+    if (r >= 0 && sz && dir == 1)
+        for (int i = 0; i < sz; i++) ((uint8_t*)(uintptr_t)arg)[i] = k[i];
+    return r;
+}
 
 /* brk: the real program break since §M90 (vma.c, vma_brk) — the break after
  * the call, Linux's contract.  An image loaded without one still answers 0. */
@@ -2466,7 +2511,7 @@ static long h_statfs64(struct abi_ctx* c) {
 }
 static uint32_t abi_fd_fs_magic(int fd) {
     struct ofile* o = fd_lookup(fd);
-    if (o && (o->kind == FD_VFS || o->kind == FD_FIFO) && o->file && o->file->dentry)
+    if (o && (o->kind == FD_VFS || o->kind == FD_FIFO || o->kind == FD_PTY) && o->file && o->file->dentry)
         return abi_dentry_fs_magic(o->file->dentry);
     return 0x858458f6u;
 }

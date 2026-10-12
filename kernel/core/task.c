@@ -80,6 +80,7 @@
 #include "lnx_signal.h"
 #include "nsproxy.h"   /* §M89 */
 #include "task.h"
+#include "tty.h"   /* §M90 rung 6 */
 #include "swap.h"
 #include "watchdog.h"   /* §M31 L3 — hw_watchdog_pet from the tick */
 #include "kmutex.h"
@@ -933,6 +934,7 @@ static struct task* spawn_common_ex(const char* name, void (*entry)(void),
     t->cgroup = cur ? cur->cgroup : NULL;    /* §M90 — a child starts in its parent's cgroup */
     t->mntns  = cur ? cur->mntns  : 0;       /* §M90 — and in its mount namespace */
     t->sid  = cur ? cur->sid  : 0;
+    t->ctty_id = cur ? cur->ctty_id : 0;    /* §M90 rung 6 — the terminal follows */
     t->oom_score_adj = cur ? cur->oom_score_adj : 0;   /* §M90 — inherited */
     ns_inherit(cur, t);                      /* §M90 — namespaces, with references */
     ns_pid_assign(t);                        /* §M90 — its number in each pid namespace */
@@ -2935,6 +2937,11 @@ void task_exit_code(int code) {
      * and still holding the write end.  Idempotent: a table already released
      * leaves the private one empty. */
     if (self->user_task) fd_close_all();
+
+    /* §M90 rung 6 — a session leader leaving takes its session's terminal
+     * with it: the foreground group is hung up (tty.c). */
+    if (self->user_task && self->pid == self->sid && (!self->tgid || self->tgid == self->pid))
+        tty_task_exit(self);
 
     /* NO ARMED TIMER MAY OUTLIVE THE STACK IT LIVES ON (2026-09-25).  See
      * ktimer_cancel_range: a task leaving from inside a wait (task_yield exits

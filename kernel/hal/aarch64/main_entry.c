@@ -38,6 +38,7 @@ void hal_fpu_enable_this_cpu(void);   /* fpu.c (A2) */
 #include "vfs.h"
 #include "procfs.h"
 #include "devfs.h"          /* this arch had no /dev at all — see the call site */
+#include "tty.h"          /* §M90 rung 6 */
 #include "clipboard.h"       /* §M59 — /dev/clipboard */
 #include "random.h"          /* §M39 — /dev/urandom */
 #include "audio.h"           /* §M23 stage 3 — audio_devfs_init */
@@ -288,6 +289,7 @@ void aarch64_main_entry(uint64_t dtb) {
      * missing here — on the very arch that had just been given a sound
      * device.  Same ordering as x86: after the modules have registered. */
     devfs_init();
+    tty_init();                  /* §M90 rung 6 — /dev/tty, /dev/ptmx, /dev/pts */
     clipboard_devfs_init();
     audio_devfs_init();          /* §M23 stage 3 — /dev/dsp */
     random_init();

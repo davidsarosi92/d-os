@@ -155,6 +155,8 @@ long lnx_h_sigaltstack(struct abi_ctx* c);
 long lnx_h_tkill(struct abi_ctx* c);
 long lnx_h_tgkill(struct abi_ctx* c);
 long lnx_h_kill(struct abi_ctx* c);
+/* §M90 rung 6 — would `sig` reach `t` (not ignored, not blocked)?  1 = it would not. */
+int  lnx_sig_ignored_or_blocked(struct task* t, int sig);
 
 /* Per arch (hal/<arch>/lnx_sigframe.c).  x86 passes its int_frame; aarch64
  * its trapframe — hence `void*` here and the real type in each file. */

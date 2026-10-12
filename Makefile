@@ -75,7 +75,8 @@ MUSL_PROG_BLOBS := user/muslhello_muslblob.o user/netmusl_muslblob.o \
                    user/nxtest_muslblob.o user/mmaptest_muslblob.o \
                    user/sigmusl_muslblob.o user/cpuidmusl_muslblob.o \
                    user/sock6musl_muslblob.o user/killmusl_muslblob.o \
-                   user/nftmusl_muslblob.o
+                   user/nftmusl_muslblob.o user/ptymusl_muslblob.o \
+                   user/ptyrun_muslblob.o
 # §M37 dynamic-linking artifacts — the ld.so blob + the dynamically linked tests.
 MUSL_DYN_BLOBS  := user/ldmusl_blob.o user/muslhellodyn_dynblob.o \
                    user/libgreet_blob.o user/solibtest_dynblob.o \
@@ -625,6 +626,8 @@ else ifeq ($(ARCH),aarch64)
                      user/sock6musl_muslblob.o \
                      user/killmusl_muslblob.o \
                      user/nftmusl_muslblob.o \
+                     user/ptymusl_muslblob.o \
+                     user/ptyrun_muslblob.o \
                      user/pthreadtest_muslblob.o \
                      $(MUSL_COREUTIL_BLOBS)
 
@@ -853,7 +856,7 @@ CORE_C_SRCS := \
     kernel/core/ktimer.c \
     kernel/core/timerfd.c \
     kernel/core/eventfd.c \
-    kernel/core/fifo.c \
+    kernel/core/fifo.c kernel/core/tty.c \
     kernel/core/nsproxy.c \
     kernel/core/bpf.c \
     kernel/core/flock.c \
@@ -918,7 +921,7 @@ CORE_C_SRCS := \
     kernel/core/ktimer.c \
     kernel/core/timerfd.c \
     kernel/core/eventfd.c \
-    kernel/core/fifo.c \
+    kernel/core/fifo.c kernel/core/tty.c \
     kernel/core/nsproxy.c \
     kernel/core/bpf.c \
     kernel/core/flock.c \
@@ -1244,7 +1247,7 @@ CORE_C_SRCS := \
     kernel/core/ktimer.c \
     kernel/core/timerfd.c \
     kernel/core/eventfd.c \
-    kernel/core/fifo.c \
+    kernel/core/fifo.c kernel/core/tty.c \
     kernel/core/nsproxy.c \
     kernel/core/bpf.c \
     kernel/core/flock.c \

@@ -517,6 +517,10 @@ struct task {
      * a second setsid in it is refused, as on Linux. */
     int       pgid;
     int       sid;
+    /* §M90 rung 6 — the controlling terminal (tty.c): an id with a
+     * generation, valid only while that terminal is alive AND still belongs
+     * to this task's session.  Inherited by fork, cleared by setsid. */
+    uint32_t  ctty_id;
     /* §M90 — prctl(PR_SET_PDEATHSIG): the signal asked for when the parent
      * dies.  Recorded and reported; the DELIVERY is the kill-tree rule in
      * task_exit_code, which already ends every non-detached child when its

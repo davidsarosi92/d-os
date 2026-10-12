@@ -6,7 +6,8 @@
 
 #include "packet.h"
 #include "cgroupfs.h"   /* §M90 — memfd pages charged to their creator */
-#include "fsnotify.h"   /* §M90 — FD_INOTIFY */
+#include "fsnotify.h"
+#include "tty.h"       /* §M90 rung 6 — FD_PTY */   /* §M90 — FD_INOTIFY */
 #include "fd.h"
 #include "fifo.h"
 #include "bpf.h"
@@ -173,6 +174,7 @@ void ofile_unref(struct ofile* o) {
         case FD_BPF:     bpf_prog_put(o->bpf); break;
         case FD_INOTIFY: inotify_close(o->ino); break;
         case FD_PACKET:  packet_close(o->pkt); break;
+        case FD_PTY:     tty_release(o); if (o->file) vfs_close(o->file); break;   /* §M90 rung 6 */
     }
     o->kind = (enum fd_kind)0x0DEAD;     /* the poison, see above */
     kfree(o);

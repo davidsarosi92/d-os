@@ -27,6 +27,7 @@
 #include "fd.h"
 #include "printf.h"
 #include "nsproxy.h"
+#include "tty.h"       /* §M90 rung 6 — lnx_sig_pgrp */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -452,15 +453,48 @@ long lnx_h_sigaltstack(struct abi_ctx* c) {
 int task_may_signal(struct task* me, struct task* t);
 static int may_signal(struct task* me, struct task* t) { return task_may_signal(me, t); }
 
-static long send_to(int tid, int sig, int code) {
-    struct task* me = task_current();
-    /* §M90 — `tid` is a number in the SENDER's pid namespace. */
-    int g = ns_pid_resolve(me, tid);
-    struct task* t = g > 0 ? task_find(g) : NULL;
-    if (!t) return -E_SRCH;
+/* The disposition of `sig` for `t`: 0 default, 1 ignored, 2 a handler. */
+static int disposition(struct task* t, int sig) {
+    struct lnx_sigstate* s = state_of(t, 0);
+    uintptr_t h = (s && s->sh) ? s->sh->a[sig].handler : 0;
+    if (!h && !t->linux_abi && sig < NSIG) h = t->sig_handler[sig];   /* a native program */
+    return h == SIG_IGN ? 1 : (h ? 2 : 0);
+}
+/* §M90 rung 6 — for the terminal's job control: would `sig` reach `t` at all? */
+int lnx_sig_ignored_or_blocked(struct task* t, int sig) {
+    if (!t || sig <= 0 || sig >= LNX_NSIG) return 1;
+    if (disposition(t, sig) == 1) return 1;
+    return (lnx_sig_blocked64(t) >> (sig - 1)) & 1;
+}
+
+/* One process, one signal — the decision `kill` and a terminal share.
+ * `si` NULL = the kernel's own (SI_KERNEL).
+ *
+ * §M90 rung 6 — SIGTSTP, SIGTTIN and SIGTTOU STOP only by DEFAULT.  They went
+ * straight to the scheduler as if they were SIGSTOP, so an interactive shell
+ * — which ignores all three, precisely so that ^Z does not stop IT — was
+ * stopped by its own terminal.  A handler gets the signal; ignored means
+ * dropped; only the default stops.  SIGCONT always resumes, and is ALSO
+ * delivered to a handler (a full-screen program redraws on it). */
+static int deliver_one(struct task* t, int sig, const struct lnx_siginfo* si) {
+    if (sig == SIGSTOP) return task_stop(t->pid) == 0 ? 0 : -E_PERM;
+    if (sig == 20 || sig == 21 || sig == 22) {
+        int d = disposition(t, sig);
+        if (d == 1) return 0;
+        if (d == 0) return task_stop(t->pid) == 0 ? 0 : -E_PERM;
+    }
+    if (sig == SIGCONT) {
+        task_cont(t->pid);
+        if (disposition(t, sig) != 2) return 0;
+    }
+    struct lnx_siginfo k;
+    if (!si) { k.signo = sig; k.code = 0x80 /* SI_KERNEL */; k.addr = 0; k.pid = 0; k.uid = 0; si = &k; }
+    return lnx_sig_post(t, sig, si) == 0 ? 0 : -E_INVAL;
+}
+
+static long send_one(struct task* me, struct task* t, int sig, int code) {
     if (!may_signal(me, t)) return -E_PERM;
     if (sig == 0) return 0;                                  /* existence probe */
-    if (sig < 0 || sig >= LNX_NSIG) return -E_INVAL;
     /* §M90 — a pid namespace's init is protected from its own namespace:
      * a signal it has no handler for is DROPPED when sent from inside (SIGKILL
      * and SIGSTOP included), as on Linux — the container's init cannot be
@@ -471,16 +505,94 @@ static long send_to(int tid, int sig, int code) {
         uintptr_t h = (ts && ts->sh) ? ts->sh->a[sig].handler : 0;
         if (sig == 9 || sig == SIGSTOP || h == 0) return 0;
     }
-    if (sig == SIGSTOP || sig == 20 /* SIGTSTP */ || sig == SIGCONT)
-        /* §M72 acts on these — by GLOBAL pid (it used to be handed the
-         * caller's namespace number, i.e. some other task in a container) */
-        return sys_kill(g, sig) == 0 ? 0 : -E_PERM;
     struct lnx_siginfo si;
     si.signo = sig; si.code = code; si.addr = 0;
     si.pid = me ? ns_vnr(t, me) : 0;                 /* §M90 — as the receiver sees us */
     si.uid = me ? cred_uid(&me->cred) : 0;
     if (si.uid < 0) si.uid = 0;
-    return lnx_sig_post(t, sig, &si) == 0 ? 0 : -E_INVAL;
+    return deliver_one(t, sig, &si);
+}
+
+/* §M90 rung 6 — a signal to a GROUP of processes.  kill(0) is the caller's
+ * own group, kill(-pg) group pg, kill(-1) every process the caller may
+ * signal except init and itself (and, in a pid namespace, only the ones it
+ * can see).  They all answered ESRCH: send_to resolved only positive pids,
+ * so killpg(3), a shell's job control and `kill -- -PGID` reached nobody.
+ * The processes are collected under the task list's lock and signalled
+ * after it (posting may wake, which takes scheduler locks). */
+#define GRP_MAX 256
+struct grp_q { int pgid, all, me_tgid, n; int pids[GRP_MAX]; const struct task* me; };
+static void grp_fn(const struct task* t, int cur, void* ctx) {
+    (void)cur;
+    struct grp_q* q = (struct grp_q*)ctx;
+    if (q->n >= GRP_MAX || t->state == TASK_DEAD || t->is_idle || !t->user_task) return;
+    if (t->tgid && t->tgid != t->pid) return;               /* processes, not threads */
+    if (q->all) {
+        if (t->pid == q->me_tgid) return;
+    } else if ((t->pgid ? t->pgid : 0) != q->pgid) return;
+    q->pids[q->n++] = t->pid;
+}
+static int collect_group(struct grp_q* q, struct task* me, int pgid, int all) {
+    q->pgid = pgid; q->all = all; q->n = 0; q->me = me;
+    q->me_tgid = me ? task_tgid(me) : 0;
+    task_for_each(grp_fn, q);
+    return q->n;
+}
+
+int lnx_sig_pgrp(int pgid, int sig, int check) {
+    if (sig <= 0 || sig >= LNX_NSIG) return 0;
+    struct task* me = task_current();
+    struct grp_q* q = (struct grp_q*)kmalloc(sizeof *q);
+    if (!q) return 0;
+    collect_group(q, me, pgid, 0);
+    int done = 0;
+    for (int i = 0; i < q->n; i++) {
+        struct task* t = task_find(q->pids[i]);
+        if (!t) continue;
+        if (check ? send_one(me, t, sig, LNX_SI_USER) == 0 : deliver_one(t, sig, NULL) == 0) done++;
+    }
+    kfree(q);
+    return done;
+}
+
+static long send_group(int pgid, int sig, int all) {
+    struct task* me = task_current();
+    struct grp_q* q = (struct grp_q*)kmalloc(sizeof *q);
+    if (!q) return -12;
+    collect_group(q, me, pgid, all);
+    int found = 0, ok = 0;
+    long err = -E_SRCH;
+    for (int i = 0; i < q->n; i++) {
+        struct task* t = task_find(q->pids[i]);
+        if (!t) continue;
+        if (all) {                                           /* init, and the invisible, are skipped */
+            int v = me ? ns_vnr(me, t) : t->pid;
+            if (v <= 1) continue;
+        }
+        found = 1;
+        long r = send_one(me, t, sig, LNX_SI_USER);
+        if (r == 0) ok = 1; else err = r;
+    }
+    kfree(q);
+    if (ok) return 0;
+    return found ? err : -E_SRCH;
+}
+
+static long send_to(int tid, int sig, int code) {
+    struct task* me = task_current();
+    if (sig < 0 || sig >= LNX_NSIG) return -E_INVAL;
+    if (tid == 0)  return send_group(me ? (me->pgid ? me->pgid : 0) : 0, sig, 0);
+    if (tid == -1) return send_group(0, sig, 1);
+    if (tid < -1) {
+        int g = ns_pid_resolve(me, -tid);                    /* the group, in OUR namespace */
+        if (g <= 0) return -E_SRCH;
+        return send_group(g, sig, 0);
+    }
+    /* §M90 — `tid` is a number in the SENDER's pid namespace. */
+    int g = ns_pid_resolve(me, tid);
+    struct task* t = g > 0 ? task_find(g) : NULL;
+    if (!t) return -E_SRCH;
+    return send_one(me, t, sig, code);
 }
 
 long lnx_h_kill(struct abi_ctx* c)   { return send_to((int)c->a[0], (int)c->a[1], LNX_SI_USER); }
