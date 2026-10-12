@@ -180,6 +180,69 @@ void gterm_emit(void* ctx, char c) {
     spin_unlock(&win->lock);
     gui_damage_win(win);
 }
+/* §M90 rung 6 — the GUI terminal's side of the VT100 subset (vt.h): the
+ * cursor, erasing and shifting cells in the backing store, and the answer to
+ * a cursor-position query typed back into the window's own input.  Each op
+ * takes the window lock as gterm_emit does, and damages what it changed. */
+static void gv_put(void* x, char c) { gterm_emit(x, c); }
+static void gv_get(void* x, int* r, int* c) {
+    struct gui_window* w = x;
+    spin_lock(&w->lock); *r = w->crow; *c = w->ccol; spin_unlock(&w->lock);
+}
+static void gv_set(void* x, int r, int c) {
+    struct gui_window* w = x;
+    spin_lock(&w->lock);
+    w->crow = r < w->rows ? r : w->rows - 1;
+    w->ccol = c < w->cols ? c : w->cols - 1;
+    spin_unlock(&w->lock);
+}
+static void gv_dims(void* x, int* r, int* c) {
+    struct gui_window* w = x;
+    *r = w->rows > 0 ? w->rows : 24;
+    *c = w->cols > 0 ? w->cols : 80;
+}
+static void gv_redraw_row(struct gui_window* w, int row, int c0, int c1) {
+    for (int c = c0; c < c1; c++) {
+        char ch = w->cells[(size_t)row * gmax_cols + c];
+        gterm_draw_cell(w, c, w->scrolled + row, ch ? ch : ' ');
+    }
+}
+static void gv_erase(void* x, int row, int c0, int c1) {
+    struct gui_window* w = x;
+    spin_lock(&w->lock);
+    if (row >= 0 && row < w->rows) {
+        if (c1 > w->cols) c1 = w->cols;
+        for (int c = c0 < 0 ? 0 : c0; c < c1; c++) w->cells[(size_t)row * gmax_cols + c] = 0;
+        gv_redraw_row(w, row, c0 < 0 ? 0 : c0, c1);
+    }
+    spin_unlock(&w->lock);
+    gui_damage_win(w);
+}
+static void gv_shift(void* x, int row, int col, int n) {
+    struct gui_window* w = x;
+    spin_lock(&w->lock);
+    if (row >= 0 && row < w->rows && col >= 0 && col < w->cols && n) {
+        char* r = w->cells + (size_t)row * gmax_cols;
+        if (n > 0) {                                   /* insert n blanks at col */
+            for (int c = w->cols - 1; c >= col; c--) r[c] = (c - n >= col) ? r[c - n] : 0;
+        } else {                                       /* delete -n characters */
+            int k = -n;
+            for (int c = col; c < w->cols; c++) r[c] = (c + k < w->cols) ? r[c + k] : 0;
+        }
+        gv_redraw_row(w, row, col, w->cols);
+    }
+    spin_unlock(&w->lock);
+    gui_damage_win(w);
+}
+static void gv_reply(void* x, const char* s) {
+    struct gui_window* w = x;
+    for (; *s; s++) vc_kbd_push_to(w->vc, *s);
+}
+const struct vt_ops gterm_vt_ops = {
+    .put = gv_put, .get_cursor = gv_get, .set_cursor = gv_set, .dims = gv_dims,
+    .erase = gv_erase, .shift = gv_shift, .reply = gv_reply,
+};
+
 /* §M58 — copy the selected cells out of the backing store into `dst`.
  * Trailing blanks on each line are dropped (a terminal pads its rows with
  * spaces, and pasting that padding is never what was meant), and a newline is

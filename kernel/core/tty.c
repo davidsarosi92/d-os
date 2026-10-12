@@ -83,6 +83,7 @@
 #include "syscall.h"
 #include "printf.h"
 #include "lnx_signal.h"
+#include "vc.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -204,6 +205,7 @@ static void termios_defaults(struct ktermios* t, int master) {
 /* Is the special character `v` enabled and equal to c?  (0 disables it —
  * _POSIX_VDISABLE on Linux.) */
 static int is_cc(const struct tty* p, int v, uint8_t c) { return p->t.c_cc[v] && p->t.c_cc[v] == c; }
+static int is_cc_t(const struct ktermios* t, int v, uint8_t c) { return t->c_cc[v] && t->c_cc[v] == c; }
 
 /* ---- the output queue (slave → master), lock held ----------------------------- */
 
@@ -1086,4 +1088,172 @@ void tty_task_exit(struct task* t) {
     struct tty* p = ctty_locked(t);
     spin_unlock_irqrestore(&g_tab_lock, f);
     if (p) hangup_session(p);                          /* the session lost its terminal */
+}
+
+/* ---- the console as a terminal ---------------------------------------------------------
+ *
+ * The machine's own consoles (a framebuffer pane, a GUI terminal window) are
+ * terminals to the programs running on them: isatty() is true, tcgetattr
+ * answers, the window size is the console's size in cells, and a program
+ * that turns canonical mode or echo off gets raw keystrokes — `docker run -it`
+ * typed in a terminal window puts the console into raw mode and streams it.
+ * The settings live per console (a VC) and start as Linux's defaults.
+ *
+ * NOT here, said plainly: ISIG on a console (^C in a console does not signal
+ * a process group — the console has no sessions; a program is ended from the
+ * Task Manager or `kill`), and output post-processing (the console renders
+ * '\n' as a new line whatever OPOST says).  Canonical mode WITH echo is the
+ * shell's own line reader (usyscall.c's stdin_read_line), unchanged. */
+#define CON_MAX 24
+static struct { struct vc* v; struct ktermios t; int used; } g_con[CON_MAX];
+static spinlock_t g_con_lock = SPINLOCK_INIT;
+
+static struct vc* con_vc(void) {
+    struct task* me = task_current();
+    struct vc* v = me && me->out_console ? (struct vc*)me->out_console : NULL;
+    return v ? v : vc_focused();
+}
+/* The console's termios (created with the defaults on first use). */
+static struct ktermios* con_termios(struct vc* v, struct ktermios* scratch) {
+    uint32_t f = spin_lock_irqsave(&g_con_lock);
+    int free_i = -1;
+    for (int i = 0; i < CON_MAX; i++) {
+        if (g_con[i].used && g_con[i].v == v) { spin_unlock_irqrestore(&g_con_lock, f); return &g_con[i].t; }
+        if (!g_con[i].used && free_i < 0) free_i = i;
+    }
+    struct ktermios* t = scratch;
+    if (free_i >= 0) {
+        g_con[free_i].used = 1; g_con[free_i].v = v;
+        t = &g_con[free_i].t;
+    }
+    termios_defaults(t, 0);
+    spin_unlock_irqrestore(&g_con_lock, f);
+    return t;
+}
+void tty_console_forget(struct vc* v) {
+    uint32_t f = spin_lock_irqsave(&g_con_lock);
+    for (int i = 0; i < CON_MAX; i++) if (g_con[i].used && g_con[i].v == v) g_con[i].used = 0;
+    spin_unlock_irqrestore(&g_con_lock, f);
+}
+
+/* §M90 rung 6 — has a program put console `v` into raw (non-canonical)
+ * mode?  Then the GUI terminal sends it the keys a Linux terminal sends
+ * (arrows as ESC [ A ...).  Never creates state; safe from the input path. */
+int tty_vc_raw(struct vc* v) {
+    uint32_t f = spin_lock_irqsave(&g_con_lock);
+    int raw = 0;
+    for (int i = 0; i < CON_MAX; i++)
+        if (g_con[i].used && g_con[i].v == v) { raw = !(g_con[i].t.c_lflag & T_ICANON); break; }
+    spin_unlock_irqrestore(&g_con_lock, f);
+    return raw;
+}
+
+/* 1 = the shell's cooked line reader applies (canonical with echo). */
+int tty_console_cooked(void) {
+    struct ktermios sc;
+    struct ktermios* t = con_termios(con_vc(), &sc);
+    return (t->c_lflag & T_ICANON) && (t->c_lflag & T_ECHO);
+}
+
+long tty_console_read(void* buf, size_t n, int block) {
+    struct vc* v = con_vc();
+    if (!v) return 0;
+    struct ktermios sc;
+    struct ktermios* t = con_termios(v, &sc);
+    char* b = (char*)buf;
+    if (t->c_lflag & T_ICANON) {
+        /* canonical WITHOUT echo (a password prompt): a line, erase honoured,
+         * nothing shown */
+        size_t len = 0;
+        for (;;) {
+            char c;
+            if (vc_read_nb(v, &c, 1) == 0) {
+                if (!block && !len) return -E_AGAIN;
+                if (vc_wait_input(v) != 0) return len ? (long)len : -E_INTR;
+                continue;
+            }
+            if (c == '\r' && (t->c_iflag & T_ICRNL)) c = '\n';
+            if (c == '\n') { if (len < n) b[len++] = '\n'; return (long)len; }
+            if (is_cc_t(t, VEOF, (uint8_t)c)) return (long)len;
+            if (is_cc_t(t, VERASE, (uint8_t)c) || c == '\b') { if (len) len--; continue; }
+            if (len < n) b[len++] = c;
+        }
+    }
+    /* non-canonical: what is there, at least VMIN of it (1 when 0 and no VTIME) */
+    uint32_t vmin = t->c_cc[VMIN];
+    size_t got = 0;
+    for (;;) {
+        int k = vc_read_nb(v, b + got, (int)(n - got));
+        for (int i = 0; i < k; i++) {
+            uint8_t c = (uint8_t)b[got + i];
+            if (c == '\r' && (t->c_iflag & T_ICRNL)) b[got + i] = '\n';
+            if (t->c_lflag & T_ECHO) vc_putchar(v, b[got + i]);
+        }
+        got += (size_t)k;
+        if (got >= n || got >= (vmin ? vmin : 1) || (vmin == 0 && t->c_cc[VTIME] == 0)) break;
+        if (!block) return got ? (long)got : -E_AGAIN;
+        if (vmin == 0 && t->c_cc[VTIME]) {                 /* a timed wait, in 10 ms steps */
+            for (uint32_t i = 0; i < (uint32_t)t->c_cc[VTIME] * 10 && !vc_in_count(v); i++) task_msleep(10);
+            if (!vc_in_count(v)) break;
+            continue;
+        }
+        if (vc_wait_input(v) != 0) return got ? (long)got : -E_INTR;
+    }
+    return (long)got;
+}
+
+/* POLLIN for a console's input: a whole line when cooked, a byte when raw. */
+int tty_console_readable(void) {
+    struct vc* v = con_vc();
+    if (!v) return 0;
+    struct ktermios sc;
+    struct ktermios* t = con_termios(v, &sc);
+    if (t->c_lflag & T_ICANON) return vc_can_read_line(v);
+    return vc_in_count(v) > 0;
+}
+
+long tty_console_ioctl(unsigned cmd, void* k, unsigned long val) {
+    struct vc* v = con_vc();
+    struct task* me = task_current();
+    struct ktermios sc;
+    struct ktermios* t = con_termios(v, &sc);
+    switch (cmd) {
+    case TCGETS: case TCGETS2: {
+        uint32_t f = spin_lock_irqsave(&g_con_lock);
+        for (unsigned i = 0; i < sizeof *t; i++) ((uint8_t*)k)[i] = ((const uint8_t*)t)[i];
+        spin_unlock_irqrestore(&g_con_lock, f);
+        if (cmd == TCGETS2) { w32((uint8_t*)k + 36, 38400); w32((uint8_t*)k + 40, 38400); }
+        return 0;
+    }
+    case TCSETS: case TCSETSW: case TCSETSF: case TCSETS2: case TCSETSW2: case TCSETSF2: {
+        uint32_t f = spin_lock_irqsave(&g_con_lock);
+        for (unsigned i = 0; i < sizeof *t; i++) ((uint8_t*)t)[i] = ((const uint8_t*)k)[i];
+        spin_unlock_irqrestore(&g_con_lock, f);
+        if (cmd == TCSETSF || cmd == TCSETSF2) vc_in_flush(v);
+        fd_readiness_changed(NULL);
+        return 0;
+    }
+    case TIOCGWINSZ: {
+        int rows = 24, cols = 80;
+        vc_cells(v, &rows, &cols);
+        uint16_t ws[4] = { (uint16_t)rows, (uint16_t)cols, 0, 0 };
+        for (int i = 0; i < 4; i++) { ((uint8_t*)k)[2 * i] = (uint8_t)ws[i]; ((uint8_t*)k)[2 * i + 1] = (uint8_t)(ws[i] >> 8); }
+        return 0;
+    }
+    case TIOCSWINSZ: return 0;                         /* the console's size is its window's */
+    case TIOCGPGRP: case TIOCGSID: {
+        /* no sessions on a console: the caller is in the foreground */
+        int g = cmd == TIOCGPGRP ? (me && me->pgid ? me->pgid : (me ? me->pid : 1))
+                                 : (me && me->sid ? me->sid : (me ? me->pid : 1));
+        w32(k, (uint32_t)pg_vnr(me, g));
+        return 0;
+    }
+    case TIOCSPGRP: return 0;
+    case FIONREAD:  w32(k, (uint32_t)vc_in_count(v)); return 0;
+    case TIOCOUTQ:  w32(k, 0); return 0;
+    case TCFLSH:    if (val == 0 || val == 2) vc_in_flush(v); return 0;
+    case TCXONC: case TCSBRK: case TCSBRKP: case TIOCEXCL: case TIOCNXCL: return 0;
+    case TIOCSCTTY: case TIOCNOTTY: return 0;
+    default: return -E_NOTTY;
+    }
 }

@@ -1794,7 +1794,9 @@ static long h_ioctl(struct abi_ctx* c) {
     case 0x5450u: return fd_set_cloexec(fd, 0) == 0 ? 0 : -9;   /* FIONCLEX */
     default: break;
     }
-    if (!o || o->kind != FD_PTY) return -ABI_ENOTTY;
+    /* §M90 rung 6 — the console (an empty 0/1/2, or a dup of it) is a terminal too */
+    int console = !o || o->kind == FD_CONSOLE;
+    if (!console && o->kind != FD_PTY) return -ABI_ENOTTY;
     int dir = 0;
     int sz = tty_ioctl_size(cmd, &dir);
     if (sz < 0) return -ABI_ENOTTY;
@@ -1805,7 +1807,7 @@ static long h_ioctl(struct abi_ctx* c) {
         for (int i = 0; i < sz; i++) k[i] = ((const uint8_t*)(uintptr_t)arg)[i];
     }
     if (sz && dir == 1 && !abi_user_w_ok(arg, (size_t)sz)) return -ABI_EFAULT;
-    long r = tty_ioctl(o, cmd, k, arg);
+    long r = console ? tty_console_ioctl(cmd, k, arg) : tty_ioctl(o, cmd, k, arg);
     if (r >= 0 && sz && dir == 1)
         for (int i = 0; i < sz; i++) ((uint8_t*)(uintptr_t)arg)[i] = k[i];
     return r;

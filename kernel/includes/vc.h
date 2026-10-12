@@ -47,6 +47,7 @@ enum vc_split_dir {
 };
 
 #include "waitq.h"                      /* §M49 — blocking vc_getchar */
+#include "vt.h"                         /* §M90 rung 6 — the escape-sequence parser */
 
 struct vc_node;                         /* opaque to callers */
 struct task;                            /* fwd */
@@ -77,7 +78,24 @@ struct vc {
      * through the same hook.  Offscreen VCs have leaf == NULL. */
     void (*emit)(void* ctx, char c);
     void*             emit_ctx;
+    /* §M90 rung 6 — APPENDED.  Output goes through the VT100 subset (vt.h)
+     * when `vtops` is set: the framebuffer panes set their own, a GUI terminal
+     * window sets gterm's; an offscreen VC without one still gets raw bytes. */
+    struct vt               vt;
+    const struct vt_ops*    vtops;
+    void*                   vtctx;
 };
+/* §M90 rung 6 — the console as a terminal (tty.c): what is waiting in the
+ * input ring (copied, not waited for), a wait for input that a signal or a
+ * kill ends (0 = input is there, -1 = interrupted), the size in cells, and
+ * how many bytes are buffered. */
+int  vc_read_nb(struct vc* v, char* buf, int n);
+int  vc_wait_input(struct vc* v);
+void vc_cells(struct vc* v, int* rows, int* cols);
+int  vc_in_count(struct vc* v);
+void vc_in_flush(struct vc* v);
+/* §M90 rung 6 — the tty layer's per-console state is dropped with the VC. */
+void tty_console_forget(struct vc* v);
 
 /* Bring up the VC subsystem.  Creates the root VC covering the whole FB,
  * marks it focused, and disables the legacy fb_sink so kprintf no

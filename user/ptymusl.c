@@ -218,6 +218,24 @@ int main(void) {
         umount("/tmp/ptsi");
         printf("pty: devpts instance - ptmx inode 2 (5:2, magic 1cd1), pts/0 inode 3 (136:0), name gone with the master\n");
     }
+    /* the console is a terminal too: isatty, a size, raw mode times out */
+    {
+        if (!isatty(1)) return fail("the console (stdout) is not a terminal");
+        struct winsize cw;
+        if (ioctl(1, TIOCGWINSZ, &cw) != 0 || cw.ws_row == 0 || cw.ws_col == 0) return fail("the console's size");
+        struct termios ct, cr;
+        if (tcgetattr(0, &ct) != 0) return fail("tcgetattr on the console");
+        cr = ct; cfmakeraw(&cr); cr.c_cc[VMIN] = 0; cr.c_cc[VTIME] = 1;
+        if (tcsetattr(0, TCSANOW, &cr) != 0) return fail("raw mode on the console");
+        long c0 = ms_now();
+        int cn = (int)read(0, buf, sizeof buf);
+        long cd = ms_now() - c0;
+        tcsetattr(0, TCSANOW, &ct);
+        struct termios back;
+        tcgetattr(0, &back);
+        if (cn != 0 || cd < 50 || !(back.c_lflag & ICANON)) { printf("pty: console raw read %d after %ld ms\n", cn, cd); return fail("the console's raw read / restore"); }
+        printf("pty: console - a terminal of %dx%d, raw read timed out after %ld ms, cooked again\n", cw.ws_col, cw.ws_row, cd);
+    }
     printf("pty: PASS\n");
     return 0;
 }

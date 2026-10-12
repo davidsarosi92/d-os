@@ -329,7 +329,8 @@ void gui_outputs_layout(struct gfx_surface* fb);   /* gui.c — primary fb in, d
 void gui_outputs_primary_only(void);
 int  gui_panel_strip_build(void);
 void apply_outputs_change(void);                   /* gui_mode.c — a queued re-arrangement */
-extern int  gmax_cols, gmax_rows;      /* terminal grid capacity, in cells    */
+extern int  gmax_cols, gmax_rows;
+extern const struct vt_ops gterm_vt_ops;      /* §M90 rung 6 — gterm.c */      /* terminal grid capacity, in cells    */
 extern volatile int need_frame;
 extern const struct desktop_shell* shell;
 

@@ -67,6 +67,14 @@ void tty_init(void);
  * leaves the old one. */
 void tty_task_exit(struct task* t);
 
+/* The console (a VC) as a terminal: termios, raw reads, size (tty.c). */
+int  tty_console_cooked(void);                  /* 1 = the shell's cooked reader applies */
+struct vc;
+int  tty_vc_raw(struct vc* v);                  /* a program holds it raw: send key sequences */
+long tty_console_read(void* buf, size_t n, int block);
+int  tty_console_readable(void);
+long tty_console_ioctl(unsigned cmd, void* kbuf, unsigned long val);
+
 /* Linux pgrp signal delivery (lnx_signal.c): `sig` to every process of group
  * `pgid` (global numbering, 0 = the boot group).  `check` = the caller's
  * permission applies (kill), else it is the kernel's own signal (a tty's ^C).

@@ -37,6 +37,7 @@
 
 #include "display.h"          /* §M88 */
 #include "gui_priv.h"
+#include "tty.h"       /* §M90 rung 6 — raw consoles get key sequences */
 #include "gui.h"
 #include "gui_internal.h"
 #include "gui_app.h"
@@ -996,6 +997,28 @@ int gui_raw_key(uint8_t keycode, uint8_t mods) {
                     term_sel_dirty = tw;
                 need_frame = 1;
                 return 1;
+            }
+
+            /* §M90 rung 6 — a program holding the terminal RAW (a container's
+             * shell under `docker run -it`, an editor) gets the editing keys
+             * as a Linux terminal sends them.  Only then: the d-os shell's own
+             * cooked reader would print these bytes as text. */
+            if (tw->vc && tty_vc_raw(tw->vc)) {
+                const char* seq = NULL;
+                switch (keycode) {
+                case KC_UP:     seq = "\x1b[A";  break;
+                case KC_DOWN:   seq = "\x1b[B";  break;
+                case KC_RIGHT:  seq = "\x1b[C";  break;
+                case KC_LEFT:   seq = "\x1b[D";  break;
+                case KC_HOME:   seq = "\x1b[H";  break;
+                case KC_END:    seq = "\x1b[F";  break;
+                case KC_INSERT: seq = "\x1b[2~"; break;
+                case KC_DELETE: seq = "\x1b[3~"; break;
+                case KC_PGUP:   seq = "\x1b[5~"; break;
+                case KC_PGDN:   seq = "\x1b[6~"; break;
+                default: break;
+                }
+                if (seq) { for (; *seq; seq++) vc_kbd_push_to(tw->vc, *seq); return 1; }
             }
 
             /* Anything else TYPED means the user is done reading history: snap

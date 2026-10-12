@@ -41,6 +41,7 @@
 
 #include "klog.h"
 #include "vc.h"
+#include "lnx_signal.h"   /* §M90 rung 6 — a signal ends a wait for input */
 #include "splash.h"
 #include "fd.h"                       /* fd_readiness_signal (§M56) */
 #include "task.h"
@@ -156,11 +157,9 @@ static void repaint_all(void) {
  * tabs either).
  * --------------------------------------------------------------------------- */
 
-void vc_putchar(struct vc* v, char c) {
-    if (!v) return;
-    /* M22: offscreen VCs render through their emit hook (GUI terminal
-     * window), never through the FB cell grid. */
-    if (v->emit) { v->emit(v->emit_ctx, c); return; }
+/* The framebuffer pane renderer: one byte at the cursor (no escapes here —
+ * vt.c has taken them out already). */
+static void pane_put(struct vc* v, char c) {
     if (!v->leaf) return;
     /* While the GUI compositor owns the screen, leaf VCs go dark: their
      * shells keep running (output is simply dropped) but they must not
@@ -168,6 +167,11 @@ void vc_putchar(struct vc* v, char c) {
     if (screen_suppressed) return;
     struct vc_node* n = v->leaf;
 
+    if (c == '\f') {
+        fb_clear_cells(n->x, n->y, n->w, n->h, v->bg);
+        v->cur_col = 0; v->cur_row = 0;
+        return;
+    }
     if (c == '\n') {
         v->cur_col = 0;
         if (++v->cur_row >= n->h) {
@@ -184,6 +188,7 @@ void vc_putchar(struct vc* v, char c) {
         }
         return;
     }
+    if ((unsigned char)c < 0x20) return;          /* other controls draw nothing */
 
     fb_draw_glyph_at(n->x + v->cur_col, n->y + v->cur_row, c, v->fg, v->bg);
     v->cur_col++;
@@ -194,6 +199,41 @@ void vc_putchar(struct vc* v, char c) {
             v->cur_row = n->h - 1;
         }
     }
+}
+
+/* §M90 rung 6 — the pane's side of the VT100 subset.  A pane keeps no cell
+ * store (it draws straight into the framebuffer), so it cannot SHIFT what is
+ * on a line: insert/delete-character are consumed there, the GUI terminal
+ * window (gterm.c) performs them. */
+static void pv_put(void* x, char c) { pane_put((struct vc*)x, c); }
+static void pv_get(void* x, int* r, int* c) { struct vc* v = x; *r = v->cur_row; *c = v->cur_col; }
+static void pv_set(void* x, int r, int c) { struct vc* v = x; v->cur_row = r; v->cur_col = c; }
+static void pv_dims(void* x, int* r, int* c) {
+    struct vc* v = x;
+    *r = v->leaf ? v->leaf->h : 24;
+    *c = v->leaf ? v->leaf->w : 80;
+}
+static void pv_erase(void* x, int row, int c0, int c1) {
+    struct vc* v = x;
+    if (!v->leaf || screen_suppressed) return;
+    struct vc_node* n = v->leaf;
+    for (int c = c0; c < c1 && c < n->w; c++) fb_draw_glyph_at(n->x + c, n->y + row, ' ', v->fg, v->bg);
+}
+static void pv_reply(void* x, const char* s) { for (; *s; s++) vc_kbd_push_to((struct vc*)x, *s); }
+static const struct vt_ops pane_vt_ops = {
+    .put = pv_put, .get_cursor = pv_get, .set_cursor = pv_set, .dims = pv_dims,
+    .erase = pv_erase, .shift = NULL, .reply = pv_reply,
+};
+
+void vc_putchar(struct vc* v, char c) {
+    if (!v) return;
+    /* §M90 rung 6 — through the VT100 subset when the VC has a renderer for
+     * it (every pane, every GUI terminal window) */
+    if (v->vtops) { vt_feed(&v->vt, c, v->vtops, v->vtctx); return; }
+    /* M22: offscreen VCs render through their emit hook (GUI terminal
+     * window), never through the FB cell grid. */
+    if (v->emit) { v->emit(v->emit_ctx, c); return; }
+    pane_put(v, c);
 }
 
 void vc_clear(struct vc* v) {
@@ -230,6 +270,8 @@ static struct vc* vc_alloc_new(void) {
     v->in_tail = 0;
     waitq_init(&v->inq);                /* §M49 — readers park, they don't spin */
     vcs[vc_n++] = v;
+    vt_init(&v->vt);
+    v->vtops = &pane_vt_ops; v->vtctx = v;          /* §M90 rung 6 */
     return v;
 }
 
@@ -483,6 +525,34 @@ char vc_getchar(struct vc* v) {
 /* See vc.h: readable means a whole LINE is available, because that is what a
  * cooked read will consume.  Scanning the ring costs a few dozen byte
  * comparisons and is only done from poll/epoll, never per keystroke. */
+/* §M90 rung 6 — the console as a terminal: tty.c's primitives. */
+int vc_read_nb(struct vc* v, char* buf, int n) {
+    if (!v) return 0;
+    int k = 0;
+    while (k < n && v->in_tail != v->in_head) {
+        buf[k++] = v->in_buf[v->in_tail];
+        v->in_tail = (v->in_tail + 1) & VC_INBUF_MASK;
+    }
+    return k;
+}
+int vc_in_count(struct vc* v) { return v ? (int)((v->in_head - v->in_tail) & VC_INBUF_MASK) : 0; }
+void vc_in_flush(struct vc* v) { if (v) v->in_tail = v->in_head; }
+int vc_wait_input(struct vc* v) {
+    if (!v) return -1;
+    struct task* me = task_current();
+    uint32_t fl = waitq_lock(&v->inq);
+    while (v->in_head == v->in_tail) {
+        if (task_should_stop() || (me && lnx_sig_deliverable(me))) { waitq_unlock(&v->inq, fl); return -1; }
+        waitq_block(&v->inq);
+    }
+    waitq_unlock(&v->inq, fl);
+    return 0;
+}
+void vc_cells(struct vc* v, int* rows, int* cols) {
+    *rows = 24; *cols = 80;
+    if (v && v->vtops && v->vtops->dims) v->vtops->dims(v->vtctx, rows, cols);
+}
+
 int vc_can_read_line(struct vc* v) {
     if (!v) return 0;
     uint32_t head = v->in_head, tail = v->in_tail;
@@ -536,6 +606,7 @@ struct vc* vc_create_offscreen(void (*emit)(void* ctx, char c), void* ctx) {
     if (!v) return NULL;
     v->emit     = emit;
     v->emit_ctx = ctx;
+    v->vtops    = NULL;      /* §M90 rung 6 — raw until the owner installs a renderer */
     /* No leaf: this VC lives outside the split tree.  vc_kbd_push and
      * vc_getchar work unchanged because they only touch the ring. */
     return v;
@@ -546,6 +617,7 @@ int  vc_screen_suppressed(void) { return screen_suppressed; }
 
 void vc_destroy(struct vc* v) {
     if (!v || v->leaf) return;              /* pane VCs are not destroyable */
+    tty_console_forget(v);                  /* §M90 rung 6 — its termios go with it */
     /* Keep the IRQ side (vc_kbd_push / vc_focus_by_id) from touching a
      * dying VC: fix `focused` first, then compact the table.  Same
      * preempt_disable discipline as the split-tree mutations; the

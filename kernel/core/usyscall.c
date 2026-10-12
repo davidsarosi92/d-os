@@ -439,6 +439,10 @@ static long stdin_read_line(char* buf, size_t cap) {
 long sys_read_k(int fd, void* buf, size_t n) {
     struct ofile* o = fd_lookup(fd);
     if (!o || o->kind == FD_CONSOLE) {
+        /* §M90 rung 6 — a console a program put into raw mode (or echo off)
+         * reads through the terminal layer; the cooked default is unchanged */
+        if ((o || fd == 0) && !tty_console_cooked())
+            return tty_console_read(buf, n, o ? !o->nonblock : 1);
         if (o || fd == 0) return stdin_read_line((char*)buf, n);   /* cooked stdin */
         return -1;                       /* console out is not readable */
     }
@@ -1397,6 +1401,7 @@ uint32_t fd_readiness_of(int fd, struct ofile* o) {
     uint32_t r = 0;
 
     if (o && o->kind == FD_CONSOLE) {           /* §M73 — a dup of the console */
+        if (!tty_console_cooked()) return (tty_console_readable() ? POLLIN : 0) | POLLOUT;  /* §M90 rung 6 — raw */
         struct vc* v = vc_focused();
         if (v && vc_can_read_line(v)) r |= POLLIN;
         return r | POLLOUT;
@@ -1408,6 +1413,7 @@ uint32_t fd_readiness_of(int fd, struct ofile* o) {
          * the caller's read(2) would then block until Enter anyway — a poll
          * that lies about which reads will not block is the one thing a poll
          * must never do. */
+        if (!tty_console_cooked()) return tty_console_readable() ? POLLIN : 0;   /* §M90 rung 6 — raw */
         struct vc* v = vc_focused();
         if (v && vc_can_read_line(v)) r |= POLLIN;
         return r;

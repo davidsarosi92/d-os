@@ -1505,6 +1505,8 @@ struct gui_window* term_window_create(const char* title,
     }
 
     win->vc = vc_create_offscreen(gterm_emit, win);
+    /* §M90 rung 6 — its output goes through the VT100 subset (vt.h) */
+    if (win->vc) { vt_init(&win->vc->vt); win->vc->vtops = &gterm_vt_ops; win->vc->vtctx = win; }
     if (!win->vc) {
         gfx_surface_free(&win->surf);
         kfree(win->cells);
