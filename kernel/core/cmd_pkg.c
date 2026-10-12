@@ -270,8 +270,14 @@ static int is_linux_elf(const uint8_t* img, size_t len, const char* real) {
 }
 
 int shell_run_from_path(const char* line) {
-    /* Arguments, with "double quoted" words kept together. */
-    static char pool[1024];
+    /* Arguments as a POSIX shell splits them (§M90 rung 6): 'single quotes'
+     * keep everything literal, "double quotes" keep spaces (a backslash
+     * escapes " \ $ ` in them), and outside quotes a backslash escapes the
+     * next character.  Only double quotes were honoured, so
+     * `docker run … sh -c 'cat a; echo b'` reached the program split at every
+     * space ("unterminated quoted string").  The pool is the CALL's: a static
+     * one was shared by every shell (pane, terminal window) running at once. */
+    char pool[1024];
     const char* argv[32];
     int argc = 0, used = 0;
     const char* p = line;
@@ -279,10 +285,14 @@ int shell_run_from_path(const char* line) {
         while (*p == ' ') p++;
         if (!*p) break;
         argv[argc++] = pool + used;
-        int q = 0;
+        char q = 0;                                  /* the quote we are inside */
         while (*p && (q || *p != ' ')) {
-            if (*p == '"') { q = !q; p++; continue; }
-            if (used < (int)sizeof pool - 2) pool[used++] = *p;
+            char c = *p;
+            if (!q && (c == '"' || c == '\'')) { q = c; p++; continue; }
+            if (q && c == q) { q = 0; p++; continue; }
+            if (c == '\\' && q != '\'' && p[1] &&
+                (!q || p[1] == '"' || p[1] == '\\' || p[1] == '$' || p[1] == '`')) { p++; c = *p; }
+            if (used < (int)sizeof pool - 2) pool[used++] = c;
             p++;
         }
         pool[used++] = 0;

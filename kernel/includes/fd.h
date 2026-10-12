@@ -111,6 +111,9 @@ struct ofile* ofile_from_packet(struct pktsock* s);   /* §M90 — takes ownersh
  * what makes it safe to compare the result against a remembered pointer
  * (§M56.2's readiness memo) rather than dereferencing the remembered one. */
 struct ofile* fd_lookup(int fd);
+/* §M90 rung 6 — the same WITH a reference the caller drops (ofile_unref): for a
+ * call that may block on the descriptor while another thread closes it. */
+struct ofile* fd_get(int fd);
 
 /* §M89 — a descriptor table SHARED by the threads of one process (Linux's
  * CLONE_FILES).  A task without threads keeps its own inline table and never

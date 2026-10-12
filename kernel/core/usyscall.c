@@ -241,6 +241,28 @@ struct ofile* fd_lookup(int fd) {
     return t->fds[fd];
 }
 
+/* §M90 rung 6 — the open file description behind `fd` WITH a reference, for a
+ * call that may BLOCK on it (Linux's fget).  fd_lookup's bare pointer is safe
+ * only while nothing can close the descriptor under the caller, and a thread
+ * parked in epoll_wait or a read is exactly when another thread can: the
+ * close freed the object, the waiter woke into freed memory — a dockerd
+ * epoll set freed this way left a CPU spinning on a garbage lock word while
+ * holding the readiness queue, and every poller on the machine stopped
+ * (`docker run -v v1:/v ...`, aarch64).  The caller drops it (ofile_unref);
+ * a close that happens meanwhile only removes the NUMBER, the object lives
+ * until the call is done. */
+static uint32_t fdt_lock(struct task* t);
+static void     fdt_unlock(struct task* t, uint32_t fl);
+struct ofile* fd_get(int fd) {
+    struct task* t = task_current();
+    if (!t || fd < 0 || fd >= TASK_MAX_FDS) return NULL;
+    uint32_t fl = fdt_lock(t);
+    struct ofile* o = t->fds[fd];
+    if (o) ofile_ref(o);
+    fdt_unlock(t, fl);
+    return o;
+}
+
 /* ---- §M89: the shared descriptor table (contract in fd.h) ----------------- */
 struct fdtable {
     int           refs;
@@ -333,10 +355,16 @@ static long netsock_write(struct netsock* ns, const void* buf, size_t n);
 static long netsock_read (struct netsock* ns, void* buf, size_t n);
 
 /* Core: `buf` is always KERNEL memory (see the *_k note in syscall.h). */
+static long sys_write_ref(int fd, struct ofile* wo, const void* buf, size_t n);
 long sys_write_k(int fd, const void* buf, size_t n) {
+    struct ofile* o = fd_get(fd);             /* §M90 rung 6 — held while it may block */
+    long r = sys_write_ref(fd, o, buf, n);
+    if (o) ofile_unref(o);
+    return r;
+}
+static long sys_write_ref(int fd, struct ofile* wo, const void* buf, size_t n) {
     /* A REDIRECTED std stream is just an ofile; the console is what a slot with
      * nothing in it means. */
-    struct ofile* wo = fd_lookup(fd);
     if (((fd == 1 || fd == 2) && !wo) || (wo && wo->kind == FD_CONSOLE)) {
         const char* s = (const char*)buf;
         /* §M43: also capture into the task's buffer if one is set (Editor
@@ -359,8 +387,8 @@ long sys_write_k(int fd, const void* buf, size_t n) {
             me->cap_buf[me->cap_len] = '\0';
         return (long)n;
     }
-    if (fd == 0) return -1;                    /* can't write stdin */
-    struct ofile* o = fd_lookup(fd);
+    if (fd == 0 && !wo) return -1;             /* can't write stdin */
+    struct ofile* o = wo;
     if (!o) return -1;
     if (o->kind == FD_VFS)  return (long)vfs_write(o->file, buf, n);
     /* §M90 — a STREAM write: blocks while the peer is full (EAGAIN when
@@ -436,8 +464,14 @@ static long stdin_read_line(char* buf, size_t cap) {
 }
 
 /* Core: `buf` is always KERNEL memory (see the *_k note in syscall.h). */
+static long sys_read_ref(int fd, struct ofile* o, void* buf, size_t n);
 long sys_read_k(int fd, void* buf, size_t n) {
-    struct ofile* o = fd_lookup(fd);
+    struct ofile* o = fd_get(fd);             /* §M90 rung 6 — held while it may block */
+    long r = sys_read_ref(fd, o, buf, n);
+    if (o) ofile_unref(o);
+    return r;
+}
+static long sys_read_ref(int fd, struct ofile* o, void* buf, size_t n) {
     if (!o || o->kind == FD_CONSOLE) {
         /* §M90 rung 6 — a console a program put into raw mode (or echo off)
          * reads through the terminal layer; the cooked default is unchanged */
@@ -1764,13 +1798,15 @@ int sys_epoll_ctl_u(int epfd, int op, int fd, const uint64_t* ev) {
 
 /* `out` is a KERNEL array of 2*maxevents u64s: (events, data) per slot. */
 int sys_epoll_wait_k(int epfd, uint64_t* out, int maxevents, int timeout_ms) {
-    struct ofile* o = fd_lookup(epfd);
-    if (!o || o->kind != FD_EPOLL) return -9;
-    if (!out || maxevents <= 0 || maxevents > 256) return -22;
+    struct ofile* o = fd_get(epfd);                      /* §M90 rung 6 — see fd_get */
+    if (!o) return -9;
+    if (o->kind != FD_EPOLL) { ofile_unref(o); return -9; }
+    if (!out || maxevents <= 0 || maxevents > 256) { ofile_unref(o); return -22; }
 
     struct epoll_ev* evs = (struct epoll_ev*)kmalloc(sizeof(*evs) * (size_t)maxevents);
-    if (!evs) return -12;                                /* -ENOMEM */
+    if (!evs) { ofile_unref(o); return -12; }            /* -ENOMEM */
     int n = epoll_wait_obj(o->ep, evs, maxevents, timeout_ms);
+    ofile_unref(o);
     for (int i = 0; i < n && i < maxevents; i++) {
         out[i * 2 + 0] = evs[i].events;
         out[i * 2 + 1] = evs[i].data;

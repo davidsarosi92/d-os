@@ -22,6 +22,8 @@
 #include <sys/statfs.h>
 #include <sys/mount.h>
 #include <sys/sysmacros.h>
+#include <sys/epoll.h>
+#include <pthread.h>
 
 static int fail(const char* what) { printf("pty: FAIL - %s (errno %d)\n", what, errno); return 1; }
 
@@ -63,6 +65,13 @@ static int open_pair(int* pm, int* ps, char* name, int cap, int noctty) {
     *pm = m; *ps = s;
     return 0;
 }
+
+/* a close by another thread while this one is blocked on the descriptor */
+static int g_epfd, g_pr, g_pw;
+static volatile int g_ep_ret = 99, g_rd_ret = 99;
+static char g_rdbuf[16];
+static void* ep_waiter(void* a) { (void)a; struct epoll_event ev; g_ep_ret = epoll_wait(g_epfd, &ev, 1, 1500); return NULL; }
+static void* rd_waiter(void* a) { (void)a; g_rd_ret = (int)read(g_pr, g_rdbuf, sizeof g_rdbuf); return NULL; }
 
 int main(void) {
     char name[64], buf[256];
@@ -235,6 +244,34 @@ int main(void) {
         tcgetattr(0, &back);
         if (cn != 0 || cd < 50 || !(back.c_lflag & ICANON)) { printf("pty: console raw read %d after %ld ms\n", cn, cd); return fail("the console's raw read / restore"); }
         printf("pty: console - a terminal of %dx%d, raw read timed out after %ld ms, cooked again\n", cw.ws_col, cw.ws_row, cd);
+    }
+    /* a descriptor closed under a call blocked on it: the object lives until
+     * the call ends (Linux's fget) — it used to be freed under the waiter */
+    {
+        int fds[2];
+        g_epfd = epoll_create1(0);
+        if (g_epfd < 0 || pipe(fds) != 0) return fail("epoll_create1/pipe");
+        g_pr = fds[0]; g_pw = fds[1];
+        struct epoll_event ev = { EPOLLIN, { 0 } };
+        epoll_ctl(g_epfd, EPOLL_CTL_ADD, g_pr, &ev);
+        pthread_t a, b;
+        pthread_create(&a, NULL, ep_waiter, NULL);
+        pthread_create(&b, NULL, rd_waiter, NULL);
+        usleep(200000);
+        close(g_epfd);                                   /* under the epoll_wait */
+        close(g_pr);                                     /* under the read: its ONLY fd */
+        for (int i = 0; i < 32; i++) {                   /* churn the heap */
+            int e = epoll_create1(0), q[2];
+            if (pipe(q) == 0) { close(q[0]); close(q[1]); }
+            if (e >= 0) close(e);
+        }
+        write(g_pw, "late", 4);
+        pthread_join(b, NULL);
+        pthread_join(a, NULL);
+        close(g_pw);
+        if (g_rd_ret != 4 || memcmp(g_rdbuf, "late", 4)) { printf("pty: read after close gave %d\n", g_rd_ret); return fail("a read blocked on a pipe whose fd another thread closed"); }
+        if (g_ep_ret != 0 && g_ep_ret != 1) { printf("pty: epoll_wait after close gave %d\n", g_ep_ret); return fail("an epoll_wait whose set another thread closed"); }
+        printf("pty: a close under a blocked read / epoll_wait - the read got its data, the wait ended (%d)\n", g_ep_ret);
     }
     printf("pty: PASS\n");
     return 0;
