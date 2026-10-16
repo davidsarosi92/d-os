@@ -6,7 +6,21 @@ the higher half); the whole suite — run, networking, `-it`, build, volumes,
 `app install`, the guide is docs/INSTALLING.md (docs/TELEPITES.md).  Details:
 DOCS §4.120 and the change log.
 
-Next, by the agreed order (memory: project_dos_milestone_order): §M91 (the ABI
+**NEXT STEP (decided 2026-10-16):**
+1. **NEXT #14 — the occasional `pthread_join` hang.**  It reproduced 3 times in
+   26 runs in the first series (i386 -smp 4, `pthreadtest` x12 per boot: the
+   main thread joined thread 0 and hung joining thread 1, which had printed
+   "done"), and 0 times in the next 72.  The state of the tasks AT the hang has
+   not been captured yet.  Recipe: /tmp/pj2.sh-shaped loop — boots of 12
+   `pthreadtest`s with `--monitor-cmd "serial ps"` after them (the serial
+   channel answers while the shell is stuck in the excursion), stop at the
+   first boot with fewer than 12 `returned` lines.
+2. **The terminal's alternate screen** (`CSI ?1049h/l`, ?47, ?1047 — what vim
+   and less use) and **TIOCPKT**.  Note for the alternate screen: the VC pane
+   renderer keeps NO cell store (it draws straight into the framebuffer), so it
+   needs one or a pixel save of its region; gterm has a cell store.
+
+Then, by the agreed order (memory: project_dos_milestone_order): §M91 (the ABI
 as its own project) and §M92 (driver engine) are recorded, not scheduled;
 §M94 (package installation up to building a git repository into native d-os
 code) is recorded, not scheduled; §M84 (phone) only when asked.
