@@ -366,7 +366,9 @@ long sys_write_k(int fd, const void* buf, size_t n) {
 static long sys_write_ref(int fd, struct ofile* wo, const void* buf, size_t n) {
     /* A REDIRECTED std stream is just an ofile; the console is what a slot with
      * nothing in it means. */
-    if (((fd == 1 || fd == 2) && !wo) || (wo && wo->kind == FD_CONSOLE)) {
+    /* 2026-10-16 — fd 0 too: the three default slots are ONE terminal opened
+     * read-write (as on Linux), and programs do write to stdin's terminal. */
+    if (((fd >= 0 && fd <= 2) && !wo) || (wo && wo->kind == FD_CONSOLE)) {
         const char* s = (const char*)buf;
         /* §M43: also capture into the task's buffer if one is set (Editor
          * "Compile & Run" reads it back), leaving room for a NUL terminator. */
@@ -388,7 +390,6 @@ static long sys_write_ref(int fd, struct ofile* wo, const void* buf, size_t n) {
             me->cap_buf[me->cap_len] = '\0';
         return (long)n;
     }
-    if (fd == 0 && !wo) return -1;             /* can't write stdin */
     struct ofile* o = wo;
     if (!o) return -1;
     if (o->kind == FD_VFS)  return (long)vfs_write(o->file, buf, n);
@@ -483,10 +484,15 @@ static long sys_read_ref(int fd, struct ofile* o, void* buf, size_t n) {
     if (!o || o->kind == FD_CONSOLE) {
         /* §M90 rung 6 — a console a program put into raw mode (or echo off)
          * reads through the terminal layer; the cooked default is unchanged */
-        if ((o || fd == 0) && !tty_console_cooked())
+        /* 2026-10-16 — fds 1 and 2 READ the console too.  The default slots
+         * are one terminal opened read-write; busybox `less`, finding no
+         * /dev/tty (a container has none), reads its keys from stdout — as
+         * less(1) itself does — and got -1 here, so it drew its first page
+         * and never answered a key. */
+        if ((o || fd <= 2) && !tty_console_cooked())
             return tty_console_read(buf, n, o ? !o->nonblock : 1);
-        if (o || fd == 0) return stdin_read_line((char*)buf, n);   /* cooked stdin */
-        return -1;                       /* console out is not readable */
+        if (o || fd <= 2) return stdin_read_line((char*)buf, n);   /* cooked */
+        return -1;
     }
     if (o->kind == FD_VFS)  return (long)vfs_read(o->file, buf, n);
     /* Sockets read(2) with POSIX blocking semantics (block == 1): an empty
@@ -1449,20 +1455,18 @@ uint32_t fd_readiness_of(int fd, struct ofile* o) {
         if (v && vc_can_read_line(v)) r |= POLLIN;
         return r | POLLOUT;
     }
-    if (fd == 0 && !o) {
+    if (fd >= 0 && fd <= 2 && !o) {      /* 2026-10-16 — one read-write terminal */
         /* stdin is COOKED (stdin_read_line blocks until Enter), so it becomes
          * readable when a whole LINE is buffered, not when a byte is.  Saying
          * "readable" on the first keystroke would be worse than saying nothing:
          * the caller's read(2) would then block until Enter anyway — a poll
          * that lies about which reads will not block is the one thing a poll
          * must never do. */
-        if (!tty_console_cooked()) return tty_console_readable() ? POLLIN : 0;   /* §M90 rung 6 — raw */
+        if (!tty_console_cooked()) return (tty_console_readable() ? POLLIN : 0) | POLLOUT;   /* §M90 rung 6 — raw */
         struct vc* v = vc_focused();
         if (v && vc_can_read_line(v)) r |= POLLIN;
-        return r;
+        return r | POLLOUT;                     /* and always writable */
     }
-    if ((fd == 1 || fd == 2) && !o)
-        return POLLOUT;                         /* console out: always writable */
 
     /* POLLNVAL is the honest answer for a descriptor that is not open, and it
      * is reported unrequested: a loop watching an fd it has already closed

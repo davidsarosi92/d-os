@@ -32,8 +32,20 @@
  *   VREPRINT reprints; ECHO/ECHOE/ECHOK/ECHOKE/ECHONL/ECHOCTL as specified;
  *   non-canonical reads honour VMIN and VTIME (VTIME is measured in steps of
  *   10 ms, a tenth of its unit).  NOT here, said plainly: parity/break
- *   handling, IUCLC/OLCUC/XCASE, IMAXBEL's bell, delays, and TIOCPKT packet
- *   mode (refused).
+ *   handling, IUCLC/OLCUC/XCASE, IMAXBEL's bell, delays, and EXTPROC (so
+ *   TIOCPKT_IOCTL is never reported).
+ *
+ * PACKET MODE (TIOCPKT, 2026-10-16) — what `script`, telnetd/sshd-style
+ * servers and terminal multiplexers use to learn about the slave's flow
+ * control and flushes through the master.  With it on, every master read
+ * begins with a status byte: 0 (TIOCPKT_DATA) followed by data, or a single
+ * byte of event bits accumulated since the last read — FLUSHREAD (the slave's
+ * input was discarded), FLUSHWRITE (its output was), STOP / START (output was
+ * stopped or resumed: VSTOP/VSTART, IXANY, tcflow), NOSTOP / DOSTOP (the
+ * slave's IXON-with-^S/^Q state changed, so the master knows whether to do
+ * flow control locally).  Pending events make the master readable and
+ * POLLPRI, as on Linux; events take precedence over data.  TIOCGPKT reads the
+ * mode back.  Both are master-only (ENOTTY on a slave).
  *
  * HANGUP (Linux's rules, which the copy loops depend on):
  *   - the last MASTER close hangs the slave up: the session leader gets SIGHUP
@@ -152,6 +164,8 @@ struct tty {
     uint16_t        rq[RQ_SIZE];    uint32_t rhead, rcount, lines;
     uint8_t         oq[OQ_SIZE];    uint32_t ohead, ocount;
     int             lnext, stopped, locked, excl, hung;
+    int             pkt;            /* TIOCPKT on (the master's packet mode)   */
+    uint8_t         pkt_status;     /* TIOCPKT_* events not yet read           */
     int             master_open, slave_open, slave_ever;
     int             pins;           /* releases in progress: no free under them */
     int             session, pgrp;  /* global ids; 0 = none                   */
@@ -271,6 +285,34 @@ static uint32_t rq_avail(const struct tty* p) {
 /* One byte from the master into the slave's line discipline.  Returns 0
  * consumed, 1 no room (the writer waits), and sets *sig when it must signal
  * the foreground group. */
+/* ---- packet mode (TIOCPKT) -------------------------------------------------------- */
+#define PKT_FLUSHREAD  0x01
+#define PKT_FLUSHWRITE 0x02
+#define PKT_STOP       0x04
+#define PKT_START      0x08
+#define PKT_NOSTOP     0x10
+#define PKT_DOSTOP     0x20
+/* Record an event for the master (wq lock held).  STOP and START cancel each
+ * other, as do NOSTOP and DOSTOP — only the latest state is news. */
+static void pkt_event(struct tty* p, uint8_t ev) {
+    if (!p->pkt) return;
+    if (ev & PKT_STOP)   p->pkt_status &= (uint8_t)~PKT_START;
+    if (ev & PKT_START)  p->pkt_status &= (uint8_t)~PKT_STOP;
+    if (ev & PKT_DOSTOP) p->pkt_status &= (uint8_t)~PKT_NOSTOP;
+    if (ev & PKT_NOSTOP) p->pkt_status &= (uint8_t)~PKT_DOSTOP;
+    p->pkt_status |= ev;
+}
+/* Output stops or resumes — every place `stopped` changes goes through here. */
+static void set_stopped(struct tty* p, int on) {
+    if (p->stopped == on) return;
+    p->stopped = on;
+    pkt_event(p, on ? PKT_STOP : PKT_START);
+}
+/* Does the slave do ^S/^Q flow control itself (Linux's DOSTOP test)? */
+static int does_stop(const struct ktermios* t) {
+    return (t->c_iflag & T_IXON) && t->c_cc[VSTOP] == 0x13 && t->c_cc[VSTART] == 0x11;
+}
+
 static int ldisc_receive(struct tty* p, uint8_t c, int* sig) {
     uint32_t i = p->t.c_iflag, l = p->t.c_lflag;
     int canon = (l & T_ICANON) != 0;
@@ -288,14 +330,14 @@ static int ldisc_receive(struct tty* p, uint8_t c, int* sig) {
         if (i & T_ICRNL) c = '\n';
     } else if (c == '\n' && (i & T_INLCR)) c = '\r';
     if (i & T_IXON) {
-        if (is_cc(p, VSTOP, c)) { p->stopped = 1; return 0; }
-        if (is_cc(p, VSTART, c)) { p->stopped = 0; return 0; }
-        if (p->stopped && (i & T_IXANY)) p->stopped = 0;
+        if (is_cc(p, VSTOP, c)) { set_stopped(p, 1); return 0; }
+        if (is_cc(p, VSTART, c)) { set_stopped(p, 0); return 0; }
+        if (p->stopped && (i & T_IXANY)) set_stopped(p, 0);
     }
     if (l & T_ISIG) {
         int s = is_cc(p, VINTR, c) ? 2 : is_cc(p, VQUIT, c) ? 3 : is_cc(p, VSUSP, c) ? 20 : 0;
         if (s) {
-            if (!(l & T_NOFLSH)) { rq_flush(p); p->ocount = 0; }
+            if (!(l & T_NOFLSH)) { rq_flush(p); p->ocount = 0; pkt_event(p, PKT_FLUSHREAD | PKT_FLUSHWRITE); }
             echo_char(p, c);
             *sig = s;
             return 0;
@@ -720,15 +762,26 @@ static long master_read(struct tty* p, uint8_t* buf, size_t n, int block) {
     struct task* me = task_current();
     uint32_t f = waitq_lock(&p->wq);
     for (;;) {
+        /* packet mode: an event is one byte of its own, ahead of any data */
+        if (p->pkt && p->pkt_status) {
+            buf[0] = p->pkt_status;
+            p->pkt_status = 0;
+            waitq_unlock(&p->wq, f);
+            fd_readiness_changed(NULL);
+            return 1;
+        }
         if (p->ocount) {
-            size_t k = p->ocount < n ? p->ocount : n;
-            for (size_t i = 0; i < k; i++) buf[i] = p->oq[(p->ohead + i) % OQ_SIZE];
+            size_t off = p->pkt ? 1 : 0;                 /* TIOCPKT_DATA first */
+            size_t room = n - off;
+            size_t k = p->ocount < room ? p->ocount : room;
+            if (off) buf[0] = 0;
+            for (size_t i = 0; i < k; i++) buf[off + i] = p->oq[(p->ohead + i) % OQ_SIZE];
             p->ohead = (p->ohead + (uint32_t)k) % OQ_SIZE;
             p->ocount -= (uint32_t)k;
             waitq_wake_all(&p->wq);                      /* a slave writer has room */
             waitq_unlock(&p->wq, f);
             fd_readiness_changed(NULL);
-            return (long)k;
+            return (long)(off + k);
         }
         if (p->slave_ever && !p->slave_open) { waitq_unlock(&p->wq, f); return -E_IO; }
         if (!block) { waitq_unlock(&p->wq, f); return -E_AGAIN; }
@@ -795,6 +848,7 @@ uint32_t tty_readiness(struct ofile* o) {
     uint32_t f = waitq_lock(&p->wq);
     if (o->tty_side == TTY_MASTER) {
         if (p->ocount) r |= POLLIN;
+        if (p->pkt && p->pkt_status) r |= POLLIN | POLLPRI;   /* TIOCPKT event */
         if (p->slave_ever && !p->slave_open) r |= POLLHUP | POLLIN;
         if (p->rcount < RQ_SIZE - 1) r |= POLLOUT;
     } else {
@@ -841,6 +895,7 @@ uint32_t tty_readiness(struct ofile* o) {
 #define TIOCGDEV    0x80045432u
 #define TIOCVHANGUP 0x5437u
 #define TIOCGPTLCK  0x80045439u
+#define TIOCGPKT    0x80045438u
 #define TIOCGEXCL   0x80045440u
 #define TIOCGPTPEER 0x5441u
 #define TIOCGLCKTRMIOS 0x5456u
@@ -852,7 +907,7 @@ int tty_ioctl_size(unsigned cmd, int* dir) {
     case TCGETS2:                                       *dir = 1; return 44;
     case TIOCGWINSZ:                                    *dir = 1; return 8;
     case TIOCGPTN: case TIOCGPTLCK: case TIOCGDEV: case TIOCGPGRP: case TIOCGSID:
-    case FIONREAD: case TIOCOUTQ: case TIOCGEXCL:       *dir = 1; return 4;
+    case FIONREAD: case TIOCOUTQ: case TIOCGEXCL: case TIOCGPKT: *dir = 1; return 4;
     case TCSETS: case TCSETSW: case TCSETSF: case TIOCSLCKTRMIOS: *dir = 2; return 36;
     case TCSETS2: case TCSETSW2: case TCSETSF2:         *dir = 2; return 44;
     case TIOCSWINSZ:                                    *dir = 2; return 8;
@@ -903,12 +958,14 @@ long tty_ioctl(struct ofile* o, unsigned cmd, void* k, unsigned long val) {
         uint32_t f = waitq_lock(&p->wq);
         struct ktermios* t = master ? &p->mt : &p->t;
         int was_canon = (t->c_lflag & T_ICANON) != 0;
+        int was_dostop = does_stop(t);
         for (unsigned i = 0; i < sizeof *t; i++) ((uint8_t*)t)[i] = ((const uint8_t*)k)[i];
         if (!master) {
             int canon = (t->c_lflag & T_ICANON) != 0;
-            if (cmd == TCSETSF || cmd == TCSETSF2) rq_flush(p);
+            if (cmd == TCSETSF || cmd == TCSETSF2) { rq_flush(p); pkt_event(p, PKT_FLUSHREAD); }
             else if (canon != was_canon) rq_recount(p);
-            if (!(t->c_iflag & T_IXON)) p->stopped = 0;
+            if (!(t->c_iflag & T_IXON)) set_stopped(p, 0);
+            if (does_stop(t) != was_dostop) pkt_event(p, does_stop(t) ? PKT_DOSTOP : PKT_NOSTOP);
         }
         waitq_wake_all(&p->wq);
         waitq_unlock(&p->wq, f);
@@ -945,10 +1002,18 @@ long tty_ioctl(struct ofile* o, unsigned cmd, void* k, unsigned long val) {
         return 0;
     case TIOCSLCKTRMIOS:
         return me && cred_capable(&me->cred, 21) ? 0 : -E_PERM;   /* accepted, not enforced */
-    case TIOCPKT:
-        if (r32(k) == 0) return 0;
-        kprintf("tty: TIOCPKT (packet mode) refused - not implemented\n");
-        return -E_INVAL;
+    case TIOCPKT: {                                    /* packet mode, the master's */
+        if (!master) return -E_NOTTY;
+        uint32_t f = waitq_lock(&p->wq);
+        p->pkt = r32(k) != 0;
+        p->pkt_status = 0;                             /* a fresh start, as Linux */
+        waitq_unlock(&p->wq, f);
+        return 0;
+    }
+    case TIOCGPKT:
+        if (!master) return -E_NOTTY;
+        w32(k, (uint32_t)p->pkt);
+        return 0;
     case TIOCSTI:
         return -E_IO;                                  /* as Linux with legacy_tiocsti off */
     case FIONREAD: {
@@ -973,6 +1038,8 @@ long tty_ioctl(struct ofile* o, unsigned cmd, void* k, unsigned long val) {
         if (master) { int t = in; in = out; out = t; }   /* the master's input is the slave's output */
         if (in) rq_flush(p);
         if (out) p->ocount = 0;
+        /* reported from the SLAVE's side: its input is FLUSHREAD */
+        pkt_event(p, (uint8_t)((in ? PKT_FLUSHREAD : 0) | (out ? PKT_FLUSHWRITE : 0)));
         waitq_wake_all(&p->wq);
         waitq_unlock(&p->wq, f);
         fd_readiness_changed(NULL);
@@ -980,8 +1047,9 @@ long tty_ioctl(struct ofile* o, unsigned cmd, void* k, unsigned long val) {
     }
     case TCXONC: {
         uint32_t f = waitq_lock(&p->wq);
-        if (val == 0) p->stopped = 1;                  /* TCOOFF */
-        else if (val == 1) p->stopped = 0;             /* TCOON  */
+        if (val == 0) set_stopped(p, 1);               /* TCOOFF */
+        else if (val == 1) set_stopped(p, 0);          /* TCOON  */
+        if (val <= 1) fd_readiness_changed(NULL);      /* the master may have an event */
         waitq_wake_all(&p->wq);
         waitq_unlock(&p->wq, f);
         return val <= 3 ? 0 : -E_INVAL;

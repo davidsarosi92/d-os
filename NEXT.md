@@ -12,12 +12,12 @@ selector) in three preemptible steps, and CLONE_PARENT_SETTID was stored after
 the child could run (all arches).  180/180 runs after, a hang in 3 boots of 6
 before.  Diagnostics kept: `ps` (`futex <addr> want <v>`, `ctid`), `futex [kick]`.
 
-**NEXT STEP:** **the terminal's alternate screen** (`CSI ?1049h/l`, ?47, ?1047 —
-what vim and less use) and **TIOCPKT**.  Note for the alternate screen: the VC
-pane renderer keeps NO cell store (it draws straight into the framebuffer), so
-it needs one or a pixel save of its region; gterm has a cell store.
+**Alternate screen + scroll regions + TIOCPKT — DONE (2026-10-16, DOCS §4.122).**
+vim/less-style full-screen programs work on the framebuffer pane (new cell
+store) and in GUI terminals; busybox `less` runs in a container; `ptytest`
+covers TIOCPKT.
 
-Then, by the agreed order (memory: project_dos_milestone_order): §M91 (the ABI
+**NEXT STEP: not decided — ask.**  Then, by the agreed order (memory: project_dos_milestone_order): §M91 (the ABI
 as its own project) and §M92 (driver engine) are recorded, not scheduled;
 §M94 (package installation up to building a git repository into native d-os
 code) is recorded, not scheduled; §M84 (phone) only when asked.
@@ -25,9 +25,6 @@ code) is recorded, not scheduled; §M84 (phone) only when asked.
 Small items still open:
 - `/var/lib/docker` lives in memory (exFAT cannot hold overlay layers) — a
   documented limit; closing it means a Linux-capable filesystem on the disk.
-- TIOCPKT and the terminal's alternate screen are not implemented.
-- i386 has no musl `sh`/coreutils in its store (`pkgrun sh` → not installed):
-  the artifacts are absent for that arch, not a kernel defect.
 
 # Where things stand (2026-09-28)
 

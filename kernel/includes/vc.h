@@ -84,6 +84,12 @@ struct vc {
     struct vt               vt;
     const struct vt_ops*    vtops;
     void*                   vtctx;
+    /* 2026-10-16 — APPENDED.  A pane's cell store (vc.c: character + packed
+     * rendition per cell, drawn from), the rendition new cells get, and the
+     * main screen kept aside while the alternate screen is shown. */
+    uint32_t*               cell;
+    uint32_t                cur_attr;
+    uint32_t*               alt_keep;
 };
 /* §M90 rung 6 — the console as a terminal (tty.c): what is waiting in the
  * input ring (copied, not waited for), a wait for input that a signal or a

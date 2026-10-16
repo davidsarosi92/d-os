@@ -96,6 +96,9 @@ static int             next_id   = 1;
 /* M22: while non-zero, leaf VCs skip FB rendering and Alt-N focus
  * switching is disabled — the GUI compositor owns the screen. */
 static volatile int    screen_suppressed = 0;
+/* 2026-10-16 — every pane's cell store has the screen's geometry (see the
+ * cell store section below). */
+static int g_store_stride, g_store_rows;
 
 /* ---------------------------------------------------------------------------
  * Layout pass — recursively assign rects to every node.
@@ -142,7 +145,13 @@ static void repaint_all(void) {
         struct vc_node* n = stack[--sp];
         if (n->kind == VCNODE_LEAF) {
             fb_clear_cells(n->x, n->y, n->w, n->h, VC_BG);
-            if (n->vc) { n->vc->cur_col = 0; n->vc->cur_row = 0; }
+            if (n->vc) {
+                n->vc->cur_col = 0; n->vc->cur_row = 0;
+                /* the cell store follows the screen: the pane is blank now */
+                if (n->vc->cell)
+                    for (int i = 0; i < g_store_stride * g_store_rows; i++)
+                        n->vc->cell[i] = ' ';
+            }
         } else {
             stack[sp++] = n->a;
             stack[sp++] = n->b;
@@ -158,25 +167,128 @@ static void repaint_all(void) {
  * tabs either).
  * --------------------------------------------------------------------------- */
 
+/* ---------------------------------------------------------------------------
+ * THE PANE'S CELL STORE (2026-10-16).
+ *
+ * A pane used to draw straight into the framebuffer and remember nothing, so
+ * it could not shift a line (insert/delete character), move part of the screen
+ * (a scroll region, insert/delete lines) or put a screen back (the alternate
+ * screen vim and less switch to) — all of which need to know what is on the
+ * screen.  Now every cell is one 32-bit word: the character in the low byte,
+ * its rendition above it (the same packing gterm.c uses: foreground and
+ * background as palette index + 1, 0 = default; bold; reverse), and the
+ * framebuffer is drawn FROM the store.  Fixed geometry — the whole screen's
+ * cell count with the screen's width as stride — so a pane resize never
+ * reallocates (a layout change clears the pane anyway, see repaint_all).
+ * 144 KiB per pane at 1920x1200, allocated on a pane's first output.
+ * While the GUI owns the screen the store keeps being written and nothing is
+ * drawn, so leaving the GUI repaints the shell as it is (vc_screen_suppress).
+ * --------------------------------------------------------------------------- */
+#define PA_FG(a)   ((int)((a) & 0x1FF) - 1)
+#define PA_BG(a)   ((int)(((a) >> 9) & 0x1FF) - 1)
+#define PA_BOLD    (1u << 18)
+#define PA_REV     (1u << 19)
+#define PA_BGMASK  (0x1FFu << 9)
+
+/* Allocated when the VC gets its pane (node_alloc_leaf, task context); the
+ * lazy path here only covers a pane created before the framebuffer size was
+ * known.  Never from the output path's first byte if it can be helped: output
+ * can come from contexts that should not allocate. */
+static uint32_t* pane_store(struct vc* v) {
+    if (v->cell) return v->cell;
+    if (!g_store_stride) { g_store_stride = fb_cell_cols(); g_store_rows = fb_cell_rows(); }
+    if (g_store_stride <= 0 || g_store_rows <= 0) return NULL;
+    v->cell = (uint32_t*)kcalloc((size_t)g_store_stride * g_store_rows, sizeof(uint32_t));
+    return v->cell;
+}
+static inline uint32_t* pcell(struct vc* v, int r, int c) {
+    return v->cell + (size_t)r * g_store_stride + c;
+}
+static uint32_t pane_blank(const struct vc* v) { return ' ' | ((v->cur_attr & PA_BGMASK) << 8); }
+static void pane_colors(uint32_t a, uint32_t* fg, uint32_t* bg) {
+    int f = PA_FG(a), b = PA_BG(a);
+    if ((a & PA_BOLD) && f >= 0 && f < 8) f += 8;          /* bold = bright */
+    uint32_t F = f < 0 ? VC_FG : 0xFF000000u | vt_rgb(f);
+    uint32_t B = b < 0 ? VC_BG : 0xFF000000u | vt_rgb(b);
+    if (a & PA_REV) { uint32_t t = F; F = B; B = t; }
+    *fg = F; *bg = B;
+}
+/* Draw one cell from the store (nothing while the GUI owns the screen). */
+static void pane_draw(struct vc* v, int r, int c) {
+    if (screen_suppressed || !v->leaf || !v->cell) return;
+    struct vc_node* n = v->leaf;
+    if (r < 0 || c < 0 || r >= n->h || c >= n->w) return;
+    uint32_t w = *pcell(v, r, c), fg, bg;
+    pane_colors(w >> 8, &fg, &bg);
+    char ch = (char)(w & 0xFF);
+    fb_draw_glyph_at(n->x + c, n->y + r, ch ? ch : ' ', fg, bg);
+}
+static void pane_draw_rows(struct vc* v, int r0, int r1) {
+    if (screen_suppressed || !v->leaf) return;
+    for (int r = r0; r <= r1; r++)
+        for (int c = 0; c < v->leaf->w; c++) pane_draw(v, r, c);
+}
+static void pane_set(struct vc* v, int r, int c, uint32_t w) {
+    if (!pane_store(v)) return;
+    if (r < 0 || c < 0 || r >= g_store_rows || c >= g_store_stride) return;
+    *pcell(v, r, c) = w;
+    pane_draw(v, r, c);
+}
+/* Blank the whole pane, in the store and (when it is ours) on screen. */
+static void pane_wipe(struct vc* v) {
+    if (pane_store(v))
+        for (int i = 0; i < g_store_stride * g_store_rows; i++) v->cell[i] = pane_blank(v);
+    if (!screen_suppressed && v->leaf) {
+        uint32_t fg, bg; pane_colors(v->cur_attr, &fg, &bg);
+        fb_clear_cells(v->leaf->x, v->leaf->y, v->leaf->w, v->leaf->h, bg);
+    }
+}
+/* Rows top..bot by n (n > 0 up), blanks entering at the freed edge.  One row
+ * up over the whole width is a pixel move (fb_scroll_cells_up); everything
+ * else is redrawn from the store, which is correct for any shape. */
+static void pane_scroll(struct vc* v, int top, int bot, int n) {
+    if (!v->leaf || !pane_store(v) || !n) return;
+    int h = v->leaf->h, w = v->leaf->w;
+    if (top < 0) top = 0;
+    if (bot >= h) bot = h - 1;
+    if (top > bot) return;
+    int span = bot - top + 1, k = n > 0 ? n : -n;
+    if (k > span) k = span;
+    uint32_t blank = pane_blank(v);
+    if (n > 0) {
+        for (int r = top; r <= bot; r++)
+            for (int c = 0; c < w; c++)
+                *pcell(v, r, c) = (r + k <= bot) ? *pcell(v, r + k, c) : blank;
+    } else {
+        for (int r = bot; r >= top; r--)
+            for (int c = 0; c < w; c++)
+                *pcell(v, r, c) = (r - k >= top) ? *pcell(v, r - k, c) : blank;
+    }
+    if (screen_suppressed) return;
+    if (n == 1) {
+        uint32_t fg, bg; pane_colors(blank >> 8, &fg, &bg);
+        fb_scroll_cells_up(v->leaf->x, v->leaf->y + top, w, span, bg);
+        pane_draw_rows(v, bot, bot);
+    } else {
+        pane_draw_rows(v, top, bot);
+    }
+}
+
 /* The framebuffer pane renderer: one byte at the cursor (no escapes here —
  * vt.c has taken them out already). */
 static void pane_put(struct vc* v, char c) {
     if (!v->leaf) return;
-    /* While the GUI compositor owns the screen, leaf VCs go dark: their
-     * shells keep running (output is simply dropped) but they must not
-     * paint over the windows. */
-    if (screen_suppressed) return;
     struct vc_node* n = v->leaf;
 
     if (c == '\f') {
-        fb_clear_cells(n->x, n->y, n->w, n->h, v->bg);
+        pane_wipe(v);
         v->cur_col = 0; v->cur_row = 0;
         return;
     }
     if (c == '\n') {
         v->cur_col = 0;
         if (++v->cur_row >= n->h) {
-            fb_scroll_cells_up(n->x, n->y, n->w, n->h, v->bg);
+            pane_scroll(v, 0, n->h - 1, 1);
             v->cur_row = n->h - 1;
         }
         return;
@@ -185,27 +297,24 @@ static void pane_put(struct vc* v, char c) {
     if (c == '\b') {
         if (v->cur_col > 0) {
             v->cur_col--;
-            fb_draw_glyph_at(n->x + v->cur_col, n->y + v->cur_row, ' ', v->fg, v->bg);
+            pane_set(v, v->cur_row, v->cur_col, pane_blank(v));
         }
         return;
     }
     if ((unsigned char)c < 0x20) return;          /* other controls draw nothing */
 
-    fb_draw_glyph_at(n->x + v->cur_col, n->y + v->cur_row, c, v->fg, v->bg);
+    pane_set(v, v->cur_row, v->cur_col, (unsigned char)c | (v->cur_attr << 8));
     v->cur_col++;
     if (v->cur_col >= n->w) {
         v->cur_col = 0;
         if (++v->cur_row >= n->h) {
-            fb_scroll_cells_up(n->x, n->y, n->w, n->h, v->bg);
+            pane_scroll(v, 0, n->h - 1, 1);
             v->cur_row = n->h - 1;
         }
     }
 }
 
-/* §M90 rung 6 — the pane's side of the VT100 subset.  A pane keeps no cell
- * store (it draws straight into the framebuffer), so it cannot SHIFT what is
- * on a line: insert/delete-character are consumed there, the GUI terminal
- * window (gterm.c) performs them. */
+/* §M90 rung 6 — the pane's side of the VT100 subset, over the cell store. */
 static void pv_put(void* x, char c) { pane_put((struct vc*)x, c); }
 static void pv_get(void* x, int* r, int* c) { struct vc* v = x; *r = v->cur_row; *c = v->cur_col; }
 static void pv_set(void* x, int r, int c) { struct vc* v = x; v->cur_row = r; v->cur_col = c; }
@@ -216,25 +325,55 @@ static void pv_dims(void* x, int* r, int* c) {
 }
 static void pv_erase(void* x, int row, int c0, int c1) {
     struct vc* v = x;
-    if (!v->leaf || screen_suppressed) return;
-    struct vc_node* n = v->leaf;
-    for (int c = c0; c < c1 && c < n->w; c++) fb_draw_glyph_at(n->x + c, n->y + row, ' ', v->fg, v->bg);
+    if (!v->leaf) return;
+    for (int c = c0 < 0 ? 0 : c0; c < c1 && c < v->leaf->w; c++) pane_set(v, row, c, pane_blank(v));
+}
+/* insert (n > 0) blanks / delete (n < 0) characters at `col` on `row` */
+static void pv_shift(void* x, int row, int col, int n) {
+    struct vc* v = x;
+    if (!v->leaf || !pane_store(v) || row < 0 || row >= v->leaf->h || col < 0) return;
+    int w = v->leaf->w;
+    uint32_t* rr = pcell(v, row, 0), blank = pane_blank(v);
+    if (n > 0) for (int c = w - 1; c >= col; c--) rr[c] = (c - n >= col) ? rr[c - n] : blank;
+    else { int k = -n; for (int c = col; c < w; c++) rr[c] = (c + k < w) ? rr[c + k] : blank; }
+    for (int c = col; c < w; c++) pane_draw(v, row, c);
 }
 static void pv_reply(void* x, const char* s) { for (; *s; s++) vc_kbd_push_to((struct vc*)x, *s); }
-/* §M90 — SGR on a pane: it draws straight into the framebuffer, so the
- * rendition is simply the colour pair the next glyphs (and erases) use.
- * Bold shows a basic colour (0-7) as its bright form, as terminals do. */
+/* §M90 — SGR: the rendition the next cells are stored with. */
 static void pv_attr(void* x, int fg, int bg, int bold, int rev) {
     struct vc* v = x;
-    if (bold && fg >= 0 && fg < 8) fg += 8;
-    uint32_t f = fg == VT_DEFAULT ? VC_FG : 0xFF000000u | vt_rgb(fg);
-    uint32_t b = bg == VT_DEFAULT ? VC_BG : 0xFF000000u | vt_rgb(bg);
-    if (rev) { uint32_t t = f; f = b; b = t; }
+    v->cur_attr = (fg == VT_DEFAULT && bg == VT_DEFAULT && !bold && !rev) ? 0
+                : (uint32_t)(fg + 1) | ((uint32_t)(bg + 1) << 9) | (bold ? PA_BOLD : 0) | (rev ? PA_REV : 0);
+    uint32_t f, b; pane_colors(v->cur_attr, &f, &b);
     v->fg = f; v->bg = b;
+}
+static void pv_lines(void* x, int row, int n) {
+    struct vc* v = x;
+    if (v->leaf) pane_scroll(v, row, v->leaf->h - 1, -n);
+}
+static void pv_scroll(void* x, int top, int bot, int n) { pane_scroll((struct vc*)x, top, bot, n); }
+/* The alternate screen: the main screen's cells are kept aside (a copy of the
+ * store) and the pane is blanked; leaving puts the copy back and redraws. */
+static void pv_alt(void* x, int on) {
+    struct vc* v = x;
+    if (!pane_store(v)) return;
+    size_t n = (size_t)g_store_stride * g_store_rows;
+    if (on) {
+        if (!v->alt_keep) v->alt_keep = (uint32_t*)kmalloc(n * sizeof(uint32_t));
+        if (!v->alt_keep) return;                  /* no memory: draw over, as before */
+        for (size_t i = 0; i < n; i++) v->alt_keep[i] = v->cell[i];
+        pane_wipe(v);
+    } else if (v->alt_keep) {
+        for (size_t i = 0; i < n; i++) v->cell[i] = v->alt_keep[i];
+        kfree(v->alt_keep);
+        v->alt_keep = NULL;
+        if (v->leaf) pane_draw_rows(v, 0, v->leaf->h - 1);
+    }
 }
 static const struct vt_ops pane_vt_ops = {
     .put = pv_put, .get_cursor = pv_get, .set_cursor = pv_set, .dims = pv_dims,
-    .erase = pv_erase, .shift = NULL, .reply = pv_reply, .attr = pv_attr,
+    .erase = pv_erase, .shift = pv_shift, .reply = pv_reply, .attr = pv_attr,
+    .lines = pv_lines, .scroll = pv_scroll, .altscreen = pv_alt,
 };
 
 void vc_putchar(struct vc* v, char c) {
@@ -252,9 +391,7 @@ void vc_clear(struct vc* v) {
     if (!v) return;
     if (v->emit) { v->emit(v->emit_ctx, '\f'); return; }   /* GUI: form feed */
     if (!v->leaf) return;
-    if (screen_suppressed) return;
-    struct vc_node* n = v->leaf;
-    fb_clear_cells(n->x, n->y, n->w, n->h, v->bg);
+    pane_wipe(v);                       /* the store too, drawn only if ours */
     v->cur_col = 0;
     v->cur_row = 0;
 }
@@ -293,7 +430,7 @@ static struct vc_node* node_alloc_leaf(struct vc_node* parent, struct vc* vc) {
     n->kind   = VCNODE_LEAF;
     n->parent = parent;
     n->vc     = vc;
-    if (vc) vc->leaf = n;
+    if (vc) { vc->leaf = n; (void)pane_store(vc); }   /* 2026-10-16 — its cell store */
     return n;
 }
 
@@ -465,7 +602,13 @@ void vc_kbd_push_to(struct vc* v, char c) {
     uint32_t fl = waitq_lock(&v->inq);
     waitq_wake_all(&v->inq);
     waitq_unlock(&v->inq, fl);
-    if (c == '\n') fd_readiness_signal();
+    /* 2026-10-16 — EVERY byte, not only '\n'.  The end-of-line rule is the
+     * COOKED answer and fd_readiness_of still gives it (a cooked reader is
+     * readable at Enter); but a program that put the console into raw mode
+     * and waits in poll() — busybox `less` does — was never told a key had
+     * arrived and drew its first page forever.  A wake that finds nothing
+     * new costs one re-check. */
+    fd_readiness_signal();
 }
 
 /* §M82 (2026-09-27) — THE CONSOLE BEHIND A DESKTOP IS SEALED while an
@@ -626,7 +769,17 @@ struct vc* vc_create_offscreen(void (*emit)(void* ctx, char c), void* ctx) {
     return v;
 }
 
-void vc_screen_suppress(int on) { screen_suppressed = on ? 1 : 0; }
+/* 2026-10-16 — handing the screen back REPAINTS every pane from its cell
+ * store: the shell comes back showing what it showed (and whatever it printed
+ * while the GUI was up), not whatever the GUI left in the framebuffer. */
+void vc_screen_suppress(int on) {
+    int was = screen_suppressed;
+    screen_suppressed = on ? 1 : 0;
+    if (was && !on)
+        for (int i = 0; i < vc_n; i++)
+            if (vcs[i] && vcs[i]->leaf && vcs[i]->cell && !vcs[i]->emit)
+                pane_draw_rows(vcs[i], 0, vcs[i]->leaf->h - 1);
+}
 int  vc_screen_suppressed(void) { return screen_suppressed; }
 
 void vc_destroy(struct vc* v) {
@@ -646,5 +799,7 @@ void vc_destroy(struct vc* v) {
         }
     }
     preempt_enable();
+    if (v->cell) kfree(v->cell);
+    if (v->alt_keep) kfree(v->alt_keep);
     kfree(v);
 }

@@ -181,6 +181,13 @@ struct gui_window {
      * step with `cells`, and the one new output gets.  NULL/0 = defaults. */
     uint32_t* cattr;
     uint32_t  cur_attr;
+    /* 2026-10-16 — the ALTERNATE SCREEN (?1049, vim/less): the main grid and
+     * its renditions kept aside while it is shown; `alt` set meanwhile, and
+     * then a scroll feeds no history (nothing a full-screen program draws
+     * belongs in the scrollback). */
+    char*     alt_cells;
+    uint32_t* alt_cattr;
+    int       alt;
 
     /* §M58 — SCROLLBACK.  A ring of `sb_cap` rows, each gmax_cols wide; a row
      * evicted by a scroll is pushed here instead of being dropped.  `scrolled`

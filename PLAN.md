@@ -6079,7 +6079,7 @@ down a path nothing tested, so each was built for real; and a credential built
 on an unzeroed stack struct took a seccomp pointer from stack garbage
 (`cred_become_user`), which surfaced as a GPF somewhere else entirely.
 **Open, said:** `/var/lib/docker` is in memory (exFAT cannot hold overlay
-layers); TIOCPKT and the alternate screen are unimplemented.
+layers); TIOCPKT and the alternate screen: done 2026-10-16 (DOCS §4.122).
 
 ## §M91 — The ABI becomes its own project: d-os, Linux and NT over one common language
 

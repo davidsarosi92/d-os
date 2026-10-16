@@ -21,11 +21,21 @@
  * (38;5;n / 48;5;n), direct colour (38;2;r;g;b, kept as the nearest of the
  * 256), bold (shown as the bright variant of a basic colour), reverse, and
  * the defaults (39, 49, 0).  Underline/italic/blink are accepted and not
- * drawn.  Insert/delete lines (L, M) are performed by the GUI terminal (a
- * framebuffer pane keeps no cell store and consumes them).  Scroll regions (r)
- * are accepted and ignored: scrolling is always the whole screen.  An
- * alternate screen (?1049) is not kept; a full-screen program draws over the
- * scrollback. */
+ * drawn.
+ *
+ * FULL-SCREEN PROGRAMS (2026-10-16 — what vim and less need):
+ *   - the SCROLL REGION (CSI t;b r, DECSTBM).  A line feed or ESC D on the
+ *     region's bottom row scrolls the REGION; ESC M (reverse index) on its top
+ *     row scrolls it down — which is how `less` scrolls back one line; insert
+ *     and delete lines (L, M) act inside it; CSI n S / n T scroll it.  Lines
+ *     outside the region never move.  Origin mode (DECOM) is not implemented.
+ *   - the ALTERNATE SCREEN: ?1049 h/l (save the cursor, switch, clear / switch
+ *     back, restore), ?1047 and ?47 (switch only), ?1048 (cursor only).  The
+ *     renderer keeps the main screen aside while the program draws, so leaving
+ *     vim gives back the shell exactly as it was, and nothing a full-screen
+ *     program drew enters the scrollback.
+ * Both renderers keep a cell store for this (the framebuffer pane gained one
+ * for it); `vttest` checks the parser against a test screen. */
 #ifndef VT_H
 #define VT_H
 
@@ -46,6 +56,14 @@ struct vt_ops {
     /* §M90 — APPENDED.  Insert (n > 0) or delete (n < 0) |n| whole lines at
      * `row`; the lines below move down/up, the screen bottom fills blank. */
     void (*lines)(void* ctx, int row, int n);
+    /* 2026-10-16 — APPENDED.  Scroll rows top..bot (inclusive) by n: n > 0
+     * moves the content UP (blank rows enter at `bot`), n < 0 moves it DOWN
+     * (blank rows enter at `top`).  Nothing outside the rows moves, and
+     * nothing goes to the scrollback. */
+    void (*scroll)(void* ctx, int top, int bot, int n);
+    /* 2026-10-16 — APPENDED.  on = 1: keep the screen aside and show a blank
+     * one; on = 0: put the kept screen back exactly (cells and colours). */
+    void (*altscreen)(void* ctx, int on);
 };
 #define VT_DEFAULT (-1)
 /* xterm's 256-colour palette as 0xRRGGBB. */
@@ -56,6 +74,11 @@ struct vt {
     int params[8], np, priv;
     int saved_row, saved_col;
     int fg, bg, bold, reverse;          /* §M90 — the current rendition (SGR) */
+    /* 2026-10-16 — the scroll region (0-based, inclusive; bot < 0 = the whole
+     * screen, so a resize needs no fix-up), and the alternate screen with the
+     * cursor ?1049 saved for it — separate from ESC 7's, as in xterm. */
+    int top, bot;
+    int alt, alt_row, alt_col;
 };
 
 void vt_init(struct vt* v);

@@ -15766,8 +15766,8 @@ docs/TELEPITES.md).  The pieces:
 
 **Limits, said.**  `/var/lib/docker` is in memory: images and containers do
 not survive a reboot (exFAT has no device nodes or xattrs for overlay
-layers); the installed programs do.  TIOCPKT and the alternate screen are not
-implemented.
+layers); the installed programs do.  (TIOCPKT and the alternate screen: done
+2026-10-16, §4.122.)
 
 ### 4.121 NEXT #14 — the pthread_join hang: a thread that ran as another thread (2026-10-16)
 
@@ -15844,7 +15844,73 @@ threadtest, tlstest, forktest, forkexec, pipetest, sigtest, musltest,
 newapitest and isigtest on i386; 6x pthreadtest plus the same set and
 `pkgrun sh -c` on x86_64 and aarch64.
 
+### 4.122 Full-screen programs: the alternate screen, scroll regions, TIOCPKT (2026-10-16)
+
+**Asked for:** the terminal's alternate screen (what vim and less use) and
+TIOCPKT.  The alternate screen alone would not have made vim usable — a
+full-screen program also scrolls PART of the screen (a scroll region) and
+inserts/deletes lines — so all three are here, on both renderers.
+
+**The parser (kernel/core/vt.c, contract in vt.h)** tracks the scroll region
+(`CSI t;b r`, DECSTBM; `bot < 0` = the whole screen, so a resize needs no
+fix-up).  A line feed or ESC D on the region's bottom row scrolls the REGION
+only; ESC M (reverse index) on its top row scrolls it down, which is how `less`
+steps back one line; CSI L / M act inside the region; CSI n S / n T scroll it.
+On the whole-screen region the renderer's own line feed is still used, because
+that is where the scrollback is fed.  Private modes: ?1049 h/l (save the
+cursor, switch, blank / switch back, restore), ?1047 and ?47 (switch only),
+?1048 (cursor only); ESC c leaves the alternate screen.  Two ops were APPENDED
+to `struct vt_ops`: `scroll(top, bot, n)` and `altscreen(on)`.  Origin mode
+(DECOM) is not implemented.
+
+**The framebuffer pane got a CELL STORE (vc.c).**  It drew straight into the
+framebuffer and remembered nothing, so it could not shift a line, move part of
+the screen or put a screen back.  Each cell is one 32-bit word (character + the
+rendition packed as gterm.c packs it), the screen is drawn FROM the store, and
+the store has the screen's full geometry (144 KiB per pane at 1920x1200,
+allocated with the pane).  Insert/delete character (P, @), which panes used to
+consume, now work there too.  While the GUI owns the screen the store keeps
+being written and nothing is drawn; **handing the screen back repaints every
+pane from its store**, so leaving the desktop shows the shell as it was instead
+of what the GUI left in the framebuffer.  **The GUI terminal (gterm.c)** keeps
+the main grid aside (`alt_cells`/`alt_cattr`) while the alternate screen is
+shown, and a scroll there feeds no history and advances no line numbers.
+
+**TIOCPKT (tty.c).**  Packet mode on a pty master: every master read begins
+with a status byte — 0 followed by data, or one byte of the events since the
+last read: FLUSHREAD / FLUSHWRITE (the slave's input / output was flushed:
+TCFLSH, TCSETSF, an ISIG flush), STOP / START (VSTOP/VSTART, IXANY, tcflow —
+every change of `stopped` goes through `set_stopped`), NOSTOP / DOSTOP (the
+slave's IXON-with-^S/^Q state changed).  Pending events make the master
+readable and POLLPRI (new `POLLPRI`); TIOCGPKT reads the mode back; both are
+master-only (ENOTTY on a slave).  EXTPROC/TIOCPKT_IOCTL is not implemented.
+
+**Two console defects found by running the real `less` (busybox, in a
+container):**
+- `less` drew its first page and never answered a key.  With no /dev/tty
+  (a container has none) it reads keys from its STDOUT, as less(1) does, and
+  the default console fds 1/2 were write-only — read returned -1 and poll said
+  POLLOUT only.  The three default slots are now one terminal opened
+  read-write (Linux's shape): all three read, write and poll alike.
+- even then a key never woke it.  `vc_kbd_push_to` signalled poll/epoll
+  waiters only on '\n' — the COOKED rule, applied regardless of mode — so a
+  program in raw mode waiting in poll() was never told.  It signals every byte
+  now; fd_readiness_of still answers the cooked case by the line.
+
+**Verified.**  `vttest` 25/25 (9 new: region LF, RI, IL in the region, S, the
+reset, ?1049h/l, ?47) on all three arches; `vtdemo alt` / `vtdemo back`
+checked BY PICTURE on the framebuffer pane and in a GUI terminal window (status
+lines stay while the region scrolls; the previous screen and cursor come back
+exactly); busybox `less` in a container pages with Space, steps back with `k`,
+quits with `q`; busybox `vi` edits and quits.  `ptytest` (user/ptymusl.c) gained
+a TIOCPKT block — data framing, each event provoked from the slave, POLLPRI,
+TIOCGPKT, ENOTTY on a slave, plain data again with the mode off — PASS on
+i386, x86_64 and aarch64; the same block fails on the previous kernel at its
+first step (TIOCPKT was refused with EINVAL).
+
 ## 8. Change log
+
+- **2026-10-16 — full-screen programs: the alternate screen (?1049/?1047/?47/?1048), scroll regions (DECSTBM, region-aware LF/IND/RI, IL/DL, SU/SD) and TIOCPKT packet mode, on both renderers and all three arches (DOCS §4.122).**  The framebuffer pane gained a cell store (and with it insert/delete character, and a repaint of the shell when the GUI hands the screen back); the GUI terminal keeps the main grid aside.  Found by running busybox `less`: the default console fds 1/2 were write-only (less reads keys from stdout when there is no /dev/tty) and raw-mode keystrokes never woke a poll() — both fixed.  `vttest` 25/25, `ptytest` with a TIOCPKT block PASS everywhere, pictures of `vtdemo alt/back` on the pane and in a GUI terminal.
 
 - **2026-10-16 — NEXT #14 closed: the occasional `pthread_join` hang was a thread running as ANOTHER thread (DOCS §4.121).**  i386 bound a thread's TLS (pin + per-CPU GDT slot + selector) in three preemptible steps, so a migrated thread wrote another CPU's slot and inherited another thread's `%gs`; and on all three arches CLONE_PARENT_SETTID was stored after the child could run, so a fast child locked with tid 0.  Now `x86_tls_bind` (one step, interrupts off), the child's `%gs` passed as an argument instead of the global `g_entry_gs`, and SETTID written before `task_release`.  Also: a kill/signal wake acting on a stale `t->wq`, an excursion leaving its tid word/TLS/pin on the shell, `wget` port parsing.  New diagnostics: `ps` shows `futex <addr> want <v>` and `ctid`, `futex [kick]`.  Measured: 180/180 runs (was a hang in 3 boots of 6).
 

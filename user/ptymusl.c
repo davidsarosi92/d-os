@@ -403,6 +403,52 @@ int main(void) {
         if (!ok) return fail("/proc/stat has no \"cpu\" line");
         printf("pty: /proc/meminfo %d Linux-shaped lines; /proc/stat cpu %llu user %llu idle\n", lines, u, id);
     }
+    /* TIOCPKT — packet mode on the master (2026-10-16).  Every master read
+     * starts with a status byte: 0 + data, or one byte of events.  Each event
+     * is provoked from the SLAVE side and must arrive on the master. */
+    {
+#ifndef TIOCGPKT
+#define TIOCGPKT 0x80045438
+#endif
+        int m, s; char nm[64];
+        if (open_pair(&m, &s, nm, sizeof nm, 1) != 0) return fail("pkt: open a pair");
+        int one = 1, got = -1;
+        if (ioctl(s, TIOCPKT, &one) == 0 || errno != ENOTTY) return fail("pkt: TIOCPKT on a SLAVE must be ENOTTY");
+        if (ioctl(m, TIOCPKT, &one) != 0) return fail("pkt: TIOCPKT on");
+        if (ioctl(m, TIOCGPKT, &got) != 0 || got != 1) return fail("pkt: TIOCGPKT reads the mode back");
+        struct termios t; tcgetattr(s, &t); t.c_oflag &= ~(tcflag_t)OPOST; tcsetattr(s, TCSANOW, &t);
+        unsigned char b[32]; int r;
+        (void)!write(s, "hi", 2);
+        r = (int)read(m, b, sizeof b);
+        if (r != 3 || b[0] != 0 || b[1] != 'h' || b[2] != 'i') return fail("pkt: data comes as 0 + bytes");
+        tcflow(s, TCOOFF);
+        struct pollfd pf = { m, POLLPRI, 0 };
+        if (poll(&pf, 1, 500) != 1 || !(pf.revents & POLLPRI)) return fail("pkt: an event makes the master POLLPRI");
+        r = (int)read(m, b, sizeof b);
+        if (r != 1 || b[0] != 0x04) return fail("pkt: tcflow(TCOOFF) reads as TIOCPKT_STOP");
+        tcflow(s, TCOON);
+        r = (int)read(m, b, sizeof b);
+        if (r != 1 || b[0] != 0x08) return fail("pkt: tcflow(TCOON) reads as TIOCPKT_START");
+        tcflush(s, TCIFLUSH);
+        r = (int)read(m, b, sizeof b);
+        if (r != 1 || b[0] != 0x01) return fail("pkt: tcflush(TCIFLUSH) on the slave reads as FLUSHREAD");
+        tcflush(s, TCOFLUSH);
+        r = (int)read(m, b, sizeof b);
+        if (r != 1 || b[0] != 0x02) return fail("pkt: tcflush(TCOFLUSH) on the slave reads as FLUSHWRITE");
+        t.c_iflag &= ~(tcflag_t)IXON; tcsetattr(s, TCSANOW, &t);
+        r = (int)read(m, b, sizeof b);
+        if (r != 1 || b[0] != 0x10) return fail("pkt: IXON off reads as TIOCPKT_NOSTOP");
+        t.c_iflag |= IXON; tcsetattr(s, TCSANOW, &t);
+        r = (int)read(m, b, sizeof b);
+        if (r != 1 || b[0] != 0x20) return fail("pkt: IXON on (^S/^Q) reads as TIOCPKT_DOSTOP");
+        int zero = 0;
+        if (ioctl(m, TIOCPKT, &zero) != 0) return fail("pkt: TIOCPKT off");
+        (void)!write(s, "ok", 2);
+        r = (int)read(m, b, sizeof b);
+        if (r != 2 || b[0] != 'o') return fail("pkt: off again, data comes plain");
+        close(s); close(m);
+        printf("pty: TIOCPKT data/STOP/START/FLUSHREAD/FLUSHWRITE/NOSTOP/DOSTOP and POLLPRI all as Linux\n");
+    }
     printf("pty: PASS\n");
     return 0;
 }

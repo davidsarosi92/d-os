@@ -142,7 +142,11 @@ static void ga_row_copy(struct gui_window* w, int dst, int src) {
     const uint32_t* s = w->cattr + (size_t)src * gmax_cols;
     for (int c = 0; c < gmax_cols; c++) d[c] = s[c];
 }
+static void gterm_region_scroll_locked(struct gui_window* w, int top, int bot, int n);
 static void gterm_scroll(struct gui_window* win) {
+    /* 2026-10-16 — on the alternate screen a scroll moves the grid and nothing
+     * else: no history, no absolute line numbers advance. */
+    if (win->alt) { gterm_region_scroll_locked(win, 0, win->rows - 1, 1); return; }
     /* §M58 — the line about to be discarded goes into the history first. */
     gterm_sb_push(win, win->cells);
     win->scrolled++;
@@ -334,10 +338,88 @@ static void gv_lines(void* x, int row, int n) {
     spin_unlock(&w->lock);
     gui_damage_win(w);
 }
+/* 2026-10-16 — rows top..bot by n (n > 0 up), blanks in at the freed edge,
+ * those rows redrawn.  Window lock held. */
+static void gterm_region_scroll_locked(struct gui_window* w, int top, int bot, int n) {
+    if (top < 0) top = 0;
+    if (bot >= w->rows) bot = w->rows - 1;
+    if (top > bot || !n) return;
+    int k = n > 0 ? n : -n, span = bot - top + 1;
+    if (k > span) k = span;
+    if (n > 0) {
+        for (int r = top; r <= bot; r++) {
+            char* d = w->cells + (size_t)r * gmax_cols;
+            if (r + k <= bot) {
+                const char* s2 = w->cells + (size_t)(r + k) * gmax_cols;
+                for (int c = 0; c < gmax_cols; c++) d[c] = s2[c];
+                ga_row_copy(w, r, r + k);
+            } else { for (int c = 0; c < gmax_cols; c++) d[c] = 0; ga_row_copy(w, r, -1); }
+        }
+    } else {
+        for (int r = bot; r >= top; r--) {
+            char* d = w->cells + (size_t)r * gmax_cols;
+            if (r - k >= top) {
+                const char* s2 = w->cells + (size_t)(r - k) * gmax_cols;
+                for (int c = 0; c < gmax_cols; c++) d[c] = s2[c];
+                ga_row_copy(w, r, r - k);
+            } else { for (int c = 0; c < gmax_cols; c++) d[c] = 0; ga_row_copy(w, r, -1); }
+        }
+    }
+    /* the blank rows take the current background (BCE), as erase does */
+    if (w->cattr) {
+        int b0 = n > 0 ? bot - k + 1 : top, b1 = n > 0 ? bot : top + k - 1;
+        for (int r = b0; r <= b1; r++)
+            for (int c = 0; c < gmax_cols; c++) w->cattr[(size_t)r * gmax_cols + c] = w->cur_attr & GA_BGMASK;
+    }
+    for (int r = top; r <= bot; r++) {
+        /* a whole row repainted: fill it first so no stale glyph survives */
+        int v = gterm_screen_row(w, w->scrolled + r);
+        if (v >= 0) gfx_fill(&w->surf, PAD, PAD + v * cp_cell_h(), w->cols * cp_cell_w(), cp_cell_h(), COL_WIN_BG);
+        gv_redraw_row(w, r, 0, w->cols);
+    }
+}
+static void gv_scroll(void* x, int top, int bot, int n) {
+    struct gui_window* w = x;
+    spin_lock(&w->lock);
+    gterm_region_scroll_locked(w, top, bot, n);
+    spin_unlock(&w->lock);
+    gui_damage_win(w);
+}
+/* 2026-10-16 — the alternate screen: keep the grid aside (cells and
+ * renditions), show a blank one; leaving puts it back and re-renders.  The
+ * view snaps to the live screen and any selection is dropped — it was made
+ * on the other screen. */
+static void gv_alt(void* x, int on) {
+    struct gui_window* w = x;
+    size_t n = (size_t)gmax_cols * gmax_rows;
+    spin_lock(&w->lock);
+    if (on && !w->alt) {
+        if (!w->alt_cells) w->alt_cells = (char*)kmalloc(n);
+        if (w->cattr && !w->alt_cattr) w->alt_cattr = (uint32_t*)kmalloc(n * sizeof(uint32_t));
+        if (w->alt_cells && (!w->cattr || w->alt_cattr)) {
+            for (size_t i = 0; i < n; i++) { w->alt_cells[i] = w->cells[i]; w->cells[i] = 0; }
+            if (w->cattr) for (size_t i = 0; i < n; i++) { w->alt_cattr[i] = w->cattr[i]; w->cattr[i] = 0; }
+            w->alt = 1;
+            w->view_off = 0;
+            w->sel_on = 0;
+            gterm_rerender_locked(w);
+        }
+    } else if (!on && w->alt) {
+        for (size_t i = 0; i < n; i++) w->cells[i] = w->alt_cells[i];
+        if (w->cattr && w->alt_cattr) for (size_t i = 0; i < n; i++) w->cattr[i] = w->alt_cattr[i];
+        kfree(w->alt_cells); w->alt_cells = NULL;
+        if (w->alt_cattr) { kfree(w->alt_cattr); w->alt_cattr = NULL; }
+        w->alt = 0;
+        w->sel_on = 0;
+        gterm_rerender_locked(w);
+    }
+    spin_unlock(&w->lock);
+    gui_damage_win(w);
+}
 const struct vt_ops gterm_vt_ops = {
     .put = gv_put, .get_cursor = gv_get, .set_cursor = gv_set, .dims = gv_dims,
     .erase = gv_erase, .shift = gv_shift, .reply = gv_reply, .attr = gv_attr,
-    .lines = gv_lines,
+    .lines = gv_lines, .scroll = gv_scroll, .altscreen = gv_alt,
 };
 
 /* §M58 — copy the selected cells out of the backing store into `dst`.

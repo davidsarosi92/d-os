@@ -26,6 +26,85 @@ void vt_init(struct vt* v) {
     for (int i = 0; i < 8; i++) v->params[i] = 0;
     v->fg = v->bg = VT_DEFAULT;
     v->bold = v->reverse = 0;
+    v->top = 0; v->bot = -1;
+    v->alt = 0; v->alt_row = v->alt_col = 0;
+}
+
+/* ---- the scroll region (2026-10-16) ------------------------------------------
+ * `rg` resolves it against the screen as it is NOW: bot < 0, or a region that
+ * no longer fits after a resize, means the whole screen. */
+static void rg(const struct vt* v, int rows, int* t, int* b) {
+    int tt = v->top, bb = v->bot;
+    if (bb < 0 || bb >= rows || tt < 0 || tt >= bb) { tt = 0; bb = rows - 1; }
+    *t = tt; *b = bb;
+}
+static int region_partial(const struct vt* v, int rows) {
+    int t, b; rg(v, rows, &t, &b);
+    return t != 0 || b != rows - 1;
+}
+/* Scroll the region by n (n > 0 up).  A renderer without the scroll op can
+ * still do a whole-screen-to-the-bottom region with its line ops. */
+static void do_scroll(const struct vt_ops* o, void* x, int t, int b, int n, int rows) {
+    if (!n) return;
+    if (o->scroll) { o->scroll(x, t, b, n); return; }
+    if (o->lines && b == rows - 1) o->lines(x, t, -n);
+}
+/* A line feed's movement (ESC D, LF): at the region's bottom the region
+ * scrolls; on the screen's last row outside the region nothing moves (VT100);
+ * otherwise one row down.  `lf` = it came as '\n', which the renderers treat
+ * as CR+LF (their contract), so the full-screen case still goes to put(). */
+static void index_down(struct vt* v, const struct vt_ops* o, void* x, int lf) {
+    int rows = 24, cols = 80, r = 0, c = 0;
+    if (o->dims) o->dims(x, &rows, &cols);
+    if (o->get_cursor) o->get_cursor(x, &r, &c);
+    if (!region_partial(v, rows) || !o->set_cursor) {
+        /* The whole screen: the renderer's own line feed, which is where the
+         * scrollback is fed.  ESC D keeps the column (a '\n' returns it). */
+        o->put(x, '\n');
+        if (!lf && o->set_cursor) {
+            int r2 = 0, c2 = 0;
+            if (o->get_cursor) o->get_cursor(x, &r2, &c2);
+            o->set_cursor(x, r2, c);
+        }
+        return;
+    }
+    int t, b; rg(v, rows, &t, &b);
+    if (r == b) do_scroll(o, x, t, b, 1, rows);
+    else if (r < rows - 1) r++;
+    o->set_cursor(x, r, lf ? 0 : c);
+}
+/* ESC M: at the region's top the region scrolls DOWN (how `less` steps back
+ * a line); elsewhere the cursor moves up, stopping at row 0. */
+static void index_up(struct vt* v, const struct vt_ops* o, void* x) {
+    int rows = 24, cols = 80, r = 0, c = 0;
+    if (o->dims) o->dims(x, &rows, &cols);
+    if (o->get_cursor) o->get_cursor(x, &r, &c);
+    int t, b; rg(v, rows, &t, &b);
+    if (r == t) do_scroll(o, x, t, b, -1, rows);
+    else if (r > 0 && o->set_cursor) o->set_cursor(x, r - 1, c);
+}
+/* ?1049 / ?1047 / ?47 / ?1048 (h = set, l = reset). */
+static void private_mode(struct vt* v, int set, const struct vt_ops* o, void* x) {
+    int rows = 24, cols = 80, r = 0, c = 0;
+    if (o->dims) o->dims(x, &rows, &cols);
+    if (o->get_cursor) o->get_cursor(x, &r, &c);
+    for (int i = 0; i < (v->np ? v->np : 1); i++) {
+        int p = v->np ? v->params[i] : 0;
+        if (p == 1048 || p == 1049) {
+            if (set) { v->alt_row = r; v->alt_col = c; }
+        }
+        if (p == 1049 || p == 1047 || p == 47) {
+            if (set && !v->alt) { v->alt = 1; if (o->altscreen) o->altscreen(x, 1); }
+            else if (!set && v->alt) { v->alt = 0; if (o->altscreen) o->altscreen(x, 0); }
+        }
+        if ((p == 1048 || p == 1049) && !set && o->set_cursor) {
+            int rr = v->alt_row < rows ? v->alt_row : rows - 1;
+            int cc = v->alt_col < cols ? v->alt_col : cols - 1;
+            o->set_cursor(x, rr, cc);
+        }
+        /* everything else (?25 cursor visibility, ?1 cursor keys, ?2004
+         * bracketed paste, ...) is accepted and ignored */
+    }
 }
 
 /* §M90 — xterm's palette: 0-7 the basic colours, 8-15 their bright forms,
@@ -161,10 +240,35 @@ static void csi(struct vt* v, char f, const struct vt_ops* o, void* x) {
     case 'm':                                        /* §M90 — select graphic rendition */
         if (!v->priv) sgr(v, o, x);
         return;
-    case 'L': if (o->lines && !v->priv) o->lines(x, r, n);  return;   /* §M90 — insert lines */
-    case 'M': if (o->lines && !v->priv) o->lines(x, r, -n); return;   /* §M90 — delete lines */
+    case 'L': case 'M': {                            /* insert / delete lines, IN the region */
+        if (v->priv) return;
+        int t, b; rg(v, rows, &t, &b);
+        if (r < t || r > b) return;                  /* outside the region: nothing */
+        if (n > b - r + 1) n = b - r + 1;
+        if (o->scroll) o->scroll(x, r, b, f == 'L' ? -n : n);
+        else if (o->lines && b == rows - 1) o->lines(x, r, f == 'L' ? n : -n);
+        if (o->set_cursor) o->set_cursor(x, r, 0);
+        return;
+    }
+    case 'S': case 'T': {                            /* scroll the region up / down */
+        if (v->priv) return;
+        int t, b; rg(v, rows, &t, &b);
+        do_scroll(o, x, t, b, f == 'S' ? n : -n, rows);
+        return;
+    }
+    case 'r': {                                      /* DECSTBM: the scroll region */
+        if (v->priv) return;
+        int t = arg(v, 0, 1) - 1, b = arg(v, 1, rows) - 1;
+        if (b >= rows) b = rows - 1;
+        if (t < b) { v->top = t; v->bot = (t == 0 && b == rows - 1) ? -1 : b; }
+        r = 0; c = 0;                                /* the cursor goes home */
+        break;
+    }
+    case 'h': case 'l':
+        if (v->priv) private_mode(v, f == 'h', o, x);
+        return;                                      /* ANSI modes (IRM, ...): consumed */
     default:
-        return;                                      /* m h l r t ... consumed */
+        return;                                      /* t ... consumed */
     }
     if (o->set_cursor) o->set_cursor(x, clampi(r, 0, rows - 1), clampi(c, 0, cols - 1));
 }
@@ -185,6 +289,10 @@ void vt_feed(struct vt* v, char ch, const struct vt_ops* o, void* x) {
             }
         }
         if (c == 0x0e || c == 0x0f || c == 0) return;   /* SO / SI / NUL */
+        /* LF and VT are line feeds.  FF is NOT treated as one: '\f' is the
+         * renderers' "clear the screen" (vc_clear, `clear`), so it goes to
+         * put() as it always has. */
+        if (c == '\n' || c == 0x0b) { index_down(v, o, x, c == '\n'); return; }
         o->put(x, (char)c);
         return;
     case ST_ESC:
@@ -198,10 +306,11 @@ void vt_feed(struct vt* v, char ch, const struct vt_ops* o, void* x) {
             if (o->dims) o->dims(x, &rows, &cols);
             if (c == '7') { v->saved_row = r; v->saved_col = col; }
             else if (c == '8') { if (o->set_cursor) o->set_cursor(x, clampi(v->saved_row, 0, rows - 1), clampi(v->saved_col, 0, cols - 1)); }
-            else if (c == 'D') o->put(x, '\n');      /* index: down, scrolling */
-            else if (c == 'E') { o->put(x, '\r'); o->put(x, '\n'); }
-            else if (c == 'M') { if (o->set_cursor && r > 0) o->set_cursor(x, r - 1, col); }
+            else if (c == 'D') index_down(v, o, x, 0);           /* index */
+            else if (c == 'E') { o->put(x, '\r'); index_down(v, o, x, 0); }
+            else if (c == 'M') index_up(v, o, x);                  /* reverse index */
             else if (c == 'c') {                                   /* reset: clear */
+                if (v->alt && o->altscreen) o->altscreen(x, 0);
                 o->put(x, '\f'); vt_init(v);
                 if (o->attr) o->attr(x, VT_DEFAULT, VT_DEFAULT, 0, 0);
             }
@@ -240,7 +349,8 @@ void vt_feed(struct vt* v, char ch, const struct vt_ops* o, void* x) {
 
 #define VR 5
 #define VC 10
-struct vscr { char cell[VR][VC]; int r, c; char reply[32]; int nreply; int fg, bg, bold, rev, nattr; };
+struct vscr { char cell[VR][VC]; int r, c; char reply[32]; int nreply; int fg, bg, bold, rev, nattr;
+               char kept[VR][VC]; int alt; };
 static void vs_put(void* x, char ch) {
     struct vscr* s = x;
     if (ch == '\n') { s->c = 0; if (s->r < VR - 1) s->r++; return; }
@@ -279,8 +389,22 @@ static void vs_lines(void* x, int row, int n) {
     else       { int k = -n; for (int r = row; r < VR; r++) for (int c = 0; c < VC; c++)
                      s->cell[r][c] = (r + k < VR) ? s->cell[r + k][c] : '.'; }
 }
+/* rows top..bot by n: n > 0 up, n < 0 down (the vt.h contract) */
+static void vs_scroll(void* x, int top, int bot, int n) {
+    struct vscr* s = x;
+    if (n > 0) { for (int r = top; r <= bot; r++) for (int c = 0; c < VC; c++)
+                     s->cell[r][c] = (r + n <= bot) ? s->cell[r + n][c] : '.'; }
+    else       { int k = -n; for (int r = bot; r >= top; r--) for (int c = 0; c < VC; c++)
+                     s->cell[r][c] = (r - k >= top) ? s->cell[r - k][c] : '.'; }
+}
+static void vs_alt(void* x, int on) {
+    struct vscr* s = x;
+    if (on) { for (int r = 0; r < VR; r++) for (int c = 0; c < VC; c++) { s->kept[r][c] = s->cell[r][c]; s->cell[r][c] = '.'; } }
+    else    { for (int r = 0; r < VR; r++) for (int c = 0; c < VC; c++) s->cell[r][c] = s->kept[r][c]; }
+    s->alt = on;
+}
 static const struct vt_ops vs_ops = { vs_put, vs_get, vs_set, vs_dims, vs_erase, vs_shift, vs_reply,
-                                      vs_attr, vs_lines };
+                                      vs_attr, vs_lines, vs_scroll, vs_alt };
 
 static int row_is(struct vscr* s, int r, const char* want) {
     for (int c = 0; c < VC; c++) if (s->cell[r][c] != want[c]) return 0;
@@ -330,6 +454,32 @@ static void cmd_vttest(const char* args) {
        "insert a line (CSI L): the rest moves down");
     feed(&v, &s, "\x1b[1;1H\x1b[2M");
     VT(s.cell[0][0] == '2' && s.cell[1][0] == '3' && s.cell[4][0] == '.', "delete two lines (CSI 2M): the rest moves up");
+    /* 2026-10-16 — the scroll region and the alternate screen (vim, less). */
+    feed(&v, &s, "\x1b[2J\x1b[1;1HA\x1b[2;1HB\x1b[3;1HC\x1b[4;1HD\x1b[5;1HE");
+    feed(&v, &s, "\x1b[2;4r");
+    VT(s.r == 0 && s.c == 0, "setting a region (CSI 2;4 r) homes the cursor");
+    feed(&v, &s, "\x1b[4;1H\n");
+    VT(s.cell[0][0] == 'A' && s.cell[1][0] == 'C' && s.cell[2][0] == 'D' && s.cell[3][0] == '.' &&
+       s.cell[4][0] == 'E' && s.r == 3, "a line feed on the region's bottom scrolls ONLY the region");
+    feed(&v, &s, "\x1b[2;1H\x1b" "M");
+    VT(s.cell[1][0] == '.' && s.cell[2][0] == 'C' && s.cell[3][0] == 'D' && s.cell[4][0] == 'E' &&
+       s.cell[0][0] == 'A', "reverse index on the region's top scrolls it down (less, one line back)");
+    feed(&v, &s, "\x1b[3;1H\x1b[L");
+    VT(s.cell[2][0] == '.' && s.cell[3][0] == 'C' && s.cell[4][0] == 'E',
+       "insert a line inside the region: the region's bottom line falls off, the line below it stays");
+    feed(&v, &s, "\x1b[2;1HX\x1b[3;1HY\x1b[4;1HZ\x1b[S");
+    VT(s.cell[1][0] == 'Y' && s.cell[2][0] == 'Z' && s.cell[3][0] == '.' && s.cell[4][0] == 'E',
+       "scroll up (CSI S) moves the region");
+    feed(&v, &s, "\x1b[r\x1b[5;1H\n");
+    VT(s.r == 4 && s.cell[4][0] == 'E', "CSI r resets to the whole screen (the renderer's own line feed)");
+    feed(&v, &s, "\x1b[2J\x1b[1;1Hshell$\x1b[1;7H\x1b[?1049h");
+    VT(s.alt && row_is(&s, 0, ".........."), "?1049h: a blank alternate screen");
+    feed(&v, &s, "\x1b[3;3Hvim");
+    feed(&v, &s, "\x1b[?1049l");
+    VT(!s.alt && row_is(&s, 0, "shell$....") && s.cell[2][2] == '.' && s.r == 0 && s.c == 6,
+       "?1049l: the shell's screen and cursor come back, vim's text is gone");
+    feed(&v, &s, "\x1b[?47h\x1b[1;1Hq\x1b[?47l");
+    VT(!s.alt && row_is(&s, 0, "shell$...."), "?47 switches without touching the cursor");
     kprintf("vt: %s\n", ok ? "ALL ok" : "FAIL");
     #undef VT
 }
@@ -339,7 +489,29 @@ SHELL_CMD(vttest) = { "vttest", "", "the VT100 subset against a test screen", SH
  * proven by vttest; this proves a renderer): each line says what it should
  * read as. */
 static void cmd_vtdemo(const char* args) {
-    (void)args;
+    /* 2026-10-16 — `vtdemo alt` enters the alternate screen and draws a
+     * framed page with a scroll region inside it (a status line top and
+     * bottom that must NOT move while the middle scrolls); `vtdemo back`
+     * leaves, and the screen from before `vtdemo alt` must come back intact. */
+    if (args && args[0] == 'a') {
+        console_write("\x1b[?1049h\x1b[2J\x1b[1;1H\x1b[7m TOP STATUS - must stay \x1b[0m");
+        console_write("\x1b[8;1H\x1b[7m BOTTOM STATUS - must stay \x1b[0m");
+        console_write("\x1b[2;7r\x1b[2;1H");
+        for (int i = 1; i <= 10; i++) {
+            char b[40]; int k = 0;
+            const char* t = "region line ";
+            while (*t) b[k++] = *t++;
+            if (i >= 10) b[k++] = (char)('0' + i / 10);
+            b[k++] = (char)('0' + i % 10);
+            b[k] = 0;
+            console_write(b);
+            if (i < 10) console_write("\r\n");
+        }
+        console_write("\x1b[2;1H\x1b" "M" "\x1b[2;1Hreverse-indexed in at the top");
+        console_write("\x1b[r\x1b[10;1Hvtdemo: alternate screen\r\n");
+        return;
+    }
+    if (args && args[0] == 'b') { console_write("\x1b[?1049l"); return; }
     console_write("1 want 'vtdemo: BB'    > vtdemo: AAAA\x1b[4DBB\x1b[K\n");
     console_write("2 want 'red' in red    > \x1b[31;1mred\x1b[0m, no codes\n");
     console_write("6 want colours         > \x1b[32mgreen \x1b[44myellow-on-blue\x1b[0m "
@@ -348,4 +520,4 @@ static void cmd_vtdemo(const char* args) {
     console_write("4 want 'a  bc'         > abc\x1b[2D\x1b[2@\n");
     console_write("5 want 'title gone'    > \x1b]0;a window title\x07title gone\n");
 }
-SHELL_CMD(vtdemo) = { "vtdemo", "", "print VT100 sequences to look at", SHELL_G_TEST, cmd_vtdemo, SHELL_P_ANY };
+SHELL_CMD(vtdemo) = { "vtdemo", "[alt|back]", "print VT100 sequences to look at", SHELL_G_TEST, cmd_vtdemo, SHELL_P_ANY };
