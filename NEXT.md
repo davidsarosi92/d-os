@@ -22,9 +22,12 @@ as its own project) and §M92 (driver engine) are recorded, not scheduled;
 §M94 (package installation up to building a git repository into native d-os
 code) is recorded, not scheduled; §M84 (phone) only when asked.
 
-Small items still open:
-- `/var/lib/docker` lives in memory (exFAT cannot hold overlay layers) — a
-  documented limit; closing it means a Linux-capable filesystem on the disk.
+Everything still open — not-started milestones (§M91, §M92, §M94, §M68, §M83,
+§M84), the partly done older ones (§M38, §M42-§M45) and the small items left in
+shipped milestones — is listed in ONE place: PLAN.md "Open work — exact state"
+(updated 2026-10-16).  The best-known small item: `/var/lib/docker` lives in
+memory (exFAT cannot hold overlay layers); closing it means a Linux-capable
+filesystem on the disk.
 
 # Where things stand (2026-09-28)
 

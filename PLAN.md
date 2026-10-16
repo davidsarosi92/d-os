@@ -51,7 +51,7 @@
 | §M22.5 | Desktop apps — editor, BASIC, file manager 2.0, maximize | ~1557 |
 | §M22.6 | Tear-free present (page flip) + display scaling | ~1587 |
 | §M22.7 | Per-task GUI apps + panel-as-task — ✅ shipped | ~1660 |
-| §M23 | Audio subsystem — ◐ stage 1 + stage 2 (i386 + x86_64): AC97 PCM output, tone, WAV player (DOCS §4.26, §4.26.1) | ~1040 |
+| §M23 | Audio subsystem — ✅ COMPLETE (all 3 arches): AC97 + Intel HDA + virtio-sound, WAV player, `/dev/dsp`, mixer + master volume/mute, capture (`rec`), completion interrupts (DOCS §4.26, §4.26.1) | ~1040 |
 | §M24 | Network stack (Ethernet → TCP/IP → sockets) — ✅ stages 1–3 (i386): virtio-net + ARP/IPv4/ICMP/UDP/TCP + DNS + ping/wget (DOCS §4.25) | ~1080 |
 | §M25 | Userland foundation (Wayland prerequisites) — ✅ stages 1–7 + Tier B tail (concurrent user processes + full-arch libc; DOCS §4.24) | ~1545 |
 | §M26 | Wayland server (wire protocol on M22 + M25) — ✅ core + integration (i386+x86_64, DOCS §4.32): handshake + shm buffers (SCM_RIGHTS) + xdg_shell + framebuffer/gui_window bridge + wl_seat input + a real ring-3 client + **server-per-surface** (`waycomp`: a client's toplevel IS a desktop window, input routed to its wl_seat) + a **mini-libwayland client lib** (`user/libwl`, `wayapp`). Upstream libwayland + unmodified apps landed in §M40 | ~1615 |
@@ -61,21 +61,21 @@
 | §M29 | Services / daemons — supervisor + SERVICE() registry + service bus (endpoint/contract/transport) — ✅ shipped (DOCS §4.21) | ~1895 |
 | §M30 | Task scheduling — cron service — ✅ shipped (DOCS §4.23) | ~1935 |
 | §M31 | Watchdog — heartbeat freeze detection (task / CPU / hw) — ✅ shipped L1+L2 (DOCS §4.22; L3 HW deferred) | ~1960 |
-| §M32 | Multi-user — identity, login, file perms, isolation   **Extended 2026-09-10: whose process is this** — a tagged owner (kernel / system / user+session), zero meaning KERNEL because three of four `struct task` construction sites bypass `spawn_common`, immutable for the task's life so §M27's orphan re-parenting cannot launder a user's children into system processes.  **Plus a gap audit against the checklist**: no account lifecycle (`useradd`/`userdel`/`passwd` exist nowhere, and a reused uid inherits the previous owner's files), **no per-user settings at all** (`config.c` has no scope — one flat global file), `execve` missing from the permission-check list, and the only writable volume (exFAT) cannot store an owner | ~2160 |
+| §M32 | Multi-user — ✅ COMPLETE: credentials + tagged owners, login/greeter, per-account config layer and homes, simultaneous sessions, on-disk ownership (exFAT vendor extension) (DOCS §4.91, §4.108-§4.110).  Open: fast user switching (two live desktops) | ~2160 |
 | §M33 | Execution domains — ✅ COMPLETE (DOCS §4.82): a driver runs in ring 3 from the same source, is supervised and restarted, and an IOMMU-confined device is refused outside its granted windows.  Remaining items all gated on named triggers | ~2265 |
 | §M34 | POSIX process & signals — ✅ shipped (i386): fork(COW)/execve/waitpid/pipe/dup2/signals (DOCS §4.27) | — |
 | §M35 | Threads & futex — ✅ shipped (i386, UP + SMP): clone/futex/thread_create + per-CPU TSS (DOCS §4.28) | — |
 | §M35.5 | Package manager & isolation — ✅ store shipped (i386): content-addressed /store + profiles + GC (DOCS §4.29); gates every port | — |
-| §M36 | POSIX syscall breadth + native libc — ◐ stage 1 (i386, DOCS §4.30) + stage 2 "two brothers": **Linux-ABI peer runs real musl + coreutils (`echo`/`cat`/`ls`/`env`) + a real `sh -c` (fork/execve/waitpid) FROM the store via `pkgrun`, data-driven `.abi` seam (DOCS §4.31)**; native musl-fork peer TODO (= 2nd ABI backend). Own-libc PARKED → `NATIVE_LIBC.md` | — |
+| §M36 | POSIX syscall breadth + libc — ✅ (all 3 arches): the Linux-ABI personality runs UNMODIFIED musl and glibc programs (coreutils, `sh`, Go, the JDK, Docker) through the §M50 engine (DOCS §4.30, §4.31, §4.48).  The native musl fork (`arch/dos`) stays PARKED by decision (NATIVE_LIBC.md) | — |
 | §M37 | Dynamic linking — ld.so / `.so` / dlopen — ✅ shipped (i386, DOCS §4.33): shared musl (libc.so=ld.so) + ET_DYN/PIE loader + PT_INTERP + full auxv + full mmap2/mprotect/fstat64; dynamic hello, separate .so (DT_NEEDED + .so __thread), dlopen all green | — |
-| §M38 | C++ runtime + support libs — ◐ runtime shipped (i386, DOCS §4.34): musl-cross-make g++ 11.2.0 + libstdc++; `cpptest` throws+catches across a `.so` (DWARF unwind) + STL, dynamically linked.  Support libs (zlib/freetype/harfbuzz/ICU/Skia) still open | — |
-| §M39 | Crypto + entropy + TLS + DNS — ◐ stages 1–3b shipped (i386, DOCS §4.35): ChaCha20 CSPRNG + /dev/urandom + getrandom (arch-generic); Mbed TLS v3.6.2 (`crypttest` SHA-256+AES-GCM); **verified TLS 1.3** handshake (`ssltest`); **stage 3b = REAL HTTPS** — musl `socketcall`→M24 sockets (`netmusl`), `httpstest` = DNS→TCP:443→TLS 1.3 handshake→Mozilla CA bundle at /etc/ssl/cert.pem→VERIFY_REQUIRED (flags 0x0)→HTTP 200.  **stage 3c** = musl `getaddrinfo` runs natively (recvmsg/sendmsg/poll in linux_abi → `httpstest` resolves via real musl resolver) + a userland `wget` (http+https over mbedTLS, argv URL).  Open: DHCP resolv.conf, x86_64/aarch64 | — |
+| §M38 | C++ runtime + support libs — ◐ runtime ✅ (g++ 11.2 + libstdc++, exceptions across a `.so`, DOCS §4.34); zlib, libpng and freetype ported (NetSurf's stack); ICU / HarfBuzz / Skia NOT ported | — |
+| §M39 | Crypto + entropy + TLS + DNS — ✅ (all 3 arches): ChaCha20 CSPRNG + /dev/urandom + getrandom, Mbed TLS with TLS 1.3 and CA verification, musl `getaddrinfo` (DOCS §4.35, §4.39); `wget` HTTPS is what §M93 installs software with | — |
 | **§M40** | **Client graphics stack** — ✅ **SHIPPED** (DOCS §4.40 + §4.40.1). Wayland half: UPSTREAM libwayland-client cross-built for musl (+ libffi, `wayland-scanner` on the host, vendored tree pristine); connects via `WAYLAND_SOCKET`; real `xdg_toplevel` + shm buffers; the surface IS a desktop window; desktop input reaches its `wl_seat`; `wl_output` + `wl_surface.frame`.  **`weston-simple-shm` — an UNMODIFIED upstream application — animates in a d-os window.**  GL half: **Mesa EGL + GLES2 on gallium softpipe** — `egltri win` spins a shader-drawn triangle in a window (`OpenGL ES 3.1 Mesa 23.1.9`), presented through `wl_shm`.  Lessons: libwayland must be SHARED (libEGL had absorbed it statically → two protocol tables in one process), and `mincore` must answer truthfully (stubbed as advisory, it made Mesa dereference address 3).  x86_64, as scoped.  Open: a full toolkit (GTK/Qt) — needs the remaining §M38 support libs | ~1900 |
-| §M41 | Linux syscall ABI shim — optional binary-compat accelerator | — |
-| §M42 | Web browser bring-up — NetSurf → WebKit → Firefox/Chromium (north star) — ◐ IN PROGRESS (**x86_64 + i386**): Tier-1 NetSurf component libs (wapcaplet/parserutils/hubbub/css/dom/nsgif/nsbmp) + runway libs (nsutils/nslog/nspsl/**nsfb** framebuffer surface) all ported + running as store pkgs; **the NetSurf BINARY compiles + links + RUNS** — a 915 KB musl dynamic PIE (`make netsurf`); `netsurf [url]` shell cmd execs it under linux-abi, `/res` (resources+TTF+Messages) provisioned at boot; `netsurf` (0 unhandled syscalls) RENDERS a real page (`about:welcome` — text, links, fonts, layout) into a **WM-managed desktop window** via the display bridge (`kernel/gui/dosgui.c` + a libnsfb `dos` surface backend + `gui_window_blit`); a **Start-menu "NetSurf" launcher** (`GUI_APP`) opens it.  **Ported to i386 too** (same lib stack rebuilt with the musl-cross-i686 toolchain; linux_abi grew i386 readlink/access/madvise/stat64/statx/uname/rt_sigaction + the DOSGUI syscalls via int 0x80).  Verified by framebuffer screendump on BOTH arches.  i386 musl **unified to 1.2.5** (the musl-cross-i686 toolchain's musl rebuilt to match the 1.2.5 runtime the kernel provisions; `MUSL_VER=1.2.5` pinned in the Makefile).  Two i386 runtime bugs fixed: a triple-fault (heavy pkg_init ran on the shell task's small stack → moved to the boot task) and a GUI freeze (NetSurf busy-spun → added nanosleep/sched_yield + a yielding `dos_input`).  Left: network fetch (a `dos` fetcher over M24+mbedTLS) → `https://` pages; NetSurf window UX (close button, minimize/restore, click/type input — it bypasses the M22.7 app-host loop) | — |
-| §M43 | Native developer toolchain (self-hosting) — ◐ first slice shipped (i386, DOCS §4.36): **TinyCC compiles + runs C ON d-os** (`tcc`/`exec` shell cmds + Editor "Run" button).  Full gcc/clang self-hosting + binutils/make still open | — |
-| §M44 | Language ecosystems — Rust / C++ / .NET (NativeAOT→CoreCLR) / Java (JVM); run cross-built musl binaries, then per-runtime ports | — |
-| §M45 | Package manager frontend + GUI installer — apt-like UX + wizard over the §M35.5 store; remote repo over §M39 TLS; driver/module hot-swap via §M33 | — |
+| §M41 | Linux syscall ABI shim — ✅ realised as the Linux-ABI PERSONALITY (not an optional shim): one data-driven engine for i386/amd64/arm64 numbering (§M50, DOCS §4.31, §4.48); unmodified Linux binaries are the normal case.  The multi-personality generalisation is §M91 | — |
+| §M42 | Web browser bring-up — ◐ NetSurf ✅ usable on x86_64 + i386 (HTTPS fetcher, mouse, keyboard, resize — DOCS §4.43, §4.60); WebKit / Firefox / Chromium (the north star) NOT started | — |
+| §M43 | Native developer toolchain (self-hosting) — ◐ TinyCC compiles and runs C on d-os (`tcc`, Editor "Run"; DOCS §4.36); a full gcc/clang toolchain on the machine NOT started (overlaps §M94's build-from-git) | — |
+| §M44 | Language ecosystems — ◐ C/C++ ✅, Java ✅ (unmodified Temurin JDK, §M89), Go binaries ✅ (Docker's, §M90); Rust and .NET NOT started | — |
+| §M45 | Package manager frontend + GUI installer — ◐ `pkg` (store) + `wget` + `app install` (vendor releases, side-by-side versions, manifests — §M93, DOCS §4.120); an apt-like remote repository and a GUI installer NOT built — folded into §M94 | — |
 | **§M46** | **Resilient control plane + freeze-freeness** — ✅ **SHIPPED** (i386 + x86_64, aarch64 parity; DOCS §4.37): ring-3 fault ⇒ kill just the process (all 3 arches); real force-kill of a WEDGED ring-3 task at the timer preemption boundary (`fkill`, Task Manager "Force kill", opt-in `package.auto_fkill_ms` runaway policy); ib700 HW watchdog + NMI hard-lockup recovery + deadlock reporting on COM1; Ctrl+Alt+Del / Ctrl+Alt+X trapped in the keyboard IRQ (work while an app is frozen), window X force-kills an unresponsive client; the ring-3 pointer boundary closed with a per-syscall gate **and** a real exception table (`.ex_table` + `uaccess_*`, `faulttest`); dosgui handles owner-bound + blits range-checked; sigreturn EFLAGS sanitised; `sys_kill` restricted to the caller's subtree; x86_64 real COW; ACPI tables above the identity map mapped on demand | — |
 | **§M47** | **Crash records & reporting** — ✅ **SHIPPED** (i386 + x86_64, aarch64 parity; DOCS §4.38): fault-safe capture into a static ring (`crash_report`, no locks/alloc/IO) + deferred delivery on an ordinary task (`crash_drain`) + a `CRASH_SINK()` registry, so ANY reporting mechanism can be armed later WITHOUT touching a fault path.  Sinks: `klog` (always on) + `gui-report` (the Crash Reports window, gated by `crash.report`).  Surfaces: `crash`, `/proc/crash`, the system log, the GUI window.  A triple fault / power loss — the one event nothing in the guest can log — is reported on the NEXT boot from a CMOS NVRAM marker + a 40-byte checksummed breadcrumb of the last record (kind/pid/pc/addr/code/uptime/comm).  **Stage 2**: `/proc/crash` + the Crash
 Reports GUI window (a sink, not a fault-path change) + a wider breadcrumb.
@@ -117,8 +117,8 @@ as text), and an http/https fetcher over d-os sockets + Mbed TLS with real
 certificate verification.  `run_qemu.sh` now attaches a NIC — its absence is why
 no site loaded however well the fetcher worked.  **Mesa** runs on i386 too | i386
 kmap / PAE; non-blocking fetcher `poll` |
-| §M58 | **Text selection** — a pointer grab + press/motion/release for widgets, a selection MODEL (byte range for text, cell rectangle for the terminal grid), inverted rendering on damage rects, word/line on double/triple click.  Blocked today by the widget mouse callback having only click/double — a drag has no transport | — |
-| §M59 | **Clipboard, system-wide** — the M22.5 kernel clipboard widened to typed offers + a ring-3 surface (§M50 ops + `/dev/clipboard`) + Wayland `wl_data_device` (ownership-based, fd hand-off) + a primary selection (select ⇒ middle-click paste).  Today nothing in ring 3 can touch the clipboard at all | — |
+| §M58 | ✅ **Text selection (SHIPPED, DOCS §4.69, §4.75)** — pointer grab + press/motion/release, a selection model addressed in absolute line numbers, terminal scrollback, Ctrl+Shift+C/V, the editor selects with the mouse | — |
+| §M59 | ✅ **Clipboard, system-wide (SHIPPED, DOCS §4.69, §4.76, §4.107)** — two slots (clipboard + primary), typed offers, `/dev/clipboard` for ring 3, fds 0/1/2 as real descriptors, Wayland `wl_data_device` bridged to the d-os clipboard | — |
 | §M60 | ✅ **Wallpaper (SHIPPED, DOCS §4.62)** — the background becomes a surface with a source (`gui.wallpaper`: gradient / path / solid) + a fit mode; ONE trivial in-kernel decoder, everything else decoded in ring 3 and handed over the dosgui bridge; unreadable image ⇒ gradient + a klog line; `wallpaper` cmd then a Settings app | — |
 | §M61 | ✅ **Resolution switching (SHIPPED, DOCS §4.70 + §4.77 — aarch64 too)** — the mode is a constant in `boot.s` (and `FB_WIDTH` on ARM) today.  New `fb_mode_list`/`fb_mode_set` behind the existing `fb_present.h` seam (Bochs DISPI / virtio-gpu set_scanout), then the real work: resize the backbuffer + wallpaper + panel, clamp windows, re-send `wl_output`, deliver the §4.60 dosgui RESIZE; apply-confirm-or-revert, because a bad mode is a black screen | — |
 | §M62 | ✅ **Boot splash (SHIPPED, DOCS §4.71)** — `boot.splash` off/on/quiet; an embedded image painted through `fb_present` before the GUI exists; the log is SUPPRESSED, never discarded (`dmesg` keeps it); Esc drops to the log; **any fault/panic/watchdog trip tears the splash down first** — a splash over a panic turns a diagnosable crash into "it froze at the logo" | — |
@@ -131,7 +131,7 @@ kmap / PAE; non-blocking fetcher `poll` |
 | §M72 | ✅ **A reserve the system keeps, and a program you can pause** — SHIPPED 2026-09-27, DOCS §4.111: `mem.reserve_kb` / `fs.reserve_kb` refuse, `df`; `TASK_STOPPED` + `stop`/`cont`; pause + evict with the slot in the non-present PTE, `AUDIT(swap-runnable)`, `evicttest` | ~4735 |
 | §M73 | ✅ **Containers — running a Docker image (SHIPPED, DOCS §4.115)** —  The capability, not the impression: a per-process filesystem root (the one genuinely missing primitive), an image as a §M35.5 store artifact, identity from §M32, caps from §M49+§M72.  Docker compat is the validation target.  Network isolation is where the honest report has to say "not isolated" | ~4880 |
 | §M74 | ✅ **Swap and demand paging (SHIPPED, DOCS §4.112-§4.114)** —  §M72 builds the mechanism against a QUIESCENT process; this aims it by pressure at a RUNNING one, which brings back the race and adds the question §M72 never asks (*which page*).  Four rungs: an accessed-bit sweep (nothing reads the hardware's own usage data), a page cache, anonymous swap-out, thrash control.  **The reserve is never the swap nor on it** — pinned physical frames, swap excluded from the free-memory figure the watermark reads, and a writeout path that allocates nothing.  Off by default, size configurable and equal to the ceiling; `off` still reclaims clean pages | ~4880 |
-| §M75 | **Task Manager rework** — design.  Two new per-process columns (memory needs the one genuinely new accounting, and `vmm.c` exists THREE times — three counters would disagree invisibly), four system-wide 1 Hz charts (CPU/mem free, network per-device free, I/O needs counters `block.c` has none of), a Total under the table and not in it.  Each chart damages only itself, measured with `gui.stats_ms` | ~4880 |
+| §M75 | ✅ **Task Manager rework (SHIPPED, DOCS §4.88)** — per-process memory and CPU, system-wide charts, each damaging only itself, measured with `gui.stats_ms` | ~4880 |
 | How to use this document | Workflow rules | 930 |
 | Change log | Plan-doc revision history | 945 |
 
@@ -205,16 +205,18 @@ convenience when they conflict.
 
 ## Status snapshot
 
-Everything in DOCS.md §7 marked `[x]` is done.  Below is the active
-backlog.
+The status table at the top of this file is the per-milestone record (DOCS.md
+§7 stops at M6 and is kept only as history).  Below is the active backlog —
+the one list of what is left.
 
-### Open work — exact state (2026-09-27)
+### Open work — exact state (updated 2026-10-16)
 
-Agreed order: **(1) finish what is half done**, **(2) §M82, §M72, §M74, §M73**
-(any order; §M74 is gated on §M72) — ALL DONE 2026-09-28, **(3) the queued UI
-items (swap page, translations, system summary), then §M81**, then §M88
-(monitors) and §M89 (Java).  A defect found on the way is
-fixed first, whatever it touches.
+The 2026-09-27 order — **(1) finish what is half done**, **(2) §M82, §M72,
+§M74, §M73**, **(3) the queued UI items, then §M81**, then §M88 and §M89 — is
+ALL DONE, and so are §M90, §M93, NEXT #14 (DOCS §4.121) and the terminal's
+alternate screen + TIOCPKT (DOCS §4.122).  **No next milestone is chosen**: the
+user picks among the "not started" rows at the bottom.  A defect found on the
+way is fixed first, whatever it touches.
 
 | Milestone | Done | Open |
 |-----------|------|------|
@@ -237,8 +239,25 @@ fixed first, whatever it touches.
 | §M92 | — | a driver engine for d-os, Linux and Windows drivers — an OPEN QUESTION, recorded, not decided |
 | §M93 | ✅ (2026-10-16) | installing software as a user: DOWNLOAD from the vendor (`wget`) → `app install` → run, no OCI image required — the guide plus the `.tar.gz` install, glibc decision, manifest, service registration — shipped, DOCS §4.120 + docs/INSTALLING.md |
 | §M94 | — | package installation as ONE milestone, up to building from a git repository into code d-os runs NATIVELY (recorded 2026-10-15, not scheduled) |
-| §M68 | — | investigation, not started |
-| §M83, §M84 | — | designed, not started |
+| §M68 | — | investigation, not started (does the ring axis earn its keep; what isolation the hardware really gives) |
+| §M83 | — | designed, not started (everything a package; the tree split along package lines) |
+| §M84 | — | designed, not started — the phone; only when asked |
+
+**Partly done, older milestones** (status rows above; none is scheduled):
+
+| Milestone | Done | Open |
+|-----------|------|------|
+| §M38 | C++ runtime; zlib, libpng, freetype | ICU, HarfBuzz, Skia |
+| §M42 | NetSurf usable (x86_64, i386) | WebKit / Firefox / Chromium |
+| §M43 | TinyCC on the machine | a gcc/clang toolchain on d-os (overlaps §M94) |
+| §M44 | C/C++, Java, Go binaries | Rust, .NET |
+| §M45 | `pkg`, `wget`, `app install` (§M93) | apt-like remote repository, GUI installer — folded into §M94 |
+
+**Small items left in shipped milestones:** a taskbar per monitor (§M88);
+`/var/lib/docker` in memory — exFAT cannot hold overlay layers (§M90); per-
+container resource caps, network namespace and registry pull for the native
+`ctr` (§M73); Java rung-5 measurements (§M89); two live desktops at once / fast
+user switching (§M32, §M82); a real Wi-Fi driver (QEMU emulates none).
 
 ### Done (M1–M7)
 

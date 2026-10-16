@@ -9826,8 +9826,9 @@ loading foreign code into ring 0 wants §M33 first or alongside.
   can pick a sane resolution and font size.
 
 This list stops at M6 and has not been the roadmap for a long time —
-**PLAN.md is**, with a status table covering M1 through M49 plus the
-design sketches and definitions of done.  `PLAN_AARCH64.md` carries the
+**PLAN.md is**, with a status table covering M1 through M94, an "Open work —
+exact state" table (the current list of what is left), and the design
+sketches and definitions of done.  `PLAN_AARCH64.md` carries the
 ARM64 port's catch-up plan separately, organised by gap rather than by
 milestone.  Kept here only so a reader who lands in this section is not
 misled into thinking M6 is where the work ends.
