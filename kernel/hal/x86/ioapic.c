@@ -31,6 +31,7 @@
  * IRQ0 routed to GSI 2 is by far the most common case on QEMU.
  * ============================================================================= */
 
+#include "hal_api.h"
 #include "ioapic.h"
 #include "acpi.h"
 #include "vmm.h"
@@ -64,11 +65,9 @@ static void io_w(uint32_t reg, uint32_t v) {
 }
 
 int ioapic_init(uintptr_t phys, uint32_t gsi_base) {
-    uintptr_t aligned = phys & ~((uintptr_t)0xFFFu);
-    if (vmm_map(aligned, aligned, VMM_WRITABLE | VMM_CACHE_DIS) != 0) {
-        /* Probably already mapped — proceed. */
-    }
-    g_ioapic_mmio = (volatile uint8_t*)phys;
+    /* §M90 — through hal_mmio_map (see lapic.c). */
+    g_ioapic_mmio = (volatile uint8_t*)hal_mmio_map(phys, 0x1000);
+    if (!g_ioapic_mmio) return -1;
     g_gsi_base    = gsi_base;
 
     uint32_t ver = io_r(IOAPIC_REG_VERSION);

@@ -428,6 +428,7 @@ static int load_interp(struct vmm_space* s, struct loaded_prog* lp) {
          * and then the bit would mean "is a file" rather than "may be run". */
         struct file* f = vfs_open(lp->main.interp, VFS_RDONLY);
         if (!f) return ELF_ENOLOAD;                   /* interpreter missing   */
+        if (vfs_file_noexec(f)) { vfs_close(f); return ELF_ENOLOAD; }   /* §M90 — noexec */
 
         /* §M74 — with the file, so ld.so (which in musl IS libc.so) is shared
          * through the page cache by every dynamic program instead of copied
@@ -620,6 +621,8 @@ int proc_execve_env_k(const char* kpath, char* const uargv[], char* const uenvp[
     /* 2. Open the program (a file, or a memfd through /proc/self/fd/N). */
     struct file* f = exec_open(kpath);
     if (!f) { kfree(strbuf); return -1; }
+    /* §M90 — a program on a NOEXEC mount is not run: EACCES (Linux's answer). */
+    if (vfs_file_noexec(f)) { vfs_close(f); kfree(strbuf); return -13; }
     /* §M89 — what /proc/self/exe will name (vfs_canonical joins the cwd and
      * resolves "..", within this task's root).  Computed now, COMMITTED at the
      * point of no return below, so a failed exec keeps the old name. */
@@ -988,7 +991,11 @@ void user_excursion_fault(int sig) {
  * ============================================================================= */
 #include "nsproxy.h"
 #include "uaccess.h"
-struct clone_opts { unsigned long flags; uintptr_t ctid; };
+struct clone_opts { unsigned long flags; uintptr_t ctid; void* cg; };
+#define CL_PIDFD          0x00001000ul          /* §M90 — pidfd.c */
+#define CL_SETTLS         0x00080000ul
+#define CL_THREAD         0x00010000ul
+#define CL_INTO_CGROUP    0x200000000ull        /* clone3 only */
 #define CL_VFORK          0x00004000ul
 #define CL_PARENT         0x00008000ul
 #define CL_PARENT_SETTID  0x00100000ul
@@ -1013,10 +1020,24 @@ int proc_fork_vnr(struct user_regs* r) {
 }
 
 int vfs_mntns_new(int parent);
+static long clone_fork_ex(struct user_regs* r, unsigned long flags, uintptr_t stack,
+                          uintptr_t ptid, uintptr_t ctid, uintptr_t pidfd_out, void* cg);
 long proc_clone_fork(struct user_regs* r, unsigned long flags, uintptr_t stack,
                      uintptr_t ptid, uintptr_t ctid) {
+    /* §M90 — clone(CLONE_PIDFD): the pidfd is stored where parent_tid would
+     * go, so the two cannot be asked for together (EINVAL, as on Linux). */
+    uintptr_t pidfd_out = 0;
+    if (flags & CL_PIDFD) {
+        if (flags & CL_PARENT_SETTID) return -22;
+        pidfd_out = ptid;
+    }
+    return clone_fork_ex(r, flags, stack, ptid, ctid, pidfd_out, NULL);
+}
+
+static long clone_fork_ex(struct user_regs* r, unsigned long flags, uintptr_t stack,
+                          uintptr_t ptid, uintptr_t ctid, uintptr_t pidfd_out, void* cg) {
     unsigned long known = 0xFFul | CL_VFORK | CL_PARENT | CL_PARENT_SETTID | CL_CHILD_CLEARTID |
-                          CL_CHILD_SETTID | NS_CLONE_NEWNS | CL_NSOBJ | NS_CLONE_NEWPID;
+                          CL_CHILD_SETTID | NS_CLONE_NEWNS | CL_NSOBJ | NS_CLONE_NEWPID | CL_PIDFD;
     if (flags & ~known) {
         kprintf("clone: flags %lx not supported for a new process\n", flags & ~known);
         return -22;
@@ -1027,6 +1048,7 @@ long proc_clone_fork(struct user_regs* r, unsigned long flags, uintptr_t stack,
     if ((flags & (NS_CLONE_NEWNS | CL_NSOBJ)) &&
         cred_uid(&me->cred) != 0 && !cred_is_admin(&me->cred)) return -1;   /* EPERM */
     if ((flags & CL_PARENT_SETTID) && !vmm_user_access_ok(ptid, sizeof(int), 1)) return -14;
+    if (pidfd_out && !vmm_user_access_ok(pidfd_out, sizeof(int), 1)) return -14;
     if (stack) r->user_sp = stack;
     /* CLONE_NEWPID: the CHILD is born in a new pid namespace and is its init.
      * Done by making it, for this one fork, where the caller's children are
@@ -1040,7 +1062,7 @@ long proc_clone_fork(struct user_regs* r, unsigned long flags, uintptr_t stack,
         saved_pidc = me->ns_pid_children;                     /* our reference stays here */
         me->ns_pid_children = newns;                          /* ...only for this fork */
     }
-    struct clone_opts o = { flags & ~NS_CLONE_NEWPID, ctid };
+    struct clone_opts o = { flags & ~(NS_CLONE_NEWPID | CL_PIDFD), ctid, cg };
     me->fork_opts = &o;
     int pid = proc_fork(r);
     me->fork_opts = NULL;
@@ -1054,7 +1076,81 @@ long proc_clone_fork(struct user_regs* r, unsigned long flags, uintptr_t stack,
         int v = vnr;
         copy_to_user(ptid, &v, sizeof v);
     }
+    if (pidfd_out) {
+        /* §M90 — the parent's pidfd for the child (pidfd.c).  Made after the
+         * fork, but the child cannot have been reaped yet: only this caller
+         * can reap it, and it is here. */
+        extern int pidfd_create(int gpid, unsigned flags);
+        int fd = pidfd_create(pid, 0);
+        copy_to_user(pidfd_out, &fd, sizeof fd);
+    }
     return vnr;
+}
+
+/* §M90 — clone3(args, size).  struct clone_args is a row of u64s:
+ *   flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls,
+ *   set_tid, set_tid_size (size >= 80), cgroup (size >= 88).
+ * The FORK shape goes through the same path as clone(); the THREAD shape
+ * (CLONE_VM with a stack — glibc's pthread_create since 2.34) through
+ * proc_clone_thread.  CLONE_INTO_CGROUP places the child in the cgroup the
+ * descriptor names BEFORE it runs.  set_tid (choosing the pid — CRIU) is
+ * refused.  `tls_is_desc`: i386 passes a struct user_desc*, not a base. */
+long proc_clone3(struct user_regs* r, uintptr_t uargs, unsigned long size, int tls_is_desc) {
+    uint64_t a[11];
+    for (int i = 0; i < 11; i++) a[i] = 0;
+    if (size < 64 || size > 4096) return -22;                    /* EINVAL */
+    unsigned long n = size < sizeof a ? size : sizeof a;
+    if (!vmm_user_access_ok(uargs, size, 0)) return -14;
+    if (copy_from_user(a, uargs, n) != 0) return -14;
+    /* Fields past what we know must be zero (Linux's rule for a larger struct). */
+    for (unsigned long off = sizeof a; off < size; off++) {
+        uint8_t z = 0;
+        if (copy_from_user(&z, uargs + off, 1) != 0 || z) return -7;   /* E2BIG */
+    }
+    uint64_t fl = a[0];
+    uint64_t exit_signal = a[4];
+    if ((fl & 0xFF) || exit_signal >= 65) return -22;            /* CSIGNAL lives in exit_signal */
+    if ((a[5] == 0) != (a[6] == 0)) return -22;                  /* stack and its size, or neither */
+    if (a[9] || a[8]) {
+        kprintf("clone3: set_tid not supported (choosing a pid)\n");
+        return -22;
+    }
+    uintptr_t stack_top = a[5] ? (uintptr_t)(a[5] + a[6]) : 0;
+    void* cg = NULL;
+    if (fl & CL_INTO_CGROUP) {
+        extern void* cgroupfs_of_fd(int fd);
+        cg = cgroupfs_of_fd((int)a[10]);
+        if (!cg) return -9;                                      /* EBADF: not a cgroup dir */
+        fl &= ~CL_INTO_CGROUP;
+    }
+    /* The fork shape: no shared address space, or a vfork with no new stack. */
+    if (!(fl & 0x100 /* CLONE_VM */) || ((fl & CL_VFORK) && !stack_top)) {
+        unsigned long f = (unsigned long)(fl & ~(uint64_t)0x100) | (unsigned long)exit_signal;
+        return clone_fork_ex(r, f, stack_top, (uintptr_t)a[3], (uintptr_t)a[2],
+                             (fl & CL_PIDFD) ? (uintptr_t)a[1] : 0, cg);
+    }
+    /* The thread shape. */
+    if (cg || (fl & CL_PIDFD) || !stack_top) return -22;
+    struct task* me = task_current();
+    uintptr_t tls = me ? me->tls_base : 0;
+    if (fl & CL_SETTLS) {
+        tls = (uintptr_t)a[7];
+        if (tls_is_desc && tls) {
+            /* struct user_desc: entry_number, base_addr, ... (4-byte fields) */
+            uint32_t base = 0;
+            if (copy_from_user(&base, tls + 4, 4) != 0) return -14;
+            tls = base;
+        }
+    }
+    int* ctid = (fl & CL_CHILD_CLEARTID) ? (int*)(uintptr_t)a[2] : NULL;
+    if (ctid && !vmm_user_access_ok((uintptr_t)ctid, sizeof(int), 1)) return -14;
+    int tid = proc_clone_thread(r, stack_top, tls, ctid);
+    if (tid < 0) return -11;
+    if ((fl & CL_PARENT_SETTID) && a[3] && vmm_user_access_ok((uintptr_t)a[3], sizeof(int), 1))
+        copy_to_user((uintptr_t)a[3], &tid, sizeof tid);
+    if ((fl & CL_CHILD_SETTID) && a[2] && vmm_user_access_ok((uintptr_t)a[2], sizeof(int), 1))
+        copy_to_user((uintptr_t)a[2], &tid, sizeof tid);
+    return tid;
 }
 
 /* In proc_fork, before the child may run: what the clone flags change about
@@ -1063,6 +1159,10 @@ void proc_fork_apply(struct task* parent, struct task* child) {
     const struct clone_opts* o = parent ? (const struct clone_opts*)parent->fork_opts : NULL;
     if (!o || !child) return;
     if (o->flags & CL_PARENT) child->ppid = parent->ppid;
+    if (o->cg) {                                  /* §M90 — clone3 CLONE_INTO_CGROUP */
+        extern void cgroupfs_place(struct task* t, void* cg);
+        cgroupfs_place(child, o->cg);
+    }
     child->exit_sig_plus1 = (int)(o->flags & 0xFF) + 1;
     if (o->flags & CL_CHILD_SETTID)   child->set_child_tid = o->ctid;
     if (o->flags & CL_CHILD_CLEARTID) child->clear_tid = (int*)o->ctid;

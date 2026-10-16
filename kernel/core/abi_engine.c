@@ -9,6 +9,7 @@
  * that it does not fit is the design telling you something.
  * ============================================================================= */
 
+#include "seccomp.h"
 #include "packet.h"
 #include "net.h"
 #include "fsnotify.h"   /* §M90 rung 3 — inotify */
@@ -612,6 +613,16 @@ static long h_inotify_rm_watch(struct abi_ctx* c) {
 /* Linux open flags → VFS flags.  The access mode, O_CREAT and O_TRUNC share
  * their bits on every guest we speak; O_DIRECTORY does not, so the caller
  * checks it against the map. */
+/* §M90 (2026-10-15) — O_NOFOLLOW is NOT one bit on every guest: 0400000 on
+ * x86 (where 0100000 is O_LARGEFILE) and 0100000 on arm64 (O_LARGEFILE there
+ * is 0400000).  The map's O_DIRECTORY tells the two families apart (040000 is
+ * arm64's).  Reading 0100000 as NOFOLLOW everywhere made every x86 open that
+ * carried O_LARGEFILE — Go adds it to all of them — refuse to follow a
+ * symlink in its last component. */
+static unsigned long abi_o_nofollow(const struct abi_ctx* c) {
+    return (c && c->map && c->map->o_directory == 040000u) ? 0100000u : 0400000u;
+}
+static int abi_open_flags_c(const struct abi_ctx* c, unsigned long lf);
 static int abi_open_flags(unsigned long lf) {
     int vf;
     switch (lf & 3u) {
@@ -621,13 +632,15 @@ static int abi_open_flags(unsigned long lf) {
     }
     if (lf & 0100u)  vf |= VFS_CREATE;
     if (lf & 01000u) vf |= VFS_TRUNC;
-    if (lf & 0100000u) vf |= VFS_NOFOLLOW;                /* §M90 — O_NOFOLLOW */
     if (lf & 0400u)    vf |= VFS_NOCTTY;                  /* §M90 rung 6 — O_NOCTTY, same bit everywhere */
     return vf;
 }
-static long abi_open_common(struct abi_ctx* c, unsigned long upath, unsigned long flags) {
-    char kp[256];
-    if (abi_path(upath, kp, sizeof kp) != 0) return -ABI_EFAULT;
+static int abi_open_flags_c(const struct abi_ctx* c, unsigned long lf) {
+    int vf = abi_open_flags(lf);
+    if (lf & abi_o_nofollow(c)) vf |= VFS_NOFOLLOW;      /* §M90 — O_NOFOLLOW, per guest */
+    return vf;
+}
+static long abi_open_kpath(struct abi_ctx* c, char* kp, unsigned long flags) {
     if (c->map && c->map->o_directory && (flags & c->map->o_directory)) {
         struct kstat_full st;
         if (sys_stat_full_k(kp, &st) != 0) return -ABI_ENOENT;
@@ -637,9 +650,58 @@ static long abi_open_common(struct abi_ctx* c, unsigned long upath, unsigned lon
      * O_NONBLOCK (04000) and O_PATH (010000000) have the same bits on every
      * guest we speak; both matter to a FIFO (whether open waits for the other
      * end; whether it is an end at all), and O_NONBLOCK to every later read. */
-    long r = sys_open_ex_k(kp, abi_open_flags(flags), (flags & 04000u) != 0,
+    long r = sys_open_ex_k(kp, abi_open_flags_c(c, flags), (flags & 04000u) != 0,
                            (flags & 010000000u) != 0);
     return r < 0 ? r : abi_cx(r, flags);
+}
+static long abi_open_common(struct abi_ctx* c, unsigned long upath, unsigned long flags) {
+    char kp[256];
+    if (abi_path(upath, kp, sizeof kp) != 0) return -ABI_EFAULT;
+    return abi_open_kpath(c, kp, flags);
+}
+/* §M90 — openat2(dirfd, path, struct open_how*, size): openat with RESOLVE_*
+ * scoping (vfs_resolve_scoped says what each flag does).  open_how is three
+ * u64s — flags, mode, resolve — and a larger struct is accepted only when its
+ * extra bytes are zero (E2BIG otherwise), Linux's rule for extensible structs.
+ * RESOLVE_CACHED is accepted: every lookup here completes "from the cache". */
+static long h_openat2(struct abi_ctx* c) {
+    unsigned long size = c->a[3];
+    if (size < 24) return -22;
+    if (size > 4096) return -7;                                   /* E2BIG */
+    if (!abi_r_ok(c->a[2], size)) return -ABI_EFAULT;
+    const uint8_t* u = (const uint8_t*)(uintptr_t)c->a[2];
+    for (unsigned long i = 24; i < size; i++) if (u[i]) return -7;
+    uint64_t how[3];
+    for (int i = 0; i < 3; i++) {
+        uint64_t v = 0;
+        for (int b = 7; b >= 0; b--) v = (v << 8) | u[i * 8 + b];
+        how[i] = v;
+    }
+    unsigned long flags = (unsigned long)how[0];
+    unsigned res = (unsigned)how[2];
+    if (how[2] & ~(uint64_t)0x3F) return -22;
+    if ((res & 0x08) && (res & 0x10)) return -22;                 /* BENEATH + IN_ROOT */
+    if (how[1] & ~(uint64_t)07777) return -22;
+    if (how[1] && !(flags & 0100u /* O_CREAT */)) return -22;     /* mode only with a create */
+    if (!(res & 0x1F)) return AT_WRAP(c->a[0], abi_open_common(c, c->a[1], flags));
+    char rel[256], base[256], kp[256];
+    if (copy_str_from_user(rel, (uintptr_t)c->a[1], sizeof rel) < 0) return -ABI_EFAULT;
+    if (!rel[0]) return -2;
+    int dirfd = (int)c->a[0];
+    if (dirfd == AT_FDCWD_) {
+        const char* cwd = cred_fs_cwd();
+        unsigned i = 0;
+        if (!cwd || !cwd[0]) cwd = "/";
+        for (; cwd[i] && i + 1 < sizeof base; i++) base[i] = cwd[i];
+        base[i] = 0;
+    } else {
+        int r = sys_fd_dirpath(dirfd, base, sizeof base);
+        if (r < 0) return r;
+    }
+    int follow_last = !(flags & abi_o_nofollow(c));
+    int r = vfs_resolve_scoped(base, rel, res, follow_last, kp, sizeof kp);
+    if (r < 0) return r;
+    return abi_open_kpath(c, kp, flags);
 }
 static long h_open(struct abi_ctx* c)   { return abi_open_common(c, c->a[0], c->a[1]); }
 static long h_openat(struct abi_ctx* c) {
@@ -715,6 +777,61 @@ static long h_fstatat(struct abi_ctx* c) {
         return AT_WRAP(c->a[0], abi_lstat_path(c, c->a[1], c->a[2]));
     return AT_WRAP(c->a[0], abi_stat_path(c, c->a[1], c->a[2]));
 }
+/* §M90 — statx(dirfd, path, flags, mask, buf): struct statx is the same on
+ * every guest (256 bytes, fixed-width fields).  stx_mask says what is
+ * actually filled: type, mode, links, owner, inode, size and blocks — NOT the
+ * times (the VFS keeps none), so a caller that asks for them learns that
+ * instead of reading zeros as 1970.  glibc's 32-bit stat goes through it, and
+ * coreutils and Go probe it. */
+static long h_statx(struct abi_ctx* c) {
+    struct kstat_full k;
+    unsigned long fl = c->a[2];
+    long r;
+    char kp[256];
+    if (abi_path(c->a[1], kp, sizeof kp) != 0) return -ABI_EFAULT;
+    if (!kp[0] && (fl & ABI_AT_EMPTY_PATH)) r = sys_fstat_full_k((int)c->a[0], &k) == 0 ? 0 : -ABI_EBADF;
+    else if (fl & 0x100) r = AT_WRAP(c->a[0], sys_lstat_full_k(kp, &k) == 0 ? 0 : -ABI_ENOENT);
+    else r = AT_WRAP(c->a[0], sys_stat_full_k(kp, &k) == 0 ? 0 : -ABI_ENOENT);
+    if (r) return r;
+    uintptr_t up = (uintptr_t)c->a[4];
+    if (!abi_w_ok(up, 256)) return -ABI_EFAULT;
+    uint8_t* b = (uint8_t*)up;
+    for (int i = 0; i < 256; i++) b[i] = 0;
+    *(uint32_t*)(b + 0)   = 0x71fu;                  /* TYPE MODE NLINK UID GID INO SIZE BLOCKS */
+    *(uint32_t*)(b + 4)   = 4096;                    /* blksize */
+    *(uint32_t*)(b + 16)  = k.nlink;
+    *(uint32_t*)(b + 20)  = (uint32_t)k.uid;
+    *(uint32_t*)(b + 24)  = (uint32_t)k.gid;
+    *(uint16_t*)(b + 28)  = (uint16_t)k.mode;
+    *(uint64_t*)(b + 32)  = k.ino;
+    *(uint64_t*)(b + 40)  = k.size;
+    *(uint64_t*)(b + 48)  = (k.size + 511) / 512;
+    *(uint32_t*)(b + 128) = k.rdev_major;
+    *(uint32_t*)(b + 132) = k.rdev_minor;
+    *(uint32_t*)(b + 140) = 1;                       /* dev minor, as stat reports dev 1 */
+    return 0;
+}
+/* §M90 — close_range(first, last, flags): close every descriptor in the
+ * range, or with CLOSE_RANGE_CLOEXEC (4) only mark them close-on-exec.
+ * CLOSE_RANGE_UNSHARE (2) is accepted: the table is shared only by threads,
+ * and a program that asks to unshare it then close ranges in it gets exactly
+ * that for its own table — said in its effect, not pretended. */
+static long h_close_range(struct abi_ctx* c) {
+    unsigned long first = c->a[0], last = c->a[1], fl = c->a[2];
+    if (fl & ~6ul || first > last) return -22;
+    if (last >= TASK_MAX_FDS) last = TASK_MAX_FDS - 1;
+    for (unsigned long fd = first; fd <= last && fd < TASK_MAX_FDS; fd++) {
+        if (fl & 4) fd_set_cloexec((int)fd, 1);
+        else if (fd > 2 || fd_lookup((int)fd)) sys_close((int)fd);
+    }
+    return 0;
+}
+/* §M90 — calls this kernel does not offer and whose callers all fall back on
+ * ENOSYS (rseq, keyctl, copy_file_range, the fsopen family): answered
+ * quietly, because each runs once per process or per container and the
+ * "unhandled syscall" line was the bulk of a Docker run's console. */
+static long h_enosys_known(struct abi_ctx* c) { (void)c; return -38; }
+
 static long h_getdents64(struct abi_ctx* c) {
     return sys_getdents64((int)c->a[0], (void*)c->a[1], (size_t)c->a[2]);
 }
@@ -1007,6 +1124,144 @@ static void mnt_cpy(char* d, size_t cap, const char* a, const char* b) {
 #define MS_BIND_        0x1000ul
 #define MS_REC_         0x4000ul
 #define MS_PROPAGATION_ (0x20000ul | 0x40000ul | 0x80000ul | 0x100000ul)
+/* ===========================================================================
+ * §M90 — the new mount API's bind half: open_tree + move_mount (+ the
+ * attributes mount_setattr can put on a detached tree).
+ *
+ *   open_tree(dirfd, path, flags)         without OPEN_TREE_CLONE: an O_PATH
+ *       descriptor of the path.  With it: the same descriptor marked as a
+ *       DETACHED COPY of the tree there (AT_RECURSIVE: with its submounts —
+ *       a bind here always carries everything below its source anyway).
+ *   mount_setattr(fd, "", AT_EMPTY_PATH, attr, size)   on a detached tree:
+ *       MOUNT_ATTR_RDONLY and MOUNT_ATTR_NOEXEC recorded (applied when it is
+ *       attached); NOSUID and NODEV accepted (both hold by construction: no
+ *       set-uid programs, no device-number nodes); an ID-mapped mount is
+ *       refused (EINVAL).  On an attached mount: RDONLY/NOEXEC at once.
+ *   move_mount(from_dfd, from, to_dfd, to, flags)  a detached tree is ATTACHED:
+ *       a bind of its source at the target, in the caller's mount namespace,
+ *       read-only if asked.  Moving an already attached mount is refused
+ *       (EINVAL) and named — nothing here can move a mount yet.
+ *
+ * runc 1.2+ prepares bind-mount sources this way (it opens the source before
+ * entering the container, then attaches it inside); with open_tree absent it
+ * fell back to mount(2) through /proc/self/fd paths.
+ * ========================================================================= */
+#define OPEN_TREE_CLONE_  1ul
+#define AT_EMPTY_PATH_    0x1000ul
+#define AT_RECURSIVE_     0x8000ul
+static long tree_fd_path(int fd, char* out, unsigned cap, struct ofile** keep) {
+    struct ofile* o = fd_get(fd);
+    if (!o) return -9;                                            /* EBADF */
+    if (o->kind != FD_VFS || !o->file || vfs_file_path(o->file, out, cap) != 0) {
+        ofile_unref(o);
+        return -22;
+    }
+    if (keep) *keep = o; else ofile_unref(o);
+    return 0;
+}
+static long h_open_tree(struct abi_ctx* c) {
+    unsigned long fl = c->a[2];
+    char kp[256];
+    if (fl & ~(OPEN_TREE_CLONE_ | 02000000ul /* O_CLOEXEC */ | AT_RECURSIVE_ |
+               AT_EMPTY_PATH_ | 0x100ul /* AT_SYMLINK_NOFOLLOW */ | 0x800ul /* AT_NO_AUTOMOUNT */))
+        return -22;
+    if (fl & OPEN_TREE_CLONE_) {
+        struct task* me = task_current();
+        if (!me || !cred_capable(&me->cred, CAP_SYS_ADMIN_)) return -ABI_EPERM;
+    }
+    char rel[256];
+    if (copy_str_from_user(rel, (uintptr_t)c->a[1], sizeof rel) < 0) return -ABI_EFAULT;
+    if (!rel[0]) {
+        if (!(fl & AT_EMPTY_PATH_)) return -2;
+        long r = tree_fd_path((int)c->a[0], kp, sizeof kp, NULL);
+        if (r) return r;
+    } else {
+        long r = abi_at_join((int)c->a[0], c->a[1], kp, sizeof kp);
+        if (r) return r;
+    }
+    long fd = sys_open_ex_k(kp, VFS_RDONLY | ((fl & 0x100ul) ? VFS_NOFOLLOW : 0), 0, 1 /* O_PATH */);
+    if (fd < 0) return fd;
+    if (fl & OPEN_TREE_CLONE_) {
+        struct ofile* o = fd_lookup((int)fd);
+        if (o) o->tree_detached = 1;
+    }
+    fd_set_cloexec((int)fd, 1);           /* Linux: a mount fd is always close-on-exec */
+    return fd;
+}
+static long h_mount_setattr(struct abi_ctx* c) {
+    /* mount_setattr(dfd, path, flags, struct mount_attr*, size) */
+    unsigned long size = c->a[4];
+    if (size < 32 || !abi_r_ok(c->a[3], 32)) return -22;
+    const uint8_t* u = (const uint8_t*)(uintptr_t)c->a[3];
+    uint64_t set = 0, clr = 0;
+    for (int b = 7; b >= 0; b--) set = (set << 8) | u[b];
+    for (int b = 7; b >= 0; b--) clr = (clr << 8) | u[8 + b];
+    if (set & 0x100000ull /* MOUNT_ATTR_IDMAP */) {
+        kprintf("mount_setattr: ID-mapped mounts are not supported\n");
+        return -22;
+    }
+    char kp[256];
+    struct ofile* o = NULL;
+    char rel[256];
+    if (copy_str_from_user(rel, (uintptr_t)c->a[1], sizeof rel) < 0) return -ABI_EFAULT;
+    if (!rel[0]) {
+        if (!(c->a[2] & AT_EMPTY_PATH_)) return -2;
+        long r = tree_fd_path((int)c->a[0], kp, sizeof kp, &o);
+        if (r) return r;
+    } else {
+        long r = abi_at_join((int)c->a[0], c->a[1], kp, sizeof kp);
+        if (r) return r;
+    }
+    int ro = (set & 1ull) ? 1 : ((clr & 1ull) ? 0 : -1);   /* MOUNT_ATTR_RDONLY */
+    int nx = (set & 8ull) ? 1 : ((clr & 8ull) ? 0 : -1);   /* MOUNT_ATTR_NOEXEC */
+    long ret = 0;
+    if (o && o->tree_detached) {
+        if (ro >= 0) o->tree_ro = ro;
+        if (nx >= 0) o->tree_noexec = nx;
+    } else {
+        if (ro >= 0) ret = vfs_set_readonly(kp, ro) == 0 ? 0 : -22;
+        if (nx >= 0 && ret == 0) ret = vfs_set_noexec(kp, nx) == 0 ? 0 : -22;
+    }
+    if (o) ofile_unref(o);
+    return ret;
+}
+static long h_move_mount(struct abi_ctx* c) {
+    /* move_mount(from_dfd, from_path, to_dfd, to_path, flags) */
+    unsigned long fl = c->a[4];
+    struct task* me = task_current();
+    if (!me || !cred_capable(&me->cred, CAP_SYS_ADMIN_)) return -ABI_EPERM;
+    char from[256], to[256], rel[256];
+    struct ofile* o = NULL;
+    if (copy_str_from_user(rel, (uintptr_t)c->a[1], sizeof rel) < 0) return -ABI_EFAULT;
+    if (!rel[0] && (fl & 0x4ul /* MOVE_MOUNT_F_EMPTY_PATH */)) {
+        long r = tree_fd_path((int)c->a[0], from, sizeof from, &o);
+        if (r) return r;
+    } else {
+        kprintf("move_mount: moving an attached mount is not supported\n");
+        return -22;
+    }
+    if (!o->tree_detached) {
+        ofile_unref(o);
+        kprintf("move_mount: '%s' is not a detached tree (open_tree CLONE)\n", from);
+        return -22;
+    }
+    long r;
+    if (copy_str_from_user(rel, (uintptr_t)c->a[3], sizeof rel) < 0) { ofile_unref(o); return -ABI_EFAULT; }
+    if (!rel[0] && (fl & 0x40ul /* MOVE_MOUNT_T_EMPTY_PATH */)) r = tree_fd_path((int)c->a[2], to, sizeof to, NULL);
+    else r = abi_at_join((int)c->a[2], c->a[3], to, sizeof to);
+    if (r) { ofile_unref(o); return r; }
+    int ro = o->tree_ro, nx = o->tree_noexec;
+    o->tree_detached = 0;                  /* attached once: a second move is a move */
+    ofile_unref(o);
+    int b = vfs_bind(from, to);
+    if (b == -1) return -ABI_ENOENT;
+    if (b == -2) return -16;
+    if (b == -3) return -ABI_ENOTDIR;
+    if (b) return -12;
+    if (ro) vfs_set_readonly(to, 1);
+    if (nx) vfs_set_noexec(to, 1);
+    return 0;
+}
 static long h_mount(struct abi_ctx* c) {
     char tgt[256], fst[32], src[256];
     if (abi_path(c->a[1], tgt, sizeof tgt) != 0) return -ABI_EFAULT;
@@ -1059,10 +1314,10 @@ static long h_mount(struct abi_ctx* c) {
         /* MS_RDONLY is ENFORCED (vfs_set_readonly: everything below answers
          * EROFS); dropping it makes the mount writable again. */
         if (vfs_set_readonly(tgt, (fl & 0x1ul) ? 1 : 0) != 0) return -ABI_ENOENT;
-        if (fl & 0x8ul) {                                 /* NOEXEC */
-            static int said;
-            if (!said++) kprintf("mount: noexec is accepted but not enforced yet (first: '%s')\n", tgt);
-        }
+        /* §M90 — MS_NOEXEC is ENFORCED (vfs_set_noexec): exec and executable
+         * mappings of anything below answer EACCES / EPERM; a remount without
+         * it lifts it, as a remount replaces the flags. */
+        vfs_set_noexec(tgt, (fl & 0x8ul) ? 1 : 0);
         return 0;
     }
     /* §M90 — a FILESYSTEM mount (no MS_BIND), as runc builds a container's
@@ -1124,6 +1379,7 @@ static long h_mount(struct abi_ctx* c) {
          * directory through a live overlay would empty its upper layer */
         if (r != 0 && anon) { vfs_umount(from); vfs_unlink_recursive(from); }
         if (r == 0 && (fl & 0x1ul)) vfs_set_readonly(tgt, 1);   /* mounted read-only */
+        if (r == 0 && (fl & 0x8ul)) vfs_set_noexec(tgt, 1);     /* §M90 — mounted noexec */
         if (r == 0) return 0;
         if (r == -1) return -ABI_ENOENT;
         if (r == -2) return -16;                          /* EBUSY  */
@@ -2174,8 +2430,14 @@ static long h_waitid(struct abi_ctx* c) {
         if (id <= 0) return -22;
         want = ns_pid_resolve(task_current(), id);
         if (want <= 0) return -10;                        /* ECHILD */
+    } else if (idtype == 3 /* P_PIDFD */) {
+        /* §M90 — exactly the process the descriptor names (pidfd.c); ECHILD
+         * when it is not the caller's child — Go's runtime probes pidfd
+         * support with its OWN pidfd and expects exactly that answer. */
+        extern int pidfd_pid_of(int fd, int* live);
+        want = pidfd_pid_of(id, NULL);
+        if (want < 0) return want;                        /* EBADF */
     } else {
-        if (idtype == 3) kprintf("waitid: P_PIDFD refused — no pidfds\n");
         return -22;
     }
     unsigned long si = c->a[2];
@@ -2196,6 +2458,32 @@ static long h_waitid(struct abi_ctx* c) {
         *(int*)(b + u + 8) = sig ? (sig & 0x7F) : (code & 0xFF);
     }
     return 0;
+}
+
+/* §M90 — seccomp(op, flags, args): seccomp.c. */
+static long h_seccomp(struct abi_ctx* c) {
+    return seccomp_syscall((unsigned)c->a[0], c->a[1], (uintptr_t)c->a[2], c->map->word_bytes);
+}
+/* §M90 — pidfd_open(pid, flags): pid in the caller's pid namespace. */
+static long h_pidfd_open(struct abi_ctx* c) {
+    extern int pidfd_create(int gpid, unsigned flags);
+    int pid = (int)c->a[0];
+    if (pid <= 0) return -22;
+    int g = ns_pid_resolve(task_current(), pid);
+    if (g <= 0) return -3;                                /* ESRCH */
+    return pidfd_create(g, (unsigned)c->a[1]);
+}
+/* §M90 — pidfd_send_signal(pidfd, sig, info, flags): kill(2) aimed at the
+ * process the descriptor names; ESRCH once it has exited.  A siginfo, when
+ * given, is not used — the signal goes as kill(2) sends it (said in pidfd.c). */
+static long h_pidfd_send_signal(struct abi_ctx* c) {
+    extern struct task* pidfd_target(int fd, int* err);
+    extern long lnx_send_to_task(struct task* t, int sig);
+    if (c->a[3] != 0) return -22;                         /* no flags known */
+    int err = 0;
+    struct task* t = pidfd_target((int)c->a[0], &err);
+    if (!t) return err;
+    return lnx_send_to_task(t, (int)c->a[1]);
 }
 
 /* execve(path, argv, envp) — §M89: envp IS honoured (it used to be dropped,
@@ -2220,7 +2508,7 @@ static long h_execve(struct abi_ctx* c) {
     int r = proc_execve_env((const char*)(uintptr_t)c->a[0],
                             (char* const*)(uintptr_t)c->a[1],
                             (char* const*)(uintptr_t)c->a[2]);
-    return r == -7 ? -7 : (r < 0 ? -ABI_ENOENT : r);
+    return r == -7 ? -7 : r == -13 ? -13 : (r < 0 ? -ABI_ENOENT : r);
 }
 /* §M90 — execveat(dirfd, path, argv, envp, flags).  AT_EMPTY_PATH with an
  * empty path executes the descriptor itself (fexecve) — a memfd included,
@@ -2241,10 +2529,10 @@ static long h_execveat(struct abi_ctx* c) {
         while (d) fp[n++] = dg[--d];
         fp[n] = 0;
         int r = proc_execve_env_k(fp, av, ev);
-        return r == -7 ? -7 : (r < 0 ? -ABI_ENOENT : r);
+        return r == -7 ? -7 : r == -13 ? -13 : (r < 0 ? -ABI_ENOENT : r);
     }
     long r = AT_WRAP(c->a[0], (long)proc_execve_env_k(kp, av, ev));
-    return r == -7 ? -7 : (r < 0 ? -ABI_ENOENT : r);
+    return r == -7 ? -7 : r == -13 ? -13 : (r < 0 ? -ABI_ENOENT : r);
 }
 
 /* ---- §M89 — the calls a JVM makes before main() ----------------------------
@@ -2705,6 +2993,9 @@ static long h_prctl(struct abi_ctx* c) {
         }
         return -ABI_EINVAL;
     }
+    if (opt == 21) return seccomp_mode(t);                /* PR_GET_SECCOMP */
+    if (opt == 22)                                        /* PR_SET_SECCOMP */
+        return seccomp_prctl_set(c->a[1], (uintptr_t)c->a[2], c->map->word_bytes);
     if (opt == 3) return 1;                               /* PR_GET_DUMPABLE */
     if (opt == 4) return 0;                               /* PR_SET_DUMPABLE */
     return -ABI_EINVAL;
@@ -3779,6 +4070,16 @@ static const struct {
     [ABI_SIGPENDING]      = { "sigpending",      h_sigpending      },
     [ABI_WAIT]            = { "wait",            h_wait },
     [ABI_WAITID]          = { "waitid",          h_waitid },
+    [ABI_PIDFD_OPEN]      = { "pidfd_open",      h_pidfd_open },
+    [ABI_PIDFD_SEND_SIGNAL] = { "pidfd_send_signal", h_pidfd_send_signal },
+    [ABI_OPENAT2]         = { "openat2",         h_openat2 },
+    [ABI_SECCOMP]         = { "seccomp",         h_seccomp },
+    [ABI_STATX]           = { "statx",           h_statx },
+    [ABI_CLOSE_RANGE]     = { "close_range",     h_close_range },
+    [ABI_ENOSYS_KNOWN]    = { "enosys-known",    h_enosys_known },
+    [ABI_OPEN_TREE]       = { "open_tree",       h_open_tree },
+    [ABI_MOVE_MOUNT]      = { "move_mount",      h_move_mount },
+    [ABI_MOUNT_SETATTR]   = { "mount_setattr",   h_mount_setattr },
     [ABI_PIPE]            = { "pipe",            h_pipe },
     [ABI_PIPE2]           = { "pipe2",           h_pipe2 },
     [ABI_EXECVE]          = { "execve",          h_execve },

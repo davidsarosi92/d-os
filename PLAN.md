@@ -232,10 +232,11 @@ fixed first, whatever it touches.
 | queued UI | ✅ done (§4.116) — Memory page, System information, translations 73 → 0 | — |
 | §M88 | ✅ (§4.118) | open: a taskbar per monitor |
 | §M89 | ◐ → core ✅ | Java: `java Hello.java` from the unmodified JDK on x86_64 + aarch64 (DOCS §4.119); open: `app install` end to end, host-side delivery, rung 5 measurements |
-| §M90 | ◐ ~90 % (2026-10-12) | Docker itself on d-os (dockerd + containerd + runc + the CLI), no Docker Desktop — rungs 1-2 ✅ (`docker run … echo hi` prints `hi`, aarch64); cgroup limits + inotify ✅ (OOMKilled true/137); overlayfs + overlay2 ✅ (run/diff/commit); networking ✅ (default bridge, NAT, `-p`); IPv6 + netfilter ✅; `-it`/build/volumes ✅; next: x86_64 — resume order in §M90 |
+| §M90 | ✅ (2026-10-16) | Docker itself on d-os (dockerd + containerd + runc + the CLI), no Docker Desktop — rungs 1-2 ✅ (`docker run … echo hi` prints `hi`, aarch64); cgroup limits + inotify ✅ (OOMKilled true/137); overlayfs + overlay2 ✅ (run/diff/commit); networking ✅ (default bridge, NAT, `-p`); IPv6 + netfilter ✅; `-it`/build/volumes ✅; x86_64 ✅ (higher-half kernel) — DOCS §4.120 |
 | §M91 | — | the ABI as its own project: d-os, Linux and NT personalities over one common language (ReactOS's pattern) — designed, not started |
 | §M92 | — | a driver engine for d-os, Linux and Windows drivers — an OPEN QUESTION, recorded, not decided |
-| §M93 | — | installing software as a user: DOWNLOAD from the vendor (`wget`) → `app install` → run, no OCI image required — the guide plus the `.tar.gz` install, glibc decision, manifest, service registration; **next after §M90**, before §M91/§M92 |
+| §M93 | ✅ (2026-10-16) | installing software as a user: DOWNLOAD from the vendor (`wget`) → `app install` → run, no OCI image required — the guide plus the `.tar.gz` install, glibc decision, manifest, service registration — shipped, DOCS §4.120 + docs/INSTALLING.md |
+| §M94 | — | package installation as ONE milestone, up to building from a git repository into code d-os runs NATIVELY (recorded 2026-10-15, not scheduled) |
 | §M68 | — | investigation, not started |
 | §M83, §M84 | — | designed, not started |
 
@@ -325,10 +326,10 @@ what); a session can pick a theme and push on it.
 | M86 | **Memory beyond the 4 GiB line on i386 and aarch64** — asked for directly (2026-09-25).  x86_64 already discovers its ceiling (§M48, verified to 128 GiB).  i386 manages only what its 1 GiB identity map covers (473 MiB free on a 512 MiB box; RAM past 1 GiB unused) and cannot address physical memory above 4 GiB at all without PAE; aarch64's early MMU identity-maps 0-4 GiB in 1 GiB blocks with RAM from `0x4000_0000`, so at most ~3 GiB is usable and `hal_extend_identity_map` caps at 4 GiB | Memory / Portability | ✅ COMPLETE (highmem §4.94, PAE §4.96, aarch64 TTBR1 §4.97, multi-range DTB §4.98, user no-execute on x86 §4.104).  Kernel pages stay executable (modules run from the heap) |
 | M87 | **Network and storage in the Control Panel** — asked for directly (2026-09-27): a Network page, a taskbar network indicator with a Wi-Fi chooser, disk management with its functions, and the missing translations | UX / Network / Storage | §M87 — ✅ SHIPPED (DOCS §4.103): six-state network status, link state, admin down, static config keys, a simulated Wi-Fi adapter (QEMU has no Wi-Fi), `vfs_umount` + holds, an exFAT formatter (fsck-clean), RAM disks, `locale missing`; open: a real Wi-Fi driver, partition tables, a second virtio disk |
 | M89 | **Java — a JRE, and the JDK with it** — asked for directly (2026-09-28): Alpine's musl-built OpenJDK as a §M73 image on x86_64 + aarch64 (i386: no current JDK exists).  Needs a real address-space layer (reservations, demand-zero, PROT_NONE, lazy file maps), Linux signal delivery with siginfo/ucontext, arm64 threads, and a bulk of small calls | Userland | §M89 — core done: the JDK runs Hello.java on both 64-bit arches (DOCS §4.119); installer + measurements open |
-| M90 | **Docker itself on d-os** — asked for directly (2026-09-28): "full Docker, not the desktop if it can be left out, but everything else".  The real `docker` CLI, `dockerd`, `containerd` and `runc` (static Go binaries) running on d-os and managing containers.  Needs Linux namespaces, cgroup v2, overlayfs, netlink + veth + bridge networking, mount/pivot_root, capabilities/seccomp, and the Go runtime's own demands | Userland | §M90 — IN PROGRESS: rung 1 done (CLI), rung 2 under way (dockerd) |
+| M90 | **Docker itself on d-os** — asked for directly (2026-09-28): "full Docker, not the desktop if it can be left out, but everything else".  The real `docker` CLI, `dockerd`, `containerd` and `runc` (static Go binaries) running on d-os and managing containers.  Needs Linux namespaces, cgroup v2, overlayfs, netlink + veth + bridge networking, mount/pivot_root, capabilities/seccomp, and the Go runtime's own demands | Userland | ✅ §M90 — shipped 2026-10-16 (DOCS §4.120) |
 | M91 | **The ABI becomes its own project — three personalities (d-os, Linux, NT) over one common language** — asked for directly (2026-10-04): *any compatibility layer must be easy to add at any time, and developable as a separate project.*  §M50's engine already translates a guest trap into canonical operations; this finishes it (every handler behind a versioned HOST INTERFACE, the native d-os ABI as a table too), lifts it into its own repository as packages (§M83), and adds an **NT personality** on ReactOS's pattern: the d-os kernel stays, ReactOS's UNMODIFIED user-mode layer (ntdll, the Wine-synced kernel32/user32/gdi32, its applications and its tests) runs on top, because our NT guest map IS ReactOS's system-call table | Architecture / Compatibility | §M91 — designed, not started |
 | M92 | **A driver engine — d-os, Linux and Windows drivers? (OPEN QUESTION)** — raised 2026-10-04, deliberately not decided: the same shape as §M91 one layer down (§M33's `drvrt.h` as the common language, a personality per driver world).  Recorded with its asymmetries, its prerequisites and the condition that would trigger the decision | Architecture / Drivers | §M92 — open question |
-| M93 | **Installing software as a user — the guide and what it needs** — asked for directly (2026-10-04): *I download a package from the internet; what do I do so that it installs?*  Today Java installs only through a host-prepared disk and Docker's binaries were copied onto the test disk by hand.  The milestone is a user-facing guide (download with `wget` → `app install <file>` → run, update, remove) plus what makes every sentence of it true: `app install` for plain `.tar.gz` releases with an architecture check, a minimal manifest, service registration on install (Docker's daemons start without typing) | Packaging / Docs | §M93 — recorded, not started |
+| M93 | **Installing software as a user — the guide and what it needs** — asked for directly (2026-10-04): *I download a package from the internet; what do I do so that it installs?*  Today Java installs only through a host-prepared disk and Docker's binaries were copied onto the test disk by hand.  The milestone is a user-facing guide (download with `wget` → `app install <file>` → run, update, remove) plus what makes every sentence of it true: `app install` for plain `.tar.gz` releases with an architecture check, a minimal manifest, service registration on install (Docker's daemons start without typing) | Packaging / Docs | ✅ §M93 — shipped 2026-10-16 (DOCS §4.120) |
 
 ### Cross-cutting constraints
 
@@ -6065,235 +6066,20 @@ not i386.
 
 ## §M90 — Docker itself on d-os (no Docker Desktop)
 
-**Status: IN PROGRESS.  Asked for 2026-09-28: "Running full Docker—no need for Desktop if it can be skipped, but everything else is required.".**
-
-**Progress (aarch64; x86_64 waits for the higher-half kernel move — the
-fixed-address Go binaries load at 0x200000, inside the low identity map):**
-- Rung 1 DONE (2026-10-01): the unmodified `docker` CLI runs, `docker version`
-  prints the client half.  Needed: programs streamed from the file (no 16 MiB
-  ELF limit), eventfd, umask, faccessat2, /proc/cpuinfo + Linux meminfo lines,
-  CNTVCT readable from EL0, a signal-return trampoline page (Go installs no
-  sa_restorer), ESR/FAR read once at exception entry.
-- Rung 2 under way (2026-10-02): `dockerd` starts, creates and adopts its API
-  socket and launches its managed containerd.  Built for it: named AF_UNIX
-  stream sockets (bind/listen/accept/connect, abstract names), a real
-  `getsockopt` (it answered success and wrote nothing — Go read SO_TYPE as 0
-  and panicked), **edge-triggered epoll** (§M56 had refused EPOLLET; Go
-  registers every fd that way), **close-on-exec** (there was none — Go's
-  fork/exec learns success from a CLOEXEC pipe), sessions/process groups
-  (`setsid` & co.), `chown`/`fchownat`, `PR_SET_PDEATHSIG`,
-  `/proc/self/mountinfo` + `/proc/mounts`; fixed on the way: draining a full
-  pipe never announced the writer's POLLOUT, polling an epoll set consumed a
-  ONESHOT arming.
-- Rung 2, second step (2026-10-02): dockerd boots containerd, runs runc's
-  feature checks, creates its containerd client; stops at "Devices cgroup
-  isn't mounted".  Built: thread groups (tgid), process-wide exit_group and
-  wait, flock, fsync family, directory descriptors for *at, rename replacing,
-  a coherent page cache for read-only MAP_SHARED (bbolt); fixed signal-mask
-  inheritance, kernel writes to COW pages, killed threads leaking the shared
-  fd table, the address space freed under live threads.
-- cgroup v2 DONE (2026-10-02): `cgroup2` at /sys/fs/cgroup with real
-  membership, delegation, kill, freeze; limits stored, enforcement in rung 3.
-  dockerd then loads/restores containers and stops at the network controller.
-- rtnetlink DONE, and **dockerd is UP (2026-10-02)**: it boots containerd,
-  runs runc/docker-init, serves the API; `docker version` and `docker info`
-  answer with the server half.  The road there fixed ten kernel defects (DOCS
-  change log) — register state at program entry, std-slot close at exit,
-  listener HUP, unlink of open files, fork-snapshot and COW races.
-- 2026-10-02 later: connected UDP sockets (Go's resolver: DNS works, docker
-  pull reaches the registry's TLS), /proc/self/fd.  Measured blockers for the
-  last step, in order: `docker load` → the daemon's untar child calls
-  unshare(CLONE_NEWNS) (mount namespaces); `docker pull` → no CA bundle where
-  Go looks (/etc/ssl/certs/ca-certificates.crt); /proc/self/status; and
-  containerd's 40 MB exec from exFAT can exceed dockerd's 15 s start window
-  (start containerd first and pass --containerd until exec is faster).
-- Rung 2 DONE (2026-10-04): `docker run --network host busybox:musl echo hi`
-  prints `hi` on aarch64 — PID/UTS/IPC/cgroup/time/mount namespaces, binds and
-  filesystem mounts, pivot_root, runc's memfd exec, cgroup-device eBPF, Linux
-  capabilities, set*id, /proc/<pid>/stat, execve de_thread, half-close poll
-  (DOCS change log 2026-10-03/04).  Rung 3 is partly done with it: every
-  namespace runc asks for exists.
-- **STATE 2026-10-04, estimated ~55-60 % of the milestone** (by effort: rungs
-  1-2, the larger half, are done).  Work pauses until next week.
-- Rung 3's rest DONE (2026-10-08): cgroup v2 limits ENFORCED — pids.max
-  (fork EAGAIN), cpu.max (quota per period, throttled tasks not picked),
-  memory.max (measured near the limit, OOM kill = 137, memory.events) — and
-  inotify (`kernel/fs/inotify.c`).  Through the real Docker on aarch64:
-  `--memory 64m` → OOMKilled true / 137, `--pids-limit` → fork EAGAIN,
-  `--cpus 0.5` → cpu.max 50000 100000.  Not enforced, stated in cgroupfs.c:
-  cpu.weight, memory.high/low/min, swap, io, cpuset.  2026-10-09: memory.max
-  moved onto a Linux-style CHARGE MODEL (charge at allocation, uncharge at
-  free, per-frame owner; a memfd's page cache charged to its creator) — an
-  8 MiB container starts, memory.current is exact.  Estimate now ~62-65 %.
-- Rung 4 DONE (2026-10-09): overlayfs (kernel/fs/overlayfs.c) and Docker's
-  overlay2 driver on it — run, a write + a deletion in a container, `docker
-  diff`, `docker commit` and the committed image all correct.  Three VFS
-  defects fixed on the way (whole page cache dropped at every unmount, bind
-  records outliving their dentries, a bind made just before a namespace
-  invisible in it).  Estimate now ~70 %.
-- Rung 5 (networking), staged, each with its completion condition:
-  5a network namespaces in the stack (devices, TCP, UDP, ARP, routes per
-     namespace; a loopback per namespace) — DONE when a listener in one
-     namespace is unreachable from another and 127.0.0.1 differs (`netnstest`);
-  5b veth pairs and a learning bridge (kernel/core/netvirt.c) — DONE when two
-     namespaces talk over a veth and a host reaches a namespace through a
-     bridge and back (`netnstest`);
-  5c rtnetlink configuration: NEWLINK bridge/veth (peer namespace by fd or
-     pid), SETLINK up/down/rename/master/netns/MTU/MAC, DELLINK, NEW/DELADDR,
-     NEW/DELROUTE, per-namespace dumps with stable ifindex — DONE when dockerd
-     starts without --bridge=none and creates docker0 (`nltest`);
-  5d IPv4 forwarding per namespace (/proc/sys/net/ipv4/ip_forward) and
-     masquerade as a named kernel policy (`net.masquerade`; no netfilter) —
-     DONE when a namespace behind a bridge reaches the gateway (`netnstest`);
-  5e `-p` through docker-proxy — DONE when `docker run -p 8080:80 … httpd`
-     answers on the host's 127.0.0.1:8080.
-  The rung is complete when a container on Docker's default network has an
-  address, reaches the internet, and a published port answers.
-  DONE 2026-10-10 (all five stages; DOCS change log): eth0 172.17.0.2/16,
-  `wget http://example.com` from a container through NAT, `-p 8080:80`
-  answers on the host.  Estimate now ~80 %.
-- **RESUME HERE — in this order:**
-  1. (done 2026-10-08 — cgroup limits + inotify)
-  2. (done 2026-10-09 — overlayfs; the test recipe now uses
-     `--storage-driver=overlay2`)
-  3. (done 2026-10-10 — networking; dockerd now runs WITHOUT --bridge=none;
-     the gaps closed 2026-10-10: ICMP ping/raw sockets, AF_PACKET, sockets
-     keep their namespace, the ARP hold queue, FDB ageing, connections reset
-     when their device goes)
-  3a. **IPv6 (asked for before rung 6: "legyünk teljesek").**  Stages a-d
-     DONE 2026-10-10 (net6.c; ip6test, tcp6test, sock6test; DOCS change
-     log); stage e's kernel half (rtnetlink AF_INET6 addresses/routes/
-     lookups) and v6 FORWARDING (per namespace, NDP hold queue) DONE the same
-     day; what remains is the Docker proof (`--ipv6`).  Stages, each done
-     when its falsifier passes on all three arches:
-     (a) addresses + NDP: a per-device link-local (fe80::/64 from the MAC,
-         EUI-64) and configured globals, Neighbour Solicitation/Advertisement
-         (the IPv6 ARP), DAD answered honestly, ICMPv6 echo — `ping6 ::1`,
-         two namespaces over a veth ping each other by link-local;
-     (b) routing: a v6 route table per namespace (connected /64 + table +
-         default), forwarding per namespace (`/proc/sys/net/ipv6/conf/all/forwarding`);
-     (c) TCP and UDP over v6 on the SAME connection table (the address
-         widened to 16 bytes, v4 as v4-mapped where a socket is dual-stack);
-     (d) AF_INET6 sockets through the §M50 engine (sockaddr_in6, IPV6_V6ONLY),
-         `getaddrinfo` answering AAAA;
-     (e) rtnetlink: RTM_NEWADDR/GETADDR/NEWROUTE/GETROUTE for AF_INET6, so
-         dockerd's `--ipv6` network and `ip -6` work;
-     done = `docker network create --ipv6` + a container pinging the host's v6
-     address, and `tcptest` over ::1.  SLAAC/router advertisements are NOT in
-     scope (QEMU's SLIRP offers them; a static/link-local setup is what Docker
-     uses) — stated, not silently missing.
-  3b. **netfilter — SHIPPED 2026-10-11 (DOCS change log 2026-10-11).**
-     nf_tables over NETLINK_NETFILTER (batched transactions with rollback,
-     dumps, live counters), a compiled rule VM, conntrack with NAT at Linux's
-     priority points, hooks in the IPv4 and IPv6 paths, br_netfilter, per-device
-     `net/ipv4/conf/*/{forwarding,route_localnet}` with the 127/8 martian rule,
-     the unmodified static `nft` 1.1.1, `waitid`.  Tests: `nfttest`,
-     `brnftest`, netnstest's martian cases.  Docker's nftables firewall backend
-     (`--firewall-backend=nftables --userland-proxy=false`) creates its whole
-     ruleset (verdict maps, fib, ct, masquerade, per-network chains).  Lessons:
-     conntrack must recognise an already-translated packet at every later hook
-     (Linux attaches it to the packet instead); the INPUT hook rewrites the
-     source a transport layer reads; raw/conntrack/NAT are PRIORITIES among the
-     chains, not a prologue — each defect is falsified in the tests.  Open:
-     reject's RST/ICMP, ICMP-error inner headers, conntrack helpers, flowtables
-     and stateful objects (refused by name).
-  4. ~~Rung 6: `docker run -it` (pty/devpts), `docker build`, volumes.~~  DONE
-     2026-10-12 (DOCS change log): ptys + devpts instances + the controlling
-     terminal, the console as a VT100 terminal, legacy and BuildKit builds
-     (real docker-buildx), bind/named/tmpfs volumes.  Open: pidfd, clone3,
-     openat2, open_tree, seccomp (ENOSYS, callers fall back); the BuildKit
-     "session healthcheck failed fatally" log line, not yet explained.
-  5. x86_64: waits for the higher-half kernel move.
-  Open beside it: NEXT.md #14 (rare pthread_join hang) and #16 (a non-leader
-  thread's execve keeps its pid); `noexec` accepted, not enforced.
-- Test recipe (aarch64, ~20 min a run): `scripts/dos-shell-test.py --arch
-  aarch64 --smp 2 --mem 3G --disk build/aarch64/dk.img --via serial
-  --boot-timeout 240 --between 75 --settle 120` (the harness types on a fixed
-  clock: too short a pause reads as a hang) with `mkdir /run`, `containerd &`,
-  `dockerd --containerd=/run/containerd/containerd.sock --storage-driver=overlay2 (no --bridge=none since 2026-10-10)
-  --iptables=false --bridge=none --ip6tables=false &`, `docker version`,
-  `docker load -i /mnt/busybox.tar`, `docker run --network host busybox:musl
-  echo hi`; `strace err name <task>` to see a failing step.
-- Open, noted for later: containerd-shim daemonizes (fork, parent exits) — a
-  Linux-personality child must then outlive its parent (today the kill-tree
-  rule ends it); TASK_MAX_FDS was 32 (256 since 2026-10-10); dockerd allows containerd 15 s to start
-  and exec of the 40 MB binary from exFAT takes ~10 s under emulation.
-- Open from 2026-10-10: `pidfd_open` / `pidfd_send_signal` / `waitid(P_PIDFD)`
-  and `CLONE_PIDFD` (containerd logs "failed to ensure the kernel supports
-  pidfd"; Go and containerd probe and fall back, so nothing fails today).
-
-### What "full Docker" is, and what it is not
-
-Docker Desktop is a Mac/Windows product that runs a Linux VM so Docker has a
-Linux kernel to talk to — it is exactly the part d-os replaces, so leaving it
-out is not a restriction but the point.  What remains is four Linux programs,
-all statically linked Go binaries: the `docker` CLI, `dockerd` (the Engine
-API), `containerd` (image and container lifecycle) and `runc` (which sets a
-container up with kernel features and execs its first process).  They run
-unmodified under the §M50 Linux personality, the way §M89's JDK does — which
-means d-os must provide the kernel features runc asks for, BY THE LINUX
-INTERFACE, not d-os's own `ctr` model.
-
-### What is missing, measured against the tree (2026-09-28)
-
-1. **The Go runtime.**  Goroutine preemption by SIGURG to a THREAD (§M89's
-   tgkill + interrupt-path delivery cover it), `clone` with the full flag
-   set, `epoll`, `futex`, `mmap` reservations (§M89 rung 1), `sigaltstack`
-   per thread, `rt_sigprocmask` for all 64 signals (done in §M89).  The CLI
-   alone is the first test: `docker version` without a daemon.
-2. **Namespaces** — `clone`/`unshare`/`setns` with CLONE_NEWNS, NEWPID,
-   NEWUTS, NEWIPC, NEWNET, NEWUSER, NEWCGROUP.  d-os has ONE of these in
-   spirit (§M73's per-task root and uid); a mount namespace means a per-task
-   MOUNT TABLE, a PID namespace a second pid numbering.  The largest single
-   piece.
-3. **mount(2) as Linux knows it** — bind mounts, `MS_PRIVATE/SLAVE`
-   propagation (runc sets it), `pivot_root`, `umount2(MNT_DETACH)`, `proc`,
-   `sysfs`, `tmpfs`, `devpts`, `mqueue` filesystem types.
-4. **overlayfs** (Docker's default storage driver; `vfs` driver as the first
-   step — plain copies, no kernel feature needed).
-5. **cgroup v2** — a `cgroup2` filesystem with cpu, memory, pids, io
-   controllers.  §M72's reserves are the enforcement underneath; the
-   filesystem is the interface.
-6. **Networking** — netlink (rtnetlink: links, addresses, routes), `veth`
-   pairs, a bridge, and NAT; or `--network host` / `--bridge=none` first.
-   iptables needs netfilter — the far end.
-7. **The rest of the surface**: capabilities (`capset`/`prctl` bounding
-   set), `seccomp` (runc loads a filter; accepting and not enforcing would be
-   theatre — enforcing a BPF filter is real work), `/proc/self/*` in depth,
-   `/sys/fs/cgroup`, unix sockets with SCM_CREDENTIALS, `openat2`, `statx`,
-   `xattrs`, device nodes (`mknod`), pty (`/dev/ptmx`) for `docker run -it`.
-
-### The estimate, and a route that lands something early
-
-**Larger than §M89, and larger than M21** — it is a second kernel
-personality's worth of subsystems (namespaces, cgroups, overlayfs,
-netlink).  So it is staged so each rung is usable on its own:
-
-1. **The Go runtime + the CLI**: `docker version` (client half).
-2. **dockerd with the most permissive settings**: `--storage-driver=vfs
-   --iptables=false --bridge=none --cgroup-manager=cgroupfs`, host network —
-   needs mount namespaces, pivot_root, a minimal cgroup2 and runc's setup
-   path; `docker run --network host busybox echo hi`.
-3. PID/UTS/IPC namespaces, cgroup limits enforced (`--memory`, `--cpus`).
-4. overlayfs.
-5. Networking: veth + bridge + NAT; `docker run -p 8080:80 nginx`.
-6. `docker build`, `docker run -it` (pty), volumes.
-
-**A cheaper alternative, stated so the choice is conscious:** implement the
-Docker Engine API (a REST protocol over a unix socket) NATIVELY on top of
-§M73's `ctr`, and run only the unmodified `docker` CLI against it.  Every
-`docker` command then works for what `ctr` can do, without namespaces or
-cgroups in the Linux sense — but it is not "Docker running on d-os", and the
-user asked for the real thing.  **The user's reason, worth keeping: real
-Docker updates itself upstream and does not become d-os's burden to
-maintain; a native Engine API would be.  Both may be built.**
-
-**Decided with the user (2026-10-01): `ctr` STAYS.**  It remains the tool that
-opens and unpacks images (§M73's `ociunpack`), and its role grows toward
-Docker's — the natural home of the native Engine API route — while the real
-dockerd/containerd/runc run beside it under the Linux personality.  Neither
-replaces the other: `ctr` is d-os's own, always-available container path;
-upstream Docker is the compatible one.
+**Shipped 2026-10-16, see DOCS.md §4.120 and the change-log entries of
+2026-10-01 .. 2026-10-16.**  The unmodified static Docker release and the real
+docker-buildx plugin run on aarch64 and x86_64: version/info, load, pull, run
+(host and bridge networking, NAT, `-p`), `-it`, build (legacy and BuildKit),
+volumes, `--memory`, and Docker's default seccomp profile.  The x86_64 half
+needed the kernel moved to the higher half (0xFFFFFFFF80000000) so that the
+fixed-address Go binaries map where they ask.  **Lessons kept:** a feature the
+container runtime only PROBES for (pidfd, clone3, openat2, the new mount API)
+still decides which code path it takes — a stub that answers wrongly sends it
+down a path nothing tested, so each was built for real; and a credential built
+on an unzeroed stack struct took a seccomp pointer from stack garbage
+(`cred_become_user`), which surfaced as a GPF somewhere else entirely.
+**Open, said:** `/var/lib/docker` is in memory (exFAT cannot hold overlay
+layers); TIOCPKT and the alternate screen are unimplemented.
 
 ## §M91 — The ABI becomes its own project: d-os, Linux and NT over one common language
 
@@ -6523,103 +6309,48 @@ pattern.
 
 ## §M93 — Installing software as a user: the guide, and what it needs
 
-Asked for directly (2026-10-04): *a description of how I will install Docker,
-Java and the like — I go to the internet, download a package, and what do I
-have to do so that it installs.*  The deliverable is a USER-FACING GUIDE;
-the milestone is the guide plus whatever has to exist for every sentence in
-it to be true.
+**Shipped 2026-10-16, see DOCS.md §4.120 and docs/INSTALLING.md
+(docs/TELEPITES.md).**  The user downloads the vendor's release with `wget`
+(no OCI image needed) and runs `app install <file> [name]`: every program in
+the package is checked for this machine (processor, and glibc vs musl via
+PT_INTERP) before anything is installed; versions install side by side under
+/mnt/apps; a manifest (built in for Docker and buildx, or the release's own
+`.dos-app`) creates directories, sets sysctls, links plugins and starts
+services at install and at every boot.  A glibc package (Debian 12, unmodified)
+runs glibc-linked releases.  Verified with Docker 29.9.1 + buildx 0.38.0 and
+the Temurin 21 JDK.  **Lesson kept:** the slowest link decides whether a large
+download finishes at all — an 8 KiB TCP window through the emulator's NAT was
+slow enough for a CDN to reset the connection, so `wget` resumes with Range and
+the window is 64 KiB.
 
-**Status: recorded, not started.  ORDER (decided 2026-10-04): right AFTER
-§M90 Docker; §M91 (ABI project) and §M92 (driver engine) come later.**
-Relates to §M83 (packages from outside the image) and §M89 (`app install`).
+## §M94 — Package installation, up to building from source into native d-os code
 
-**THE PRIMARY ROUTE IS A DIRECT DOWNLOAD, NOT AN OCI IMAGE — stated by the
-user as extremely important.**  The user goes to the vendor's site, downloads
-the official release (Docker's `docker-<ver>.tgz` static binaries, a JDK
-`.tar.gz` from Adoptium), and installs it: `wget <url>` → `app install
-<file>`.  No `docker save` on a host, no image registry in between.  OCI
-images stay accepted by `app install`, as a secondary form.
+**Status: RECORDED 2026-10-15, not scheduled.  Asked for: "package
+installation — even compiling, from a git repo, into code d-os runs natively
+— in one milestone".**
 
-**What a download can be, honestly:** most Linux binary releases are linked
-against GLIBC, and d-os ships musl.  A STATIC release runs (Docker's static
-binaries do); a musl build runs (Adoptium publishes Alpine/musl JDK
-tarballs); a glibc-linked one needs a glibc package — an open decision of
-this milestone (ship one as a package, or refuse by name: "this program
-needs glibc").  The installer must tell the three apart before installing.
-**Decided 2026-10-04: a glibc PACKAGE beside musl**, not a refusal — the libc
-is per program (a static binary carries its own; a dynamic one names its
-loader, `ld-musl-*` or `ld-linux-*`), the kernel serves both through the same
-Linux personality, and the package declares its ABI as data (`pkg_recipe.abi`,
-the swappable-layers rule).  The work it brings is ABI breadth: glibc uses
-calls musl does not (`clone3`, `rseq`, `statx`, … ENOSYS today).
+One milestone covers the whole road from "I have a package" to "it runs":
 
-**Who answers "can this run?" — the PERSONALITY, through a recognizer
-(decided 2026-10-04; shared with §M91).**  The installer and exec do not
-know formats or libcs: they ask the recognizer registry, and the answer
-names the personality or the reason — "runs on Linux", "needs the glibc
-package", "an NT program, the NT personality is not installed", "wrong
-architecture".  See §M91 "The recognizer".
+- **Install from a package** — the §M35.5 store as the backend, the §M93
+  `app install` front end (a binary release, an OCI image), versions side by
+  side, rollback, GC.
+- **Install from SOURCE** — `pkg build <git-url>[@ref]`: fetch the repository
+  (a git client in d-os: smart-HTTP(S) over the existing TLS stack, or a
+  tarball of a ref as the first rung), read a RECIPE (the §M35.5 text recipe,
+  in the repository or in a recipe index), and build it ON d-os with the
+  toolchain d-os already runs (TinyCC today; a full compiler — GCC/Clang — as
+  a store package is part of this milestone) into the NATIVE ABI: the in-tree
+  libc / d-os syscalls, not the Linux personality.  The result is a store
+  package like any other.
+- **Hermetic and reproducible** — the build runs in an isolated environment
+  (§M33/§M73 containment), sees only its declared inputs, and the store hash
+  covers source + recipe + toolchain.
+- **Dependencies** — a recipe names other packages; they are built or
+  installed first, each pinned in the closure.
 
-### What exists today, said plainly
-
-| software | how it gets onto the machine today | a user can do it? |
-|---|---|---|
-| Java (Temurin JDK) | an OCI image: `docker save eclipse-temurin:21-jdk-alpine -o java.tar` ON A HOST, the archive placed in `/mnt/incoming/` (by `scripts/deliver-apps.sh` from `build/apps/`), the `apps` boot service runs `app install`: `/mnt/apps/<name>/<version>/`, `/bin` links, `app use` / `app remove` | only with a host and our scripts |
-| Docker (CLI, dockerd, containerd, runc) | the static binaries were copied onto the test disk (`build/aarch64/dk.img`) by hand | **no** |
-| an image for Docker | `docker load -i /mnt/busybox.tar`, or `docker pull` once dockerd runs | yes, once Docker is installed |
-
-What the machine itself can do: download (`wget`, TLS with CA verification),
-unpack an OCI IMAGE (`ociunpack`: gzip layers, verified).  What it cannot:
-unpack a plain `.tar.gz` / `.tgz` (the form Docker's static release and most
-Linux binary releases ship in), or install anything it downloaded without a
-host preparing the disk.
-
-### What the guide must be able to say
-
-1. **Get the package** — inside d-os with `wget <url>` (or copy it onto the
-   disk from another machine), into the user's home or `/mnt/incoming/`.
-2. **Install it** — ONE command, whatever the package's form:
-   `app install <file>` for an OCI image archive, a `.tar.gz`/`.tgz` binary
-   release (Docker's `docker-<ver>.tgz`, a JDK tarball), and later a §M83
-   package; dropping the file into `/mnt/incoming/` does the same at boot.
-3. **Use it** — the programs are on PATH (`/bin` links); what the package
-   needs to start (Docker: start `containerd` and `dockerd`, ideally as a
-   §M29 SERVICE the installer registers) is done for the user or stated.
-4. **Update, switch, remove** — `app list`, `app use <name> <version>`,
-   `app remove`; a new version installs beside the old one.
-5. **When it fails** — every refusal names its reason (no space, wrong
-   architecture, an unknown format); where the log is.
-
-### What has to be built for that
-
-- **A glibc package beside musl** (its loader and libraries, versioned), and
-  the Linux personality's breadth for what glibc calls; the recognizer
-  (§M91) reports a glibc program as "needs the glibc package" until it is
-  installed — never install something that cannot start.
-- `app install` accepting a plain `.tar.gz`/`.tgz` (a generic tar + gzip
-  unpacker in ring 3 — `ociunpack` already has both halves), with the
-  ARCHITECTURE checked from the binaries' ELF headers before anything is
-  linked (an x86_64 Docker on aarch64 must be refused by name).
-- A package MANIFEST for archives that carry none (which programs, which
-  services to start, which version) — minimal, and optional when the layout
-  is obvious (`docker/` with its binaries).
-- Service registration on install: Docker's `containerd` + `dockerd` start at
-  boot (or on first use) without typing; the dk.img hand-copy retired.
-- Room on the disk: `deliver-apps.sh` grows the image on the host today; on
-  the machine itself the user needs a disk big enough, and the guide must say
-  how big (Docker ≈ 200 MB, a JDK ≈ 350 MB, plus images).
-
-### Completion
-
-The guide exists (user-facing, in the repository's docs, and in Hungarian as
-well as English), and on a FRESH disk with network, following it word for
-word, a user installs and runs — each DOWNLOADED from its vendor with
-`wget`, no OCI image: the JDK from Adoptium's tarball (`java -version`),
-Docker from its official static release (`docker run busybox echo hi` after a `docker pull`),
-updates one of them to a newer version and switches back — with no host-side
-script involved.
-
----
+Relation to the others: §M93 makes a DOWNLOADED binary runnable; §M94 makes
+source runnable and packages first-class.  The design (recipe format, git
+transport, which compiler) is to be settled when it is scheduled.
 
 ## §M74 — Swap and demand paging: reclaim as a policy, not a favour
 

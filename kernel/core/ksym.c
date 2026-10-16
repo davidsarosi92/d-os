@@ -147,6 +147,10 @@ EXPORT_SYMBOL(pci_assign_bars);
  * out loud that this is not a portable name. */
 EXPORT_SYMBOL(vmm_map);
 #endif
+/* §M90 — THE way to a device's registers on every arch (hal_api.h): the hda
+ * module reaches its BAR through it since x86_64's device memory moved to the
+ * upper half (an identity vmm_map of the BAR would land in user space). */
+EXPORT_SYMBOL(hal_mmio_map);
 
 /* ---- waiting.  A driver that spins instead of sleeping costs a CPU for the
  * duration — the mistake §M23 stage 2 found in this tree's own AC97 driver,

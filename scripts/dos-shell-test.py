@@ -383,9 +383,18 @@ def aarch64_dtb_args(a):
         return ["-device", "loader,file=%s,addr=0x48000000,force-raw=on"
                 % os.environ["DOS_DTB"]]
     dtb = "build/aarch64/test-%d.dtb" % os.getpid()
+    # The extra arguments shape the machine (and so its tree) — except a
+    # network FILTER (`-object filter-dump,...netdev=net0`, a packet capture),
+    # which needs the netdev this tree-only run does not create.
+    ex, skip = [], False
+    for i, x in enumerate(a.extra):
+        if skip: skip = False; continue
+        if x == "-object" and i + 1 < len(a.extra) and a.extra[i + 1].startswith("filter-"):
+            skip = True; continue
+        ex.append(x)
     subprocess.run(["qemu-system-aarch64", "-M", "virt,gic-version=2,dumpdtb=" + dtb,
                     "-cpu", "cortex-a72", "-smp", str(a.smp), "-m", a.mem,
-                    "-display", "none"] + list(a.extra),
+                    "-display", "none"] + ex,
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return ["-device", "loader,file=%s,addr=0x48000000,force-raw=on" % dtb]
 

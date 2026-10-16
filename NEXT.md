@@ -1,26 +1,23 @@
-# RESUME HERE (updated 2026-10-12)
+# RESUME HERE (updated 2026-10-16)
 
-**§M90 Docker, ~90 %.**  `docker run --network host busybox:musl echo hi`
-prints `hi` on aarch64 (rungs 1-2 done); cgroup limits and inotify done (rung 3); overlayfs + Docker's overlay2 done (rung 4); container networking done (rung 5: bridge, NAT, `-p`).  Next, in order — details and the
-test recipe in PLAN.md §M90 "RESUME HERE":
+**§M90 Docker — DONE (2026-10-16).**  aarch64 and x86_64 (the kernel moved to
+the higher half); the whole suite — run, networking, `-it`, build, volumes,
+`--memory`, seccomp — passes on both.  **§M93 — DONE (2026-10-16):** `wget` +
+`app install`, the guide is docs/INSTALLING.md (docs/TELEPITES.md).  Details:
+DOCS §4.120 and the change log.
 
-1. ~~cgroup v2 limits enforced (`memory.max`, `cpu.max`, `pids.max`) + `inotify`~~ — DONE 2026-10-08; memory.max on a Linux-style charge model 2026-10-09 (`--memory 8m` works, OOMKilled true/137)
-2. ~~overlayfs~~ — DONE 2026-10-09 (overlay2 driver: run, diff, commit)
-3. ~~networking (net namespace, veth, bridge, NAT, `-p`)~~ — DONE 2026-10-10; its gaps closed the same day (ICMP ping/raw sockets, AF_PACKET, sockets keep their namespace, ARP hold queue, FDB ageing, connections reset when their device goes)
-3a. ~~IPv6~~ — DONE 2026-10-10 (addresses, NDP, ICMPv6, routes, forwarding, TCP/UDP, AF_INET6 sockets, rtnetlink v6, per-interface conf/; `docker --ipv6` gives a container a v6 address)
-3b. ~~netfilter~~ — DONE 2026-10-11 (nf_tables over netlink, conntrack + NAT, br_netfilter, the real `nft`; Docker's nftables firewall backend — `nfttest`, `brnftest`)
-4. ~~`docker run -it` (pty), `docker build`, volumes~~ — DONE 2026-10-12 (ptys, devpts, the console as a terminal; legacy + BuildKit builds via the real docker-buildx; bind/named/tmpfs volumes; seven defects fixed — DOCS change log)
-5. x86_64 after the higher-half kernel move
+Next, by the agreed order (memory: project_dos_milestone_order): §M91 (the ABI
+as its own project) and §M92 (driver engine) are recorded, not scheduled;
+§M94 (package installation up to building a git repository into native d-os
+code) is recorded, not scheduled; §M84 (phone) only when asked.
 
-**After §M90: §M93** — installing downloaded software: the user downloads the
-vendor's release with `wget` (NOT an OCI image — stated as extremely
-important) and runs `app install <file>`.  §M91 (ABI project) and §M92 (driver
-engine) come later.
-
-Recorded beside it, not scheduled: §M91 (the ABI as its own project, ReactOS
-pattern), §M92 (driver engine, open question) and §M93 (a user guide for
-installing downloaded software — Docker, Java — and the `.tar.gz` install,
-manifest and service registration it needs).  Open defects: #14, #16 below.
+Small items still open:
+- NEXT #14 below — `pthread_join` hang ~1 run in 44 (i386 -smp 4).
+- `/var/lib/docker` lives in memory (exFAT cannot hold overlay layers) — a
+  documented limit; closing it means a Linux-capable filesystem on the disk.
+- TIOCPKT and the terminal's alternate screen are not implemented.
+- i386 has no musl `sh`/coreutils in its store (`pkgrun sh` → not installed):
+  the artifacts are absent for that arch, not a kernel defect.
 
 # Where things stand (2026-09-28)
 

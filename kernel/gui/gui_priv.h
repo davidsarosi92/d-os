@@ -177,6 +177,10 @@ struct gui_window {
     int   cols, rows, ccol, crow;
     char* cells;
     struct vc* vc;
+    /* §M90 — the rendition of each cell (SGR, gterm.c's GA_* packing), in
+     * step with `cells`, and the one new output gets.  NULL/0 = defaults. */
+    uint32_t* cattr;
+    uint32_t  cur_attr;
 
     /* §M58 — SCROLLBACK.  A ring of `sb_cap` rows, each gmax_cols wide; a row
      * evicted by a scroll is pushed here instead of being dropped.  `scrolled`

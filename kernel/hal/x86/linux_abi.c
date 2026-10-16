@@ -18,6 +18,7 @@
  * ABi: eax = number, ebx/ecx/edx/esi/edi/ebp = args, return in eax.
  * ============================================================================= */
 
+#include "seccomp.h"
 #include "lnx_signal.h"   /* §M89 */
 #include "syscall.h"
 #include "idt.h"
@@ -587,6 +588,19 @@ void linux_syscall_dispatch(struct int_frame* f) {
 }
 
 static void linux_syscall_body(struct int_frame* f) {
+    /* §M90 — the caller's seccomp filters, before anything else (seccomp.c). */
+    {
+        struct task* st = task_current();
+        if (st && st->cred.seccomp) {
+            unsigned long aa[6] = { f->ebx, f->ecx, f->edx, f->esi, f->edi, f->ebp };
+            long r;
+            if (seccomp_enter(st, (unsigned long)f->eax, aa, (uintptr_t)f->eip,
+                              SECCOMP_ARCH_I386, &r)) {
+                f->eax = (uint32_t)r;
+                return;
+            }
+        }
+    }
     /* §M50 — THE ARCH SHIM.  Linux/i386 passes arguments in ebx,ecx,edx,esi,
      * edi,ebp; that mapping is the ONLY architecture-specific thing about a
      * syscall translation, and it is these six lines.  Everything the engine
@@ -805,6 +819,9 @@ static void linux_syscall_body(struct int_frame* f) {
             r.ebx = f->ebx; r.ecx = f->ecx; r.edx = f->edx;
             r.esi = f->esi; r.edi = f->edi; r.ebp = f->ebp;
             r.eip = f->eip; r.eflags = f->eflags; r.user_sp = f->user_esp;
+            /* §M90 — clone(CLONE_VM|CLONE_VFORK) with no stack is a vfork; a
+             * fork serves it (as on the other two arches). */
+            if ((flags & 0x4000 /* CLONE_VFORK */) && f->ecx == 0) flags &= ~LNX_CLONE_VM;
             if (!(flags & LNX_CLONE_VM)) {          /* a fork in disguise */
                 /* §M90 — every flag honoured or refused (proc_clone_fork);
                  * i386: (flags, stack, ptid, tls, ctid). */
@@ -889,6 +906,18 @@ static void linux_syscall_body(struct int_frame* f) {
             dosgui_destroy((int)f->ebx);
             f->eax = 0;
             return;
+
+        /* §M90 — clone3(args, size); i386's CLONE_SETTLS value is a
+         * struct user_desc*, which proc_clone3 reads the base out of. */
+        case 435: {
+            struct user_regs r;
+            r.eax = 0;
+            r.ebx = f->ebx; r.ecx = f->ecx; r.edx = f->edx;
+            r.esi = f->esi; r.edi = f->edi; r.ebp = f->ebp;
+            r.eip = f->eip; r.eflags = f->eflags; r.user_sp = f->user_esp;
+            f->eax = (uint32_t)proc_clone3(&r, (uintptr_t)f->ebx, (unsigned long)f->ecx, 1);
+            return;
+        }
 
         default:
             kprintf("linux-abi: unhandled syscall %u (returning -ENOSYS)\n", f->eax);

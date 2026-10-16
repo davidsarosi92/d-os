@@ -299,19 +299,10 @@ drv_handle drv_mmio_request(struct drv_rt* rt, uint64_t phys, size_t len,
     struct drv_res* r = res_of(h);
     r->base = phys;
     r->len  = len;
-#if DRVRT_HAS_PORTS
-    /* x86: map it page by page into the kernel's space, exactly as hda.c did
-     * by hand before this API existed. */
-    uintptr_t va = (uintptr_t)phys;
-    for (size_t o = 0; o < len; o += 4096)
-        vmm_map(va + o, (uintptr_t)phys + o, VMM_WRITABLE);
-    r->va = va;
-#else
-    /* aarch64 (§M90): device memory lives in the kernel half; the pointer comes
-     * from hal_mmio_map, not from the physical address. */
+    /* §M90: the pointer comes from hal_mmio_map, never from the physical
+     * address — identity on i386, the kernel half on x86_64 and aarch64. */
     r->va = (uintptr_t)hal_mmio_map(phys, len);
     if (!r->va) return DRV_ENORES;          /* the slot is released with the rest */
-#endif
     return h;
 }
 

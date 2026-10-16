@@ -280,11 +280,16 @@ static void scroll_one_row(void) {
  * repainted clears it afterwards (the compositor repaints everything anyway). */
 uint32_t fb_get_phys_base(void) { return fb_phys_base; }
 
-/* On both platforms the framebuffer window is mapped at its physical address
- * (x86 identity-maps the VRAM BAR; on ARM it is ordinary RAM already mapped by
- * the boot tables).  The function exists so a future platform where that is
- * NOT true has one place to change. */
+/* Where the kernel reaches a framebuffer's physical address.  i386 identity-
+ * maps the VRAM BAR; x86_64 (§M90, 2026-10-15) reaches it through its upper-
+ * half device window, since the low half belongs to programs; aarch64's is
+ * ordinary RAM, reached through the direct map by fb_term_init_direct. */
+#if defined(__x86_64__)
+extern uintptr_t x86_64_iomap_va(uint64_t phys);
+uintptr_t fb_phys_to_virt(uint32_t phys) { return x86_64_iomap_va(phys); }
+#else
 uintptr_t fb_phys_to_virt(uint32_t phys) { return (uintptr_t)phys; }
+#endif
 
 void fb_adopt_mode(volatile uint32_t* px, uint32_t w, uint32_t h, uint32_t pitch) {
     if (!px || !w || !h || !pitch) return;
@@ -419,7 +424,7 @@ int fb_term_init_if_available(const struct mboot_info* mbi) {
     /* Map the FB window writable (x86: 4 MiB PSE identity map via the vmm). */
     if (fb_present_map(fb_phys, fb_size) != 0) return -5;
 
-    fb_pixels      = (volatile uint32_t*)(uintptr_t)fb_phys;
+    fb_pixels      = (volatile uint32_t*)fb_phys_to_virt(fb_phys);
     fb_phys_base   = fb_phys;
     fb_width       = mbi->framebuffer_width;
     fb_height      = mbi->framebuffer_height;
@@ -433,7 +438,7 @@ int fb_term_init_if_available(const struct mboot_info* mbi) {
     fb_fill_bg();
 
     kprintf("fb: %dx%d@%dbpp mapped at %p, grid %dx%d cells\n",
-            fb_width, fb_height, mbi->framebuffer_bpp, (void*)(uintptr_t)fb_phys,
+            fb_width, fb_height, mbi->framebuffer_bpp, (void*)fb_pixels,
             cell_cols, cell_rows);
     return 0;
 }

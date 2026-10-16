@@ -84,6 +84,7 @@
 #include "printf.h"
 #include "lnx_signal.h"
 #include "vc.h"
+#include "workqueue.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -1099,13 +1100,20 @@ void tty_task_exit(struct task* t) {
  * typed in a terminal window puts the console into raw mode and streams it.
  * The settings live per console (a VC) and start as Linux's defaults.
  *
- * NOT here, said plainly: ISIG on a console (^C in a console does not signal
- * a process group — the console has no sessions; a program is ended from the
- * Task Manager or `kill`), and output post-processing (the console renders
- * '\n' as a new line whatever OPOST says).  Canonical mode WITH echo is the
- * shell's own line reader (usyscall.c's stdin_read_line), unchanged. */
+ * ISIG (§M90, 2026-10-15): a console has a FOREGROUND PROCESS GROUP — the
+ * one the d-os shell runs a Linux program in (it gives each foreground
+ * program its own group, as a job-control shell does), or whatever a program
+ * set with TIOCSPGRP.  With ISIG on, VINTR / VQUIT / VSUSP (^C, ^\, ^Z)
+ * signal that group (SIGINT / SIGQUIT / SIGTSTP), flush the input unless
+ * NOFLSH and echo as ^C when ECHOCTL.  The key arrives in interrupt context,
+ * so the signal is posted from a work item.  With no foreground group (the
+ * shell itself is reading) the key is an ordinary character, as before.
+ *
+ * NOT here, said plainly: output post-processing (the console renders '\n'
+ * as a new line whatever OPOST says).  Canonical mode WITH echo is the shell's
+ * own line reader (usyscall.c's stdin_read_line), unchanged. */
 #define CON_MAX 24
-static struct { struct vc* v; struct ktermios t; int used; } g_con[CON_MAX];
+static struct { struct vc* v; struct ktermios t; int used; int fg; } g_con[CON_MAX];
 static spinlock_t g_con_lock = SPINLOCK_INIT;
 
 static struct vc* con_vc(void) {
@@ -1123,13 +1131,82 @@ static struct ktermios* con_termios(struct vc* v, struct ktermios* scratch) {
     }
     struct ktermios* t = scratch;
     if (free_i >= 0) {
-        g_con[free_i].used = 1; g_con[free_i].v = v;
+        g_con[free_i].used = 1; g_con[free_i].v = v; g_con[free_i].fg = 0;
         t = &g_con[free_i].t;
     }
     termios_defaults(t, 0);
     spin_unlock_irqrestore(&g_con_lock, f);
     return t;
 }
+/* §M90 — the console's foreground process group (global numbering; 0 = none,
+ * the shell itself is reading). */
+int tty_console_fg(struct vc* v) {
+    uint32_t f = spin_lock_irqsave(&g_con_lock);
+    int fg = 0;
+    for (int i = 0; i < CON_MAX; i++) if (g_con[i].used && g_con[i].v == v) { fg = g_con[i].fg; break; }
+    spin_unlock_irqrestore(&g_con_lock, f);
+    return fg;
+}
+void tty_console_set_fg(struct vc* v, int pgid) {
+    struct ktermios sc;
+    (void)con_termios(v, &sc);                       /* make sure the entry exists */
+    uint32_t f = spin_lock_irqsave(&g_con_lock);
+    for (int i = 0; i < CON_MAX; i++) if (g_con[i].used && g_con[i].v == v) { g_con[i].fg = pgid; break; }
+    spin_unlock_irqrestore(&g_con_lock, f);
+}
+
+/* ISIG from the input path (interrupt context): decide here, signal from a
+ * work item (posting takes the task list's lock and may allocate). */
+#define ISIG_Q 8
+static struct { int pgid, sig; struct vc* v; char echo; } g_isig_q[ISIG_Q];
+static unsigned g_isig_head, g_isig_tail;
+static spinlock_t g_isig_lock = SPINLOCK_INIT;
+static struct work g_isig_work;
+static int g_isig_work_ready;
+static void isig_work_fn(struct work* w) {
+    (void)w;
+    for (;;) {
+        uint32_t f = spin_lock_irqsave(&g_isig_lock);
+        if (g_isig_tail == g_isig_head) { spin_unlock_irqrestore(&g_isig_lock, f); return; }
+        int pg = g_isig_q[g_isig_tail % ISIG_Q].pgid, sig = g_isig_q[g_isig_tail % ISIG_Q].sig;
+        struct vc* v = g_isig_q[g_isig_tail % ISIG_Q].v;
+        char echo = g_isig_q[g_isig_tail % ISIG_Q].echo;
+        g_isig_tail++;
+        spin_unlock_irqrestore(&g_isig_lock, f);
+        if (echo && v) { vc_putchar(v, '^'); vc_putchar(v, echo); vc_putchar(v, '\n'); }
+        lnx_sig_pgrp(pg, sig, 0);
+    }
+}
+int tty_console_isig(struct vc* v, char ch) {
+    uint8_t c = (uint8_t)ch;
+    uint32_t f = spin_lock_irqsave(&g_con_lock);
+    int i = 0;
+    for (; i < CON_MAX; i++) if (g_con[i].used && g_con[i].v == v) break;
+    if (i == CON_MAX || g_con[i].fg <= 0 || !(g_con[i].t.c_lflag & T_ISIG)) {
+        spin_unlock_irqrestore(&g_con_lock, f);
+        return 0;
+    }
+    struct ktermios* t = &g_con[i].t;
+    int sig = is_cc_t(t, VINTR, c) ? 2 : is_cc_t(t, VQUIT, c) ? 3 : is_cc_t(t, VSUSP, c) ? 20 : 0;
+    int pg = g_con[i].fg, flush = !(t->c_lflag & T_NOFLSH);
+    int echo = (t->c_lflag & T_ECHO) && (t->c_lflag & T_ECHOCTL);
+    spin_unlock_irqrestore(&g_con_lock, f);
+    if (!sig) return 0;
+    if (flush) vc_in_flush(v);
+    f = spin_lock_irqsave(&g_isig_lock);
+    if (g_isig_head - g_isig_tail < ISIG_Q) {
+        g_isig_q[g_isig_head % ISIG_Q].pgid = pg;
+        g_isig_q[g_isig_head % ISIG_Q].sig = sig;
+        g_isig_q[g_isig_head % ISIG_Q].v = v;
+        g_isig_q[g_isig_head % ISIG_Q].echo = echo ? (char)(c + '@') : 0;
+        g_isig_head++;
+    }
+    if (!g_isig_work_ready) { work_init(&g_isig_work, isig_work_fn); g_isig_work_ready = 1; }
+    spin_unlock_irqrestore(&g_isig_lock, f);
+    work_submit(&g_isig_work);
+    return 1;
+}
+
 void tty_console_forget(struct vc* v) {
     uint32_t f = spin_lock_irqsave(&g_con_lock);
     for (int i = 0; i < CON_MAX; i++) if (g_con[i].used && g_con[i].v == v) g_con[i].used = 0;
@@ -1242,13 +1319,23 @@ long tty_console_ioctl(unsigned cmd, void* k, unsigned long val) {
     }
     case TIOCSWINSZ: return 0;                         /* the console's size is its window's */
     case TIOCGPGRP: case TIOCGSID: {
-        /* no sessions on a console: the caller is in the foreground */
-        int g = cmd == TIOCGPGRP ? (me && me->pgid ? me->pgid : (me ? me->pid : 1))
+        /* the console's foreground group when one is set (TIOCSPGRP, or the
+         * shell's foreground program); otherwise the caller is in front */
+        int fg = cmd == TIOCGPGRP ? tty_console_fg(v) : 0;
+        int g = fg ? fg
+              : cmd == TIOCGPGRP ? (me && me->pgid ? me->pgid : (me ? me->pid : 1))
                                  : (me && me->sid ? me->sid : (me ? me->pid : 1));
         w32(k, (uint32_t)pg_vnr(me, g));
         return 0;
     }
-    case TIOCSPGRP: return 0;
+    case TIOCSPGRP: {
+        /* §M90 — the group ^C reaches: a number in the caller's namespace */
+        int nr = (int)r32(k);
+        int g = nr > 0 ? ns_pid_resolve(me, nr) : 0;
+        if (nr > 0 && g <= 0) return -3;                      /* ESRCH */
+        tty_console_set_fg(v, g);
+        return 0;
+    }
     case FIONREAD:  w32(k, (uint32_t)vc_in_count(v)); return 0;
     case TIOCOUTQ:  w32(k, 0); return 0;
     case TCFLSH:    if (val == 0 || val == 2) vc_in_flush(v); return 0;

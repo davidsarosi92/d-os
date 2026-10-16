@@ -33,6 +33,7 @@
  *      so a concurrent munmap turns into a short count or -EFAULT.
  * ============================================================================= */
 
+#include "lnx_signal.h"
 #include "version.h"
 #include "packet.h"
 #include "fsnotify.h"
@@ -397,6 +398,7 @@ static long sys_write_ref(int fd, struct ofile* wo, const void* buf, size_t n) {
     if (o->kind == FD_SOCK) return usock_write(o->sock, buf, n, !o->nonblock);
     if (o->kind == FD_NETSOCK) return netsock_write(o->nsock, buf, n);
     if (o->kind == FD_EVENT) return eventfd_write(o->efd, buf, n, !o->nonblock);   /* §M90 */
+    if (o->kind == FD_PIDFD) return -22;                                           /* §M90 */
     if (o->kind == FD_NETLINK) return nl_send(o->nl, buf, n);                      /* §M90 */
     if (o->kind == FD_PACKET) return packet_send(o->pkt, buf, n, 0, NULL, 0);      /* §M90 */
     if (o->kind == FD_FIFO) return fifo_write(o, buf, n, !o->nonblock);            /* §M90 */
@@ -459,6 +461,12 @@ static long stdin_read_line(char* buf, size_t cap) {
             if (len > 0) { len--; vc_putchar(v, '\b'); }
             continue;
         }
+        /* §M90 — control characters from the keyboard (Ctrl is mapped now):
+         * ^U erases the line, ^D at the start of a line is end-of-file, the
+         * rest are not typed into the line. */
+        if (c == 21) { while (len > 0) { len--; vc_putchar(v, '\b'); } continue; }
+        if (c == 4) { if (len == 0) return 0; continue; }
+        if ((unsigned char)c < 0x20 && c != '\t') continue;
         if (len < cap) { buf[len++] = c; vc_putchar(v, c); }
     }
 }
@@ -501,6 +509,7 @@ static long sys_read_ref(int fd, struct ofile* o, void* buf, size_t n) {
      * wants the non-blocking form uses poll(2), which is the whole point of
      * the descriptor existing. */
     if (o->kind == FD_EVENT) return eventfd_read(o->efd, buf, n, block);   /* §M90 */
+    if (o->kind == FD_PIDFD) return -22;                                   /* §M90 */
     if (o->kind == FD_NETLINK) return nl_recv(o->nl, buf, n, block, 0, 0); /* §M90 */
     if (o->kind == FD_PACKET) return packet_recv(o->pkt, buf, n, block, NULL); /* §M90 */
     if (o->kind == FD_FIFO) return fifo_read(o, buf, n, block);           /* §M90 */
@@ -1533,6 +1542,12 @@ uint32_t fd_readiness_of(int fd, struct ofile* o) {
         g_netsock_scans++;
         r |= netsock_readiness(o->nsock);
         break;
+    /* §M90 — a pidfd: readable once its process has exited (pidfd.c). */
+    case FD_PIDFD: {
+        extern uint32_t pidfd_readiness(const struct ofile* o);
+        r |= pidfd_readiness(o);
+        break;
+    }
     case FD_EPOLL:
         /* An epoll set is itself pollable: readable when it has events.  This
          * is what makes nesting one loop inside another possible, and costs a
@@ -2426,12 +2441,24 @@ static long netsock_read(struct netsock* ns, void* buf, size_t n) {
     if (ns->type == SOCK_DGRAM) return ns_dgram_recv(ns, buf, n, NULL, NULL);   /* §M90 */
     if (ns->type != SOCK_STREAM || !ns->conn) return -1;
     if (ns->rd_shut) return 0;                   /* shutdown(SHUT_RD) = EOF   */
-    int r = net_tcp_recv(ns->conn, buf, (uint32_t)n, ns->nonblock, 0);
-    /* NET_EAGAIN is "nothing yet", and it is NOT zero: zero means the peer
-     * closed, and a drain loop told EOF by a live connection stops for good
-     * (§M56.1's pipe lesson, one layer up). */
-    if (r == NET_EAGAIN) return -SOCK_EAGAIN;
-    return r;
+    /* §M90 (2026-10-16) — a BLOCKING read blocks until there is data, an end
+     * of stream or a reset — not until net_tcp_recv's internal wait (10 s)
+     * runs out.  It used to return EAGAIN then, which no blocking caller
+     * expects: a download whose server paused for ten seconds near its end
+     * (a CDN does) failed in the TLS layer as "reading from the socket
+     * failed", 65 KB short of a 78 MB file, on the slower aarch64 guest.
+     * A kill or a deliverable signal still ends the wait (EINTR). */
+    for (;;) {
+        int r = net_tcp_recv(ns->conn, buf, (uint32_t)n, ns->nonblock, 0);
+        /* NET_EAGAIN is "nothing yet", and it is NOT zero: zero means the peer
+         * closed, and a drain loop told EOF by a live connection stops for good
+         * (§M56.1's pipe lesson, one layer up). */
+        if (r != NET_EAGAIN) return r;
+        if (ns->nonblock) return -SOCK_EAGAIN;
+        if (task_should_stop()) return -4;                       /* EINTR */
+        struct task* me = task_current();
+        if (me && me->linux_abi && lnx_sig_deliverable(me)) return -4;
+    }
 }
 
 /* Core: `buf` is always KERNEL memory (see the *_k note in syscall.h). */
@@ -3207,6 +3234,7 @@ int sys_fd_link_of(struct task* t, int fd, char* out, size_t cap) {
     case FD_NETSOCK: case FD_NETLINK: case FD_PACKET: tag = "socket:["; break;
     case FD_SHM:     tag = "/memfd: (deleted)"; break;
     case FD_EVENT:   tag = "anon_inode:[eventfd]"; break;
+    case FD_PIDFD:   tag = "anon_inode:[pidfd]"; break;
     case FD_EPOLL:   tag = "anon_inode:[eventpoll]"; break;
     case FD_TIMER:   tag = "anon_inode:[timerfd]"; break;
     case FD_BPF:     tag = "anon_inode:bpf-prog"; break;

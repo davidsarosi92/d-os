@@ -81,6 +81,11 @@ static void read_line(struct vc* v, char* buf, int cap) {
             }
             continue;
         }
+        /* §M90 — control characters (Ctrl is mapped now): ^C abandons the
+         * line, ^U erases it, any other is not part of a command. */
+        if (c == 3) { vc_putchar(v, '^'); vc_putchar(v, 'C'); vc_putchar(v, '\n'); buf[0] = 0; return; }
+        if (c == 21) { while (len > 0) { len--; vc_putchar(v, '\b'); } continue; }
+        if ((unsigned char)c < 0x20 && c != '\t') continue;
         if (len < cap - 1) {
             buf[len++] = c;
             vc_putchar(v, c);

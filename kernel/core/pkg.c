@@ -949,6 +949,23 @@ static void modules_provision(void) {
     rootfs_unpack_blob(_binary_user_modules_bin_start, _binary_user_modules_bin_end);
 }
 
+/* §M93 — THE GLIBC PACKAGE, beside musl.  Debian 12's libc6 (glibc 2.36),
+ * unmodified, packed by scripts/fetch-glibc.sh: the loader at the path every
+ * glibc program names (/lib64/ld-linux-x86-64.so.2 / /lib/ld-linux-aarch64.so.1)
+ * and the libraries under the multiarch directory the loader searches
+ * (/lib/<arch>-linux-gnu).  The libc is per PROGRAM — a static one carries its
+ * own, a dynamic one names its loader — and the Linux personality serves both;
+ * nothing of musl is replaced.  A marker /lib/<arch>-linux-gnu/.glibc-package
+ * names the version.  Weak: absent when the blob was not fetched. */
+extern const unsigned char _binary_glibc_start[] __attribute__((weak));
+extern const unsigned char _binary_glibc_end[]   __attribute__((weak));
+static void glibc_provision(void) {
+    if (!_binary_glibc_start) return;
+    rootfs_unpack_blob(_binary_glibc_start, _binary_glibc_end);
+    kprintf("pkg: glibc package provisioned (%u KiB) - glibc-linked programs can run\n",
+            blob_len(_binary_glibc_start, _binary_glibc_end) >> 10);
+}
+
 static void ldso_provision(void) {
     if (!_binary_user_ldmusl_so_start) return;      /* musl shared not built */
     unsigned len = blob_len(_binary_user_ldmusl_so_start, _binary_user_ldmusl_so_end);
@@ -1257,6 +1274,7 @@ void pkg_init(void) {
     vfs_mkdir(g_store_root);
     vfs_mkdir("/etc"); vfs_mkdir("/etc/pkg");
     ldso_provision();
+    glibc_provision();                 /* §M93 — glibc beside musl */
     modules_provision();               /* §M67 — the .ko files under /modules */
     /* The tcc rootfs and NetSurf's resources are NOT unpacked here — see
      * pkg_ensure_tcc_rootfs / pkg_ensure_netsurf_res for the measurement that

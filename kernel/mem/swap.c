@@ -690,6 +690,18 @@ static void cmd_thrashtest(const char* args) {
     else if (_binary_user_memhog_x86_64_elf_start) { s = _binary_user_memhog_x86_64_elf_start;  e = _binary_user_memhog_x86_64_elf_end; }
     else if (_binary_user_memhog_aarch64_elf_start){ s = _binary_user_memhog_aarch64_elf_start; e = _binary_user_memhog_aarch64_elf_end; }
     if (!s) { kprintf("thrashtest: no memhog embedded\n"); return; }
+    /* §M90 — rung 4 fills RAM until the 8 MB swap area is full; on a machine
+     * with much more memory the fill never reaches pressure inside its minute,
+     * and the test reported FAIL for a mechanism it had not exercised.  It is
+     * written for a small machine (DOCS: 256 MiB) and SAYS so elsewhere. */
+    {
+        uint64_t mib = (uint64_t)(pmm_nr_frames - pmm_pfn_base) * 4096u >> 20;
+        if (mib > 768) {
+            kprintf("thrashtest: SKIP - needs a machine with at most 768 MiB of RAM "
+                    "(this one has %u MiB); run it with -m 256M\n", (unsigned)mib);
+            return;
+        }
+    }
     int bad = 0;
 
     /* rule 2 */

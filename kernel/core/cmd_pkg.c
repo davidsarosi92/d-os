@@ -8,6 +8,7 @@
  * chosen by DATA rather than by a hardcoded name.
  * =========================================================================== */
 
+#include "tty.h"
 #include "shellcmd.h"
 #include "cmd_util.h"
 #include "console.h"
@@ -374,11 +375,20 @@ int shell_run_from_path(const char* line) {
     vfs_close(f);
     for (unsigned i = 0; i < sizeof saved; i++) me->cred.exe[i] = saved[i];
     if (pid < 0) { kprintf("%s: could not start %s\n", argv[0], real); return 1; }
-    if (background) { kprintf("[%d] %s\n", pid, name); return 1; }
+    /* §M90 — job control: every program the shell starts gets its OWN process
+     * group (as a job-control shell does), and a FOREGROUND one becomes the
+     * console's foreground group while it runs — so ^C / ^\ / ^Z on the
+     * console signal it (tty.c, ISIG), and never the shell or a background
+     * job. */
     struct task* t = task_find(pid);
+    if (t && linux_abi && !t->pgid) t->pgid = pid;
+    if (background) { kprintf("[%d] %s\n", pid, name); return 1; }
     if (t) task_set_reap_owned(t, 1);
+    struct vc* con = (struct vc*)me->out_console;
+    if (linux_abi && con) tty_console_set_fg(con, pid);
     int code = 0;
     task_wait(pid, &code);
+    if (linux_abi && con) tty_console_set_fg(con, 0);
     if (code) kprintf("[%s exited with status %d]\n", name, code);
     return 1;
 }

@@ -80,6 +80,10 @@ void proc_path_value(char* out, int cap);
 int proc_execve_env(const char* path, char* const argv[], char* const envp[]);
 /* §M90 — clone() without CLONE_VM, every flag honoured or refused (proc.c);
  * the hooks proc_fork calls on each arch around the child. */
+/* §M90 — clone3(args, size): the fork AND the thread shape, CLONE_PIDFD,
+ * CLONE_INTO_CGROUP (proc.c).  `tls_is_desc`: i386's CLONE_SETTLS value is a
+ * struct user_desc*, not a base. */
+long proc_clone3(struct user_regs* r, uintptr_t uargs, unsigned long size, int tls_is_desc);
 long proc_clone_fork(struct user_regs* r, unsigned long flags, uintptr_t stack,
                      uintptr_t ptid, uintptr_t ctid);
 struct task;

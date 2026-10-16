@@ -669,6 +669,7 @@ void destroy_window(struct gui_window* win) {
     win->focusw  = NULL;
     gfx_surface_free(&win->surf);
     if (win->cells)   { kfree(win->cells); win->cells = NULL; }
+    if (win->cattr)   { kfree(win->cattr); win->cattr = NULL; }   /* §M90 */
     if (win->sb)      { kfree(win->sb);    win->sb = NULL; win->sb_cap = 0; }
     if (win->app_ctx) { kfree(win->app_ctx); win->app_ctx = NULL; }
     if (win->ui_state) { kfree(win->ui_state); win->ui_state = NULL; }
@@ -739,7 +740,7 @@ struct gui_window* window_alloc(const char* title, enum win_kind kind,
     win->widgets = NULL;  win->focusw = NULL;
     win->on_layout = NULL; win->on_close = NULL; win->app_ctx = NULL;
     win->ui_state = NULL;
-    win->cells = NULL; win->vc = NULL;
+    win->cells = NULL; win->vc = NULL; win->cattr = NULL; win->cur_attr = 0;
     win->sb = NULL; win->sb_cap = win->sb_count = win->sb_head = 0;
     win->scrolled = win->view_off = 0;
     win->minimized = 0; win->on_tick = NULL;

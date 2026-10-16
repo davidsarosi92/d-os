@@ -16,11 +16,16 @@
  * (private modes accepted and ignored; L and M — insert/delete lines — are
  * consumed, not performed), ESC 7 / 8 / c / D / E / M, charset
  * designations (consumed), OSC strings (consumed to BEL or ST), BEL, TAB
- * (to the next multiple of 8).  SGR (m) is consumed: colours and attributes
- * are NOT rendered — the cells have one colour pair (said, not pretended).
- * Scroll regions (r) are accepted and ignored: scrolling is always the whole
- * screen.  An alternate screen (?1049) is not kept; a full-screen program
- * draws over the scrollback. */
+ * (to the next multiple of 8).  SGR (m) — §M90, 2026-10-15 — IS rendered:
+ * the 16 colours, the bright ones (90-97, 100-107), the 256-colour palette
+ * (38;5;n / 48;5;n), direct colour (38;2;r;g;b, kept as the nearest of the
+ * 256), bold (shown as the bright variant of a basic colour), reverse, and
+ * the defaults (39, 49, 0).  Underline/italic/blink are accepted and not
+ * drawn.  Insert/delete lines (L, M) are performed by the GUI terminal (a
+ * framebuffer pane keeps no cell store and consumes them).  Scroll regions (r)
+ * are accepted and ignored: scrolling is always the whole screen.  An
+ * alternate screen (?1049) is not kept; a full-screen program draws over the
+ * scrollback. */
 #ifndef VT_H
 #define VT_H
 
@@ -35,12 +40,22 @@ struct vt_ops {
      * deletes -n characters (the tail fills with blanks) */
     void (*shift)(void* ctx, int row, int col, int n);
     void (*reply)(void* ctx, const char* s);        /* bytes into the input (DSR)    */
+    /* §M90 — APPENDED.  The current rendition changed (SGR): colours are
+     * VT_DEFAULT or a 256-colour palette index (vt_rgb turns one into RGB). */
+    void (*attr)(void* ctx, int fg, int bg, int bold, int reverse);
+    /* §M90 — APPENDED.  Insert (n > 0) or delete (n < 0) |n| whole lines at
+     * `row`; the lines below move down/up, the screen bottom fills blank. */
+    void (*lines)(void* ctx, int row, int n);
 };
+#define VT_DEFAULT (-1)
+/* xterm's 256-colour palette as 0xRRGGBB. */
+unsigned vt_rgb(int idx);
 
 struct vt {
     int state;
     int params[8], np, priv;
     int saved_row, saved_col;
+    int fg, bg, bold, reverse;          /* §M90 — the current rendition (SGR) */
 };
 
 void vt_init(struct vt* v);

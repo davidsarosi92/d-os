@@ -40,6 +40,18 @@ extern uintptr_t fb_phys_to_virt(uint32_t phys);
 /* Identity-map the FB window with 4 MiB PSE PDEs.  The region is usually a few
  * MiB and aligned to 4 MiB, so one or two PDEs cover it.  r == -2 means a
  * regular PT is already present there — treat as already mapped. */
+#if defined(__x86_64__)
+/* §M90 (2026-10-15) — x86_64 reaches the VRAM through its upper-half device
+ * window (vmm.c); the low half belongs to programs now. */
+extern volatile void* x86_64_fb_map(uint64_t phys, uint64_t len);
+int fb_present_map(uint64_t phys, uint64_t size) {
+    if (!x86_64_fb_map(phys, size)) {
+        kprintf("fb: cannot map %p (+%lu)\n", (void*)(uintptr_t)phys, (unsigned long)size);
+        return -1;
+    }
+    return 0;
+}
+#else
 int fb_present_map(uint64_t phys, uint64_t size) {
     uint32_t base_aligned = (uint32_t)phys & 0xFFC00000u;
     uint32_t end          = (uint32_t)phys + (uint32_t)size;
@@ -55,6 +67,7 @@ int fb_present_map(uint64_t phys, uint64_t size) {
     }
     return 0;
 }
+#endif
 
 /* The linear framebuffer IS the scanout, so writes are already on screen. */
 void fb_present_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
@@ -110,7 +123,8 @@ int fb_flip_init(volatile uint32_t** buf0, volatile uint32_t** buf1) {
     uint16_t id = dispi_read(VBE_DISPI_INDEX_ID);
     if (id < 0xB0C0 || id > 0xB0C5) return -2;      /* not a Bochs-VBE device */
 
-    uint32_t fb_phys_base = (uint32_t)(uintptr_t)px; /* FB is identity-mapped */
+    uint32_t fb_phys_base = fb_get_phys_base();      /* not the pointer: x86_64
+                                                      * maps it in the upper half */
     uint32_t fb_size      = pitch * h;               /* one frame, bytes */
 
     /* Ask the device for a virtual framebuffer twice as tall.  If VRAM is

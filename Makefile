@@ -76,7 +76,8 @@ MUSL_PROG_BLOBS := user/muslhello_muslblob.o user/netmusl_muslblob.o \
                    user/sigmusl_muslblob.o user/cpuidmusl_muslblob.o \
                    user/sock6musl_muslblob.o user/killmusl_muslblob.o \
                    user/nftmusl_muslblob.o user/ptymusl_muslblob.o \
-                   user/ptyrun_muslblob.o
+                   user/ptyrun_muslblob.o user/newapimusl_muslblob.o \
+                   user/isigmusl_muslblob.o user/tarx_muslblob.o
 # §M37 dynamic-linking artifacts — the ld.so blob + the dynamically linked tests.
 MUSL_DYN_BLOBS  := user/ldmusl_blob.o user/muslhellodyn_dynblob.o \
                    user/libgreet_blob.o user/solibtest_dynblob.o \
@@ -324,7 +325,6 @@ else ifeq ($(ARCH),x86_64)
       kernel/hal/x86_64/signal.c \
       kernel/hal/x86/lapic.c \
       kernel/hal/x86/tlb.c \
-      kernel/hal/x86/mmio.c \
       kernel/hal/x86/tsc.c \
       kernel/hal/x86/ioapic.c \
       kernel/hal/x86/pci.c \
@@ -350,6 +350,15 @@ else ifeq ($(ARCH),x86_64)
   # the container validation target; imported by `ctr import` at first use.
   ifneq ($(wildcard assets/images/busybox-musl.tar),)
     ARCH_EXTRA_OBJS += assets/busyboximg_blob.o
+  endif
+  # §M93 — the glibc package (scripts/fetch-glibc.sh), embedded if fetched.
+  ifneq ($(wildcard third_party/glibc-$(ARCH).bin),)
+    ARCH_EXTRA_OBJS += third_party/glibc_blob.o
+  endif
+  # §M93 — `nft`, the netfilter tool, ships with the system (Docker's nftables
+  # backend runs it); built by `make nftables ARCH=<arch>`, embedded if present.
+  ifneq ($(wildcard user/nft.$(ARCH)),)
+    ARCH_EXTRA_OBJS += user/nft_blob.o
   endif
   ifneq ($(wildcard assets/wallpaper-default.bmp),)
     ARCH_EXTRA_OBJS += assets/wallpaper_blob.o
@@ -628,6 +637,9 @@ else ifeq ($(ARCH),aarch64)
                      user/nftmusl_muslblob.o \
                      user/ptymusl_muslblob.o \
                      user/ptyrun_muslblob.o \
+                     user/newapimusl_muslblob.o \
+                     user/isigmusl_muslblob.o \
+                     user/tarx_muslblob.o \
                      user/pthreadtest_muslblob.o \
                      $(MUSL_COREUTIL_BLOBS)
 
@@ -639,6 +651,23 @@ else ifeq ($(ARCH),aarch64)
   # the container validation target; imported by `ctr import` at first use.
   ifneq ($(wildcard assets/images/busybox-musl.tar),)
     ARCH_EXTRA_OBJS += assets/busyboximg_blob.o
+  endif
+  # §M93 (aarch64) — Mbed TLS for this arch (`make mbedtls ARCH=aarch64`): the
+  # download path of the install guide (wget over TLS) exists on every 64-bit
+  # target, not only on x86.
+  # (the CA bundle is embedded on this arch already, above)
+  MBEDTLS_PREFIX := third_party/mbedtls-aarch64
+  ifneq ($(wildcard $(MBEDTLS_PREFIX)/lib/libmbedcrypto.a),)
+    ARCH_EXTRA_OBJS += $(MBEDTLS_PROG_BLOBS)
+  endif
+  # §M93 — the glibc package (scripts/fetch-glibc.sh), embedded if fetched.
+  ifneq ($(wildcard third_party/glibc-$(ARCH).bin),)
+    ARCH_EXTRA_OBJS += third_party/glibc_blob.o
+  endif
+  # §M93 — `nft`, the netfilter tool, ships with the system (Docker's nftables
+  # backend runs it); built by `make nftables ARCH=<arch>`, embedded if present.
+  ifneq ($(wildcard user/nft.$(ARCH)),)
+    ARCH_EXTRA_OBJS += user/nft_blob.o
   endif
   ifneq ($(wildcard assets/wallpaper-default.bmp),)
     ARCH_EXTRA_OBJS += assets/wallpaper_blob.o
@@ -856,6 +885,8 @@ CORE_C_SRCS := \
     kernel/core/ktimer.c \
     kernel/core/timerfd.c \
     kernel/core/eventfd.c \
+    kernel/core/pidfd.c \
+    kernel/core/seccomp.c \
     kernel/core/fifo.c kernel/core/tty.c kernel/core/vt.c \
     kernel/core/nsproxy.c \
     kernel/core/bpf.c \
@@ -921,6 +952,8 @@ CORE_C_SRCS := \
     kernel/core/ktimer.c \
     kernel/core/timerfd.c \
     kernel/core/eventfd.c \
+    kernel/core/pidfd.c \
+    kernel/core/seccomp.c \
     kernel/core/fifo.c kernel/core/tty.c kernel/core/vt.c \
     kernel/core/nsproxy.c \
     kernel/core/bpf.c \
@@ -1247,6 +1280,8 @@ CORE_C_SRCS := \
     kernel/core/ktimer.c \
     kernel/core/timerfd.c \
     kernel/core/eventfd.c \
+    kernel/core/pidfd.c \
+    kernel/core/seccomp.c \
     kernel/core/fifo.c kernel/core/tty.c kernel/core/vt.c \
     kernel/core/nsproxy.c \
     kernel/core/bpf.c \
@@ -1406,7 +1441,7 @@ musl-cross-x86_64:
 #     ... ARCH=x86_64 make mbedtls
 # -----------------------------------------------------------------------------
 MBEDTLS_DIR    := third_party/mbedtls
-ifeq ($(ARCH),x86_64)
+ifneq ($(filter x86_64 aarch64,$(ARCH)),)
   MBEDTLS_CC     := $(CURDIR)/$(MUSL_ELF_CC)
   MBEDTLS_CFLAGS := -Os -fno-stack-protector -w
 else
@@ -2153,7 +2188,7 @@ user/wlclip.muslelf: user/wlclip.c $(WL_PREFIX)/lib/libwayland-client.a
 # so adding a fifth TLS program is one name in MBEDTLS_PROGS.
 MBEDTLS_PROGS := crypttest ssltest httpstest wget
 
-ifeq ($(ARCH),x86_64)
+ifneq ($(filter x86_64 aarch64,$(ARCH)),)
 # The cross gcc driver supplies its own crt/libc/libgcc and its own sysroot
 # headers, so the whole link is one command (same shape as the generic x86_64
 # %.muslelf rule).  -Ttext-segment moves the ELF headers too, putting the whole
@@ -2209,14 +2244,52 @@ $(OBJ_DIR)/assets/busyboximg_blob.o: assets/images/busybox-musl.tar
 	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) \
 	    assets/images/busybox-musl.tar $@
 
+# §M93 — the glibc package blob; the symbol is _binary_glibc_{start,end}.
+$(OBJ_DIR)/third_party/glibc_blob.o: third_party/glibc-$(ARCH).bin
+	@mkdir -p $(@D)
+	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) \
+	    --redefine-sym _binary_third_party_glibc_$(ARCH)_bin_start=_binary_glibc_start \
+	    --redefine-sym _binary_third_party_glibc_$(ARCH)_bin_end=_binary_glibc_end \
+	    --redefine-sym _binary_third_party_glibc_$(ARCH)_bin_size=_binary_glibc_size \
+	    third_party/glibc-$(ARCH).bin $@
+
+# §M93 — the embedded `nft` (see above); the symbol loses the arch suffix.
+$(OBJ_DIR)/user/nft_blob.o: user/nft.$(ARCH)
+	@mkdir -p $(@D)
+	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) \
+	    --redefine-sym _binary_user_nft_$(ARCH)_start=_binary_user_nft_start \
+	    --redefine-sym _binary_user_nft_$(ARCH)_end=_binary_user_nft_end \
+	    --redefine-sym _binary_user_nft_$(ARCH)_size=_binary_user_nft_size \
+	    user/nft.$(ARCH) $@
+
 $(OBJ_DIR)/assets/wallpaper_blob.o: assets/wallpaper-default.bmp
 	@mkdir -p $(@D)
 	$(USER_OBJCOPY) --input-target=binary $(USER_OCARGS) \
 	    assets/wallpaper-default.bmp $@
 
 
+# THE BLOB MUST BE FOR THIS ARCH.  user/*.muslelf and user/*.dynelf are
+# arch-agnostic PATHS (scripts/build.sh parks each arch's set in a per-arch
+# cache), so a `make ARCH=aarch64` run directly — bypassing build.sh — right
+# after an x86_64 build finds an x86-64 wget.muslelf NEWER than wget.c, keeps
+# it, and embeds it: the guest then answers `wget: exit rc=-7` (ELF_EBADARCH),
+# a build accident that looks like a kernel bug (2026-10-16).  The ELF header
+# says which machine a file is for; read it, and on a mismatch delete the file
+# and stop, so the next run rebuilds it for the right arch.
+ELF_MACHINE_i386    := 3
+ELF_MACHINE_x86_64  := 62
+ELF_MACHINE_aarch64 := 183
+define CHECK_BLOB_ARCH
+	@m=$$(od -An -tu2 -j18 -N2 $(1) | tr -d ' '); \
+	if [ "$$m" != "$(ELF_MACHINE_$(ARCH))" ]; then \
+	    echo "error: $(1) is for e_machine $$m, not $(ARCH) - deleted; run the build again (or use scripts/build.sh)"; \
+	    rm -f $(1); exit 1; \
+	fi
+endef
+
 $(OBJ_DIR)/user/%_muslblob.o: user/%.muslelf
 	@mkdir -p $(@D)
+	$(call CHECK_BLOB_ARCH,$<)
 	# $(USER_OBJCOPY), not bare `objcopy`: the aarch64 container carries only the
 	# cross binutils, so the unqualified name is simply absent there.  The
 	# in-tree-libc blob rule above already knew this; this one did not, because
@@ -2255,6 +2328,7 @@ endif
 
 $(OBJ_DIR)/user/%_dynblob.o: user/%.dynelf
 	@mkdir -p $(@D)
+	$(call CHECK_BLOB_ARCH,$<)
 	objcopy --input-target=binary $(USER_OCARGS) $< $@
 
 # -----------------------------------------------------------------------------

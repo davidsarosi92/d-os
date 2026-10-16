@@ -1479,7 +1479,9 @@ struct gui_window* term_window_create(const char* title,
     if (!win) return NULL;
 
     win->cells = (char*)kcalloc(1, (size_t)gmax_cols * gmax_rows);
-    if (!win->cells) { win->used = 0; return NULL; }
+    win->cattr = (uint32_t*)kcalloc((size_t)gmax_cols * gmax_rows, sizeof(uint32_t));   /* §M90 */
+    win->cur_attr = 0;
+    if (!win->cells) { if (win->cattr) { kfree(win->cattr); win->cattr = NULL; } win->used = 0; return NULL; }
 
     /* §M58 — scrollback.  Sized from config, in LINES, because that is the unit
      * the user thinks in; the bytes follow from the screen width.  A failed
@@ -1500,6 +1502,7 @@ struct gui_window* term_window_create(const char* title,
 
     if (window_set_size(win, win->w, win->h) != 0) {
         kfree(win->cells);
+        if (win->cattr) { kfree(win->cattr); win->cattr = NULL; }
         win->used = 0;
         return NULL;
     }
@@ -1510,6 +1513,7 @@ struct gui_window* term_window_create(const char* title,
     if (!win->vc) {
         gfx_surface_free(&win->surf);
         kfree(win->cells);
+        if (win->cattr) { kfree(win->cattr); win->cattr = NULL; }
         win->used = 0;
         return NULL;
     }

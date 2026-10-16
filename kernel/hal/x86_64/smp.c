@@ -98,7 +98,10 @@ static void smp_memcpy(void* dst, const void* src, size_t n) {
 static void copy_trampoline(void) {
     size_t len = (size_t)(_binary_kernel_hal_x86_64_ap_trampoline_bin_end
                         - _binary_kernel_hal_x86_64_ap_trampoline_bin_start);
-    smp_memcpy((void*)AP_BOOT_ADDR,
+    /* §M90 — through the direct map: the kernel no longer runs in the low
+     * half (the AP itself still runs the copy at 0x8000, through the low
+     * identity map that stays until every AP is up). */
+    smp_memcpy(phys_to_virt(AP_BOOT_ADDR),
                _binary_kernel_hal_x86_64_ap_trampoline_bin_start, len);
 }
 
@@ -168,7 +171,7 @@ int smp_boot_aps(void) {
             continue;
         }
 
-        struct ap_info* info = (struct ap_info*)AP_INFO_ADDR;
+        struct ap_info* info = (struct ap_info*)phys_to_virt(AP_INFO_ADDR);
         info->pml4_phys = (uint64_t)vmm_kernel_pd_phys();
         info->stack_top = (uint64_t)((uintptr_t)stack + 4096);
         info->c_entry   = (uint64_t)(uintptr_t)&ap_main;

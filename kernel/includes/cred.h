@@ -201,6 +201,10 @@ struct cred {
     /* §M90 — APPENDED.  setgroups(2) has set groups[] (possibly to nothing):
      * getgroups answers that list exactly instead of the primary group. */
     int      groups_explicit;
+    /* §M90 — APPENDED.  The seccomp filter chain (seccomp.c): newest first,
+     * reference counted — cred_inherit takes a reference, the task's end
+     * drops it.  NULL = no filter (the normal case). */
+    struct seccomp_filter* seccomp;
 };
 
 /* §M90 — Linux capability numbers used by name, and the last one this kernel

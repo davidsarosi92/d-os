@@ -17,6 +17,7 @@
  * belongs in the engine, so that x86 gets it too.
  * ============================================================================= */
 
+#include "seccomp.h"
 #include "lnx_signal.h"   /* §M89 */
 #include "abi.h"
 #include "vmm.h"
@@ -60,6 +61,17 @@ void linux_syscall_dispatch(struct trapframe* tf) {
     if (me) me->in_user_syscall = 1;
 
     unsigned long nr = tf->x[8];
+
+    /* §M90 — the caller's seccomp filters, before anything else (seccomp.c). */
+    if (me && me->cred.seccomp) {
+        unsigned long aa[6] = { tf->x[0], tf->x[1], tf->x[2], tf->x[3], tf->x[4], tf->x[5] };
+        long r;
+        if (seccomp_enter(me, nr, aa, (uintptr_t)tf->elr, SECCOMP_ARCH_AARCH64, &r)) {
+            tf->x[0] = (uint64_t)r;
+            me->in_user_syscall = prev;
+            return;
+        }
+    }
 
     /* §M89 — rt_sigreturn restores the WHOLE register set from the frame, so
      * it must not have x0 overwritten by a return value afterwards. */
@@ -126,6 +138,19 @@ void linux_syscall_dispatch(struct trapframe* tf) {
             }
             tf->x[0] = (uint64_t)(tid < 0 ? -11 /* EAGAIN */ : tid);
         }
+        if (me) me->in_user_syscall = prev;
+        return;
+    }
+    /* §M90 — clone3(args, size): the register snapshot here, the rest is
+     * portable (proc_clone3). */
+    if (nr == 435) {
+        struct user_regs r;
+        for (int i = 0; i < 31; i++) r.x[i] = tf->x[i];
+        r.x[0] = 0;
+        __asm__ volatile ("mrs %0, sp_el0" : "=r"(r.user_sp));
+        r.pc     = tf->elr;
+        r.pstate = tf->spsr;
+        tf->x[0] = (uint64_t)proc_clone3(&r, (uintptr_t)tf->x[0], (unsigned long)tf->x[1], 0);
         if (me) me->in_user_syscall = prev;
         return;
     }

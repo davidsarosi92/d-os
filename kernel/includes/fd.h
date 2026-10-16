@@ -32,7 +32,8 @@ enum fd_kind { FD_VFS, FD_SHM, FD_SOCK, FD_NETSOCK, FD_TIMER, FD_EPOLL, FD_CONSO
                FD_BPF /* §M90 — an eBPF program, bpf.c */,
                FD_INOTIFY /* §M90 — an inotify instance, inotify.c */,
                FD_PACKET /* §M90 — an AF_PACKET socket, packet.c */,
-               FD_PTY /* §M90 rung 6 — a terminal end: pty master or slave, tty.c */ };
+               FD_PTY /* §M90 rung 6 — a terminal end: pty master or slave, tty.c */,
+               FD_PIDFD /* §M90 — a process behind a descriptor, pidfd.c */ };
 
 struct netsock;                 /* network (AF_INET) socket — usyscall.c        */
 struct timerfd;                 /* §M53 stage 3 — a deadline behind a descriptor */
@@ -87,6 +88,17 @@ struct ofile {
      * fstat and the cgroup device check see the device, as for any node. */
     struct tty*      tty;
     int              tty_side;
+    /* §M90 — APPENDED.  FD_PIDFD: the process it names — its global pid AND
+     * that task's start time, so a pid recycled after the process was reaped
+     * is never mistaken for it (pidfd.c). */
+    int              pidfd_pid;
+    uint64_t         pidfd_start;
+    /* §M90 — APPENDED.  open_tree(OPEN_TREE_CLONE): this O_PATH description
+     * is a DETACHED copy of the tree at its path, attached somewhere by
+     * move_mount (as a bind).  `tree_ro`: mount_setattr asked MOUNT_ATTR_RDONLY. */
+    int              tree_detached;
+    int              tree_ro;
+    int              tree_noexec;      /* MOUNT_ATTR_NOEXEC, likewise */
 };
 struct ofile* ofile_from_bpf(struct bpf_prog* p);   /* §M90 — takes a reference */
 struct inotify;

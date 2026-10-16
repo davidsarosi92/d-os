@@ -856,6 +856,7 @@ int task_exec_detach(struct task* me, struct vmm_space* old, int me_owned);
  * that pid.  Used by `taskset` and a future `kill`.  Walks the global
  * task list under the master scheduler lock. */
 struct task* task_find(int pid);
+int task_group_alive(int tgid);          /* §M90 — any live thread of that process */
 
 /* ---------------------------------------------------------------------------
  * §M75 — what a task is COSTING (kernel/core/taskstat.c).

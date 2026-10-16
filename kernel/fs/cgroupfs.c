@@ -50,6 +50,7 @@
 #include "cgroupfs.h"
 #include "bpf.h"
 #include "vfs.h"
+#include "fd.h"
 #include "task.h"
 #include "kmalloc.h"
 #include "printf.h"
@@ -1173,6 +1174,19 @@ void* cgroupfs_parent(void* cg) {
     return (c && !cg_is_root(c)) ? c->parent : NULL;
 }
 void* cgroupfs_task_node(const struct task* t) { return task_cg(t); }
+/* §M90 — clone3(CLONE_INTO_CGROUP): the cgroup a DIRECTORY descriptor names
+ * (NULL when it is not one), and a new task placed there before it runs. */
+void* cgroupfs_of_fd(int fd) {
+    struct ofile* o = fd_get(fd);
+    if (!o) return NULL;
+    void* cg = (o->kind == FD_VFS && o->file) ? cgroupfs_of_inode(o->file->inode) : NULL;
+    ofile_unref(o);
+    return cg;
+}
+void cgroupfs_place(struct task* t, void* cg) {
+    if (!t || !cg) return;
+    t->cgroup = cg_is_root((struct cgroup*)cg) ? NULL : cg;
+}
 
 /* ---- `cglimittest` — §M90 rung 3: each limit made to BITE ------------------
  *

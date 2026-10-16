@@ -519,14 +519,24 @@ static void cmd_archtest(void) {
     uint8_t hdr[64];
     /* Two foreign shapes: the "other" word size and a plainly alien machine. */
     int is64 = (sizeof(void*) == 8);
+    /* §M90 — THIS arch's machine number: the test hard-coded x86's (62/3) as
+     * native and EM_AARCH64 as foreign, so on aarch64 it judged the gate by
+     * the wrong answers and reported FAIL for a correct loader. */
+#if defined(__aarch64__)
+    const unsigned native_m = 183u, alien_m = 62u;        /* alien: EM_X86_64 */
+#elif defined(__x86_64__)
+    const unsigned native_m = 62u, alien_m = 183u;
+#else
+    const unsigned native_m = 3u, alien_m = 183u;
+#endif
     make_ehdr(hdr, is64 ? 1u : 2u, is64 ? 3u : 62u);      /* other class+machine */
     int foreign_other = elf_load_ex(NULL, hdr, sizeof hdr, 0, NULL);
 
-    make_ehdr(hdr, is64 ? 2u : 1u, 183u);                 /* EM_AARCH64 */
+    make_ehdr(hdr, is64 ? 2u : 1u, alien_m);              /* the right class, another machine */
     int foreign_arm = elf_load_ex(NULL, hdr, sizeof hdr, 0, NULL);
 
     /* Native class+machine — must pass the gate and fail for the NEXT reason. */
-    make_ehdr(hdr, is64 ? 2u : 1u, is64 ? 62u : 3u);
+    make_ehdr(hdr, is64 ? 2u : 1u, native_m);
     int native = elf_load_ex(NULL, hdr, sizeof hdr, 0, NULL);
 
     kprintf("archtest: arch=%s foreign=%d/%d (want %d) native=%d (want %d) -> %s\n",
@@ -885,6 +895,21 @@ SHELL_CMD(reboot)   = { "reboot",  "",          "restart the machine",
 
 SHELL_CMD(ringtest)    = { "ringtest",    "", "ring 3 / EL0 excursion",
                            SHELL_G_TEST, sy_ringtest, SHELL_P_ADMIN };
+/* §M93 — `arch`: which processor this machine is, in the spellings vendors
+ * use for their downloads (the install guide asks the reader to pick one). */
+static void cmd_arch(const char* args) {
+    (void)args;
+#if defined(__x86_64__)
+    console_write("x86_64 (downloads call it x86_64, amd64 or x64)\n");
+#elif defined(__aarch64__)
+    console_write("aarch64 (downloads call it aarch64 or arm64)\n");
+#else
+    console_write("i386 (downloads call it i386, i686 or x86; 32-bit)\n");
+#endif
+}
+SHELL_CMD(arch) = { "arch", "", "this machine's processor, as downloads name it",
+                    SHELL_G_SYS, cmd_arch, SHELL_P_ANY };
+
 SHELL_CMD(archtest)    = { "archtest",    "", "the ELF architecture gate",
                            SHELL_G_TEST, sy_archtest, SHELL_P_ADMIN };
 SHELL_CMD(fputest)     = { "fputest",     "", "per-task FP/SIMD register file",

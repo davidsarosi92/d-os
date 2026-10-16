@@ -1,15 +1,27 @@
 /* =============================================================================
  * linker-x86_64.ld — kernel link script for the x86_64 (long mode) port.
  *
- * Differs from linker-i386.ld in only two material ways:
- *   1. OUTPUT_FORMAT/ARCH say ELF64.
- *   2. Section alignment uses 4 KiB pages on both (no PSE pages here —
- *      the early page tables in boot.s map identity 4 KiB by default).
+ * §M90 (2026-10-15) — THE KERNEL RUNS IN THE UPPER HALF.
  *
- * Load address is still 1 MiB physical, identity-mapped during early
- * boot.  Higher-half kernel relocation (link at
- * 0xFFFFFFFF80000000) is deferred — M20 Phase 4+ once paging + mcmodel
- * switch is in place.
+ * The image is still LOADED at 1 MiB physical (GRUB reads the program
+ * headers' physical addresses), but everything except the 32-bit bootstrap
+ * is LINKED at KERNEL_VMA + its physical address, i.e. at
+ * 0xFFFFFFFF80100000 and up — the top 2 GiB of the address space, PML4[511].
+ *
+ * Why: the kernel used to run at its physical address, so the low 1 GiB of
+ * every process belonged to the kernel and user space began at 1 GiB.  A
+ * fixed-address Linux binary — a static Go program such as dockerd, linked
+ * at 0x400000 — could not be loaded at all.  Linux programs own the low half;
+ * now the kernel owns none of it.
+ *
+ * Layout:
+ *   .multiboot, .boot*   VMA == LMA (1 MiB up): the multiboot2 header and the
+ *                        32-bit code that runs before paging; it builds the
+ *                        page tables and jumps into the upper half.
+ *   everything else      VMA = KERNEL_VMA + LMA (AT() gives the LMA).
+ *
+ * `kernel_start` / `kernel_end` are VIRTUAL (upper-half) addresses; the PMM
+ * converts them with kptr_phys, exactly as on aarch64 (§M85).
  *
  * The .modules / .drivers KEEP() pattern is identical to i386 — the
  * driver and module registry mechanism is arch-agnostic.
@@ -21,8 +33,8 @@ ENTRY(_start)
 
 SECTIONS
 {
+    KERNEL_VMA = 0xFFFFFFFF80000000;
     . = 1M;
-    PROVIDE(kernel_start = .);
 
     /* Multiboot2 header.  Must live within the first 32 KiB of the
      * final image per the MB2 spec (vs. MB1's 8 KiB) — the section
@@ -32,7 +44,20 @@ SECTIONS
         *(.multiboot)
     }
 
-    .text BLOCK(4K) : ALIGN(4K)
+    /* The 32-bit bootstrap: runs at its physical address with paging off. */
+    .boot BLOCK(4K) : ALIGN(4K)
+    {
+        *(.boot.text)
+        *(.boot.data)
+        *(.boot.bss)
+    }
+
+    . = ALIGN(4K);
+    . += KERNEL_VMA;
+    /* The image's first byte, as a kernel (upper-half) address. */
+    PROVIDE(kernel_start = KERNEL_VMA + 1M);
+
+    .text BLOCK(4K) : AT(ADDR(.text) - KERNEL_VMA)
     {
         __text_start = .;       /* NMI stack scan: "is this a return address?" */
         *(.text)
@@ -40,7 +65,7 @@ SECTIONS
         __text_end = .;
     }
 
-    .rodata BLOCK(4K) : ALIGN(4K)
+    .rodata BLOCK(4K) : AT(ADDR(.rodata) - KERNEL_VMA) ALIGN(4K)
     {
         *(.rodata)
         *(.rodata.*)
@@ -48,7 +73,7 @@ SECTIONS
 
     /* Module registry — every MODULE() macro instantiation drops a
      * `struct module_def` here.  Same KEEP() discipline as i386. */
-    .modules : ALIGN(8)
+    .modules : AT(ADDR(.modules) - KERNEL_VMA) ALIGN(8)
     {
         __start_modules = .;
         KEEP(*(modules))
@@ -61,7 +86,7 @@ SECTIONS
      * other registry here this one is a PUBLISHED CONTRACT — an entry that
      * disappears breaks a module built against it, so removing a line from
      * ksym.c is a breaking change rather than a cleanup. */
-    .ksyms : ALIGN(8)
+    .ksyms : AT(ADDR(.ksyms) - KERNEL_VMA) ALIGN(8)
     {
         __start_ksyms = .;
         KEEP(*(ksyms))
@@ -71,7 +96,7 @@ SECTIONS
     /* Driver registry — sibling of .modules, populated by DRIVER().
      * Alignment is 8 to match the natural pointer/struct stride on
      * 64-bit (vs. 4 on i386). */
-    .drivers : ALIGN(8)
+    .drivers : AT(ADDR(.drivers) - KERNEL_VMA) ALIGN(8)
     {
         __start_drivers = .;
         KEEP(*(drivers))
@@ -80,14 +105,14 @@ SECTIONS
 
     /* GUI app + desktop shell registries (M22.2) — same KEEP()
      * discipline; alignment 8 for the 64-bit struct stride. */
-    .gui_apps : ALIGN(8)
+    .gui_apps : AT(ADDR(.gui_apps) - KERNEL_VMA) ALIGN(8)
     {
         __start_gui_apps = .;
         KEEP(*(gui_apps))
         __stop_gui_apps = .;
     }
 
-    .desktop_shells : ALIGN(8)
+    .desktop_shells : AT(ADDR(.desktop_shells) - KERNEL_VMA) ALIGN(8)
     {
         __start_desktop_shells = .;
         KEEP(*(desktop_shells))
@@ -99,7 +124,7 @@ SECTIONS
      * (the persistent store being overlaid once the disk mounts, or a
      * settings panel writing the key) reaches it instead of taking effect
      * only at the NEXT boot. */
-    .config_watches : ALIGN(8)
+    .config_watches : AT(ADDR(.config_watches) - KERNEL_VMA) ALIGN(8)
     {
         __start_config_watches = .;
         KEEP(*(config_watches))
@@ -109,7 +134,7 @@ SECTIONS
     /* Item-view registry (§M63/§M64) — ITEM_VIEW() layouts (grid, list, …).
      * The desktop and the control panel pick one BY NAME from config, so a
      * new layout is a new file rather than an edit to either consumer. */
-    .item_views : ALIGN(8)
+    .item_views : AT(ADDR(.item_views) - KERNEL_VMA) ALIGN(8)
     {
         __start_item_views = .;
         KEEP(*(item_views))
@@ -119,7 +144,7 @@ SECTIONS
     /* Control-panel registries (§M63): SETTINGS_PANEL() pages and
      * CONFIG_KEY() descriptors.  A setting ships next to the code it
      * configures; controlpanel.c names none of them. */
-    .settings_panels : ALIGN(8)
+    .settings_panels : AT(ADDR(.settings_panels) - KERNEL_VMA) ALIGN(8)
     {
         __start_settings_panels = .;
         KEEP(*(settings_panels))
@@ -128,7 +153,7 @@ SECTIONS
 
     /* §M65 — widget-class registry: WIDGET_CLASS() entries, looked up BY
        NAME so a class can be named in data (and later across a boundary). */
-    .ui_classes : ALIGN(8)
+    .ui_classes : AT(ADDR(.ui_classes) - KERNEL_VMA) ALIGN(8)
     {
         __start_ui_classes = .;
         KEEP(*(ui_classes))
@@ -138,14 +163,14 @@ SECTIONS
     /* §M69 — the string catalogue: LOCALE_CATALOG() entries, one per language,
        looked up BY KEY so adding a language is a FILE rather than an edit to a
        switch in the middle of the toolkit. */
-    .locale_catalogs : ALIGN(8)
+    .locale_catalogs : AT(ADDR(.locale_catalogs) - KERNEL_VMA) ALIGN(8)
     {
         __start_locale_catalogs = .;
         KEEP(*(locale_catalogs))
         __stop_locale_catalogs = .;
     }
 
-    .config_keys : ALIGN(8)
+    .config_keys : AT(ADDR(.config_keys) - KERNEL_VMA) ALIGN(8)
     {
         __start_config_keys = .;
         KEEP(*(config_keys))
@@ -156,7 +181,7 @@ SECTIONS
        command ships next to the code it drives, `help` is generated from this
        section, and BOTH shells (shell.c and the aarch64 serial REPL) walk it —
        so a command is no longer x86-only by accident. */
-    .shell_cmds : ALIGN(8)
+    .shell_cmds : AT(ADDR(.shell_cmds) - KERNEL_VMA) ALIGN(8)
     {
         __start_shell_cmds = .;
         KEEP(*(shell_cmds))
@@ -165,7 +190,7 @@ SECTIONS
 
     /* §M71 — runtime invariant checks: AUDIT() entries.  An invariant ships
        next to the code that must maintain it; audit.c names none of them. */
-    .audits : ALIGN(8)
+    .audits : AT(ADDR(.audits) - KERNEL_VMA) ALIGN(8)
     {
         __start_audits = .;
         KEEP(*(audits))
@@ -174,7 +199,7 @@ SECTIONS
 
     /* Which PCI IDs a driver claims (hwdev.h) — declared NEXT TO THE DRIVER so
        the device manager never accumulates knowledge of the whole tree. */
-    .driver_matches : ALIGN(8)
+    .driver_matches : AT(ADDR(.driver_matches) - KERNEL_VMA) ALIGN(8)
     {
         __start_driver_matches = .;
         KEEP(*(driver_matches))
@@ -183,7 +208,7 @@ SECTIONS
 
     /* Command-shell provider registry (S.1) — SHELL_PROVIDER() entries;
      * spawn sites resolve the active one via the shell.provider key. */
-    .shell_providers : ALIGN(8)
+    .shell_providers : AT(ADDR(.shell_providers) - KERNEL_VMA) ALIGN(8)
     {
         __start_shell_providers = .;
         KEEP(*(shell_providers))
@@ -191,7 +216,7 @@ SECTIONS
     }
 
     /* Service registry + service-bus provider/adapter registries (M29). */
-    .services : ALIGN(8)
+    .services : AT(ADDR(.services) - KERNEL_VMA) ALIGN(8)
     {
         __start_services = .;
         KEEP(*(services))
@@ -203,19 +228,19 @@ SECTIONS
      * ALIGN(4) discipline as the driver/service registries: KEEP is required
      * because nothing REFERENCES these objects by name, so --gc-sections would
      * otherwise drop every crash reporter in the build. */
-    .crashsinks : ALIGN(4)
+    .crashsinks : AT(ADDR(.crashsinks) - KERNEL_VMA) ALIGN(4)
     {
         __start_crashsinks = .;
         KEEP(*(crashsinks))
         __stop_crashsinks = .;
     }
-    .bus_providers : ALIGN(8)
+    .bus_providers : AT(ADDR(.bus_providers) - KERNEL_VMA) ALIGN(8)
     {
         __start_bus_providers = .;
         KEEP(*(bus_providers))
         __stop_bus_providers = .;
     }
-    .bus_adapters : ALIGN(8)
+    .bus_adapters : AT(ADDR(.bus_adapters) - KERNEL_VMA) ALIGN(8)
     {
         __start_bus_adapters = .;
         KEEP(*(bus_adapters))
@@ -223,7 +248,7 @@ SECTIONS
     }
 
     /* Cron job registry (M30) — CRON_JOB() entries; the cron service walks it. */
-    .cron_jobs : ALIGN(8)
+    .cron_jobs : AT(ADDR(.cron_jobs) - KERNEL_VMA) ALIGN(8)
     {
         __start_cron_jobs = .;
         KEEP(*(cron_jobs))
@@ -236,20 +261,20 @@ SECTIONS
      * panicking, so a user pointer that goes bad DURING a copy returns -EFAULT
      * rather than freezing the box.  KEEP() — nothing references the entries by
      * name, they are found only through these bounds. */
-    .ex_table : ALIGN(8)
+    .ex_table : AT(ADDR(.ex_table) - KERNEL_VMA) ALIGN(8)
     {
         __start_ex_table = .;
         KEEP(*(ex_table))
         __stop_ex_table = .;
     }
 
-    .data BLOCK(4K) : ALIGN(4K)
+    .data BLOCK(4K) : AT(ADDR(.data) - KERNEL_VMA) ALIGN(4K)
     {
         *(.data)
         *(.data.*)
     }
 
-    .bss BLOCK(4K) : ALIGN(4K)
+    .bss BLOCK(4K) : AT(ADDR(.bss) - KERNEL_VMA) ALIGN(4K)
     {
         *(COMMON)
         *(.bss)

@@ -77,6 +77,8 @@
  * context_switch that swaps away from it.
  * ============================================================================= */
 
+#include "seccomp.h"
+#include "fd.h"        /* §M90 — fd_readiness_signal (pidfd) */
 #include "lnx_signal.h"
 #include "nsproxy.h"   /* §M89 */
 #include "task.h"
@@ -2393,6 +2395,8 @@ int task_reap(int pid) {
 
     lnx_sig_free(t);                         /* §M89 — Linux signal state */
     ns_release(t);                           /* §M90 — namespace references */
+    seccomp_put(t->cred.seccomp);            /* §M90 — its filter chain */
+    t->cred.seccomp = NULL;
     if (t->kstack_base) kfree(t->kstack_base);
     kfree(t);
     task_notify_change();                    /* M22.4 — task disappeared */
@@ -2449,14 +2453,46 @@ int task_space_handoff(struct task* owner, struct vmm_space* s) {
  * (the leader) is among the killed and its reap destroys it.  Returns 1 only
  * when nobody else uses `old` and `me` owned it — the caller frees it then.
  *
- * NOT done: Linux also gives a non-leader exec'ing thread the LEADER's pid,
- * so the process keeps its number; here that thread keeps its own and the
- * leader's exit is what its parent sees.  Said on the console when it
- * happens, so it is not mistaken for a working path. */
+ * §M90 (2026-10-15) — and a NON-LEADER exec'ing thread TAKES OVER THE
+ * LEADER'S PID, as Linux's de_thread does (exchange_tids): the process keeps
+ * its number, its parent, its start time and its process attributes, and the
+ * old leader becomes an ordinary (already killed) thread whose end nobody is
+ * told about.  Before this, the exec'ing thread kept its own pid and the
+ * leader's death was what the parent saw — the process "exited" while its
+ * program went on running under another number (NEXT #16). */
+static void exec_take_leader_locked(struct task* me) {
+    struct task* L = ring_find_locked(me->tgid);
+    if (!L || L == me) return;
+    int lpid = L->pid, mpid = me->pid;
+    /* the numbers, in every pid namespace */
+    me->pid = lpid; L->pid = mpid;
+    for (int i = 0; i < 4; i++) { int t = me->upid[i]; me->upid[i] = L->upid[i]; L->upid[i] = t; }
+    me->tgid = 0;                          /* the leader: task_tgid() = pid */
+    L->tgid  = lpid;                       /* the old leader is now OUR thread */
+    /* what belongs to the process, not to the thread */
+    me->ppid = L->ppid;
+    me->pgid = L->pgid;
+    me->sid  = L->sid;
+    me->ctty_id = L->ctty_id;
+    me->start_ms = L->start_ms;            /* /proc/<pid>/stat starttime, pidfds */
+    me->child_subreaper = L->child_subreaper;
+    me->survives_parent = L->survives_parent;
+    me->reap_owned = L->reap_owned;
+    me->exit_sig_plus1 = L->exit_sig_plus1;
+    L->reap_owned = 0;                     /* a thread: init collects it, silently */
+    /* children of the exec'ing thread now belong to the process (its pid) */
+    struct task* c = master_head;
+    do {
+        if (c->ppid == mpid && c != L) c->ppid = lpid;
+        c = c->next;
+    } while (c != master_head);
+}
+
 int task_exec_detach(struct task* me, struct vmm_space* old, int me_owned) {
     if (!me || !old) return 0;
     int pids[64], n = 0;
     uint32_t fl = spin_lock_irqsave(&master_lock);
+    if (master_head && me->tgid && me->tgid != me->pid) exec_take_leader_locked(me);
     if (master_head) {
         struct task* c = master_head;
         do {
@@ -2465,9 +2501,6 @@ int task_exec_detach(struct task* me, struct vmm_space* old, int me_owned) {
         } while (c != master_head);
     }
     spin_unlock_irqrestore(&master_lock, fl);
-    if (me->tgid && me->tgid != me->pid)
-        kprintf("exec: pid %d is a thread of %d; it keeps its own pid (no leader takeover yet)\n",
-                me->pid, me->tgid);
     for (int i = 0; i < n; i++) task_kill(pids[i]);
     if (!me_owned) return 0;
     int handed = 0;
@@ -3013,12 +3046,35 @@ void task_exit_code(int code) {
      * the "parent dies → subtree dies" rule. */
     if (self->pid != 0 && !self->is_idle) {
         int kids[KILLTREE_MAX]; char kforce[KILLTREE_MAX]; int nk = 0;
+        /* §M90 (2026-10-15) — a LINUX process's children are never killed with
+         * it: Linux reparents them (to another thread of the same process if
+         * one is left, else to the nearest subreaper or the namespace's init)
+         * and only PR_SET_PDEATHSIG asks for a signal.  The kill-tree rule is
+         * d-os's own, for its native tasks; applied to Linux programs it
+         * killed every daemon whose launcher exited (containerd-shim's start
+         * survived only because it happens to call setpgid). */
+        int dsig_pid[KILLTREE_MAX]; int dsig[KILLTREE_MAX]; int nd = 0;
         uint32_t f2 = spin_lock_irqsave(&master_lock);
+        int heir = 0;                     /* a living thread of our own process */
+        if (self->linux_abi && master_head) {
+            struct task* c = master_head;
+            do {
+                if (c != self && c->state != TASK_DEAD && task_tgid(c) == task_tgid(self)) {
+                    heir = (c->pid == task_tgid(self)) ? c->pid : (heir ? heir : c->pid);
+                }
+                c = c->next;
+            } while (c != master_head);
+        }
         if (master_head) {
             struct task* c = master_head;
             do {
                 if (c->ppid == self->pid && c != self && c->state != TASK_DEAD) {
-                    if (c->survives_parent) {
+                    if (self->linux_abi && c->linux_abi && task_tgid(c) != task_tgid(self)) {
+                        adopt_locked(c, heir ? heir : adopter_for_locked(self));
+                        if (c->pdeathsig && nd < KILLTREE_MAX) {
+                            dsig_pid[nd] = c->pid; dsig[nd++] = c->pdeathsig;
+                        }
+                    } else if (c->survives_parent) {
                         adopt_locked(c, adopter_for_locked(self));   /* detached: outlives us */
                     } else if (nk < KILLTREE_MAX) {
                         kforce[nk] = (char)(c->user_task ? 1 : 0);
@@ -3040,6 +3096,12 @@ void task_exit_code(int code) {
         for (int i = 0; i < nk; i++) {
             (void)kforce[i];
             task_kill(kids[i]);
+        }
+        /* PR_SET_PDEATHSIG: the parent THREAD that created the child is gone
+         * (posted after the lock, as every signal post is). */
+        for (int i = 0; i < nd; i++) {
+            struct task* c = task_find(dsig_pid[i]);
+            if (c && c->state != TASK_DEAD) lnx_sig_post(c, dsig[i], NULL);
         }
         /* §M90 — the init of a pid namespace takes every process in it down. */
         if (ns_pid_is_init(self)) ns_pid_init_died(self);
@@ -3120,6 +3182,9 @@ void task_exit_code(int code) {
             lnx_sig_child_exit(par, ns_vnr(par, self), code & 0xFF, 0);
     }
     task_notify_change();                    /* M22.4 — went DEAD */
+    /* §M90 — a pidfd naming this process may have become readable: tell the
+     * poll/epoll waiters to look again (the readiness wake is global). */
+    if (self->linux_abi) fd_readiness_signal();
 
     rq_purge_all(self);
     uint32_t rfl = spin_lock_irqsave(&me->rq_lock);
@@ -3458,6 +3523,21 @@ int task_count(void) {
     do { n++; t = t->next; } while (t != master_head);
     spin_unlock_irqrestore(&master_lock, fl);
     return n;
+}
+
+/* §M90 — is any thread of process `tgid` still running?  (A pidfd becomes
+ * readable when the whole thread group has exited, as on Linux.) */
+int task_group_alive(int tgid) {
+    if (!master_head || tgid <= 0) return 0;
+    int alive = 0;
+    uint32_t fl = spin_lock_irqsave(&master_lock);
+    struct task* t = master_head;
+    do {
+        if (t->state != TASK_DEAD && !t->is_idle && task_tgid(t) == tgid) { alive = 1; break; }
+        t = t->next;
+    } while (t != master_head);
+    spin_unlock_irqrestore(&master_lock, fl);
+    return alive;
 }
 
 struct task* task_find(int pid) {

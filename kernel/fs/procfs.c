@@ -16,6 +16,7 @@
  * `gen_tasks`, etc.
  * ============================================================================= */
 
+#include "seccomp.h"
 #include "procfs.h"
 #include "vfs.h"
 #include "kmalloc.h"
@@ -833,7 +834,10 @@ static void gen_selfstatus(struct procfs_writer* w) {
     pw_puts(w, "\nCapBnd:\t"); pw_put_hex64(w, cred_cap_bounding(&t->cred));
     pw_puts(w, "\nCapAmb:\t"); pw_put_hex64(w, t->cred.cap_amb);
     pw_puts(w, "\nNoNewPrivs:\t"); pw_put_uint(w, t->cred.no_new_privs ? 1u : 0u);
-    pw_puts(w, "\nSeccomp:\t0\nSeccomp_filters:\t0\n");
+    /* §M90 — the real seccomp state (seccomp.c) */
+    pw_puts(w, "\nSeccomp:\t"); pw_put_uint(w, (unsigned)seccomp_mode(t));
+    pw_puts(w, "\nSeccomp_filters:\t"); pw_put_uint(w, seccomp_mode(t) == 2 ? 1u : 0u);
+    pw_puts(w, "\n");
 }
 static struct procfs_node nd_selfstatus = { .name = "self/status", .gen = gen_selfstatus };
 

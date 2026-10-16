@@ -189,6 +189,16 @@ static const struct abi_nument linux_i386_ents[] = {
     { 291, ABI_INOTIFY_INIT }, { 292, ABI_INOTIFY_ADD_WATCH }, { 293, ABI_INOTIFY_RM_WATCH },
     { 332, ABI_INOTIFY_INIT1 },
     { 313, ABI_SPLICE },                                  /* §M90 rung 5 — EINVAL */
+    /* §M90 — pidfds (pidfd.c): the generic numbers, the same on every arch */
+    { 424, ABI_PIDFD_SEND_SIGNAL }, { 434, ABI_PIDFD_OPEN },
+    /* §M90 — openat2 and the new mount API's bind half (generic numbers) */
+    { 437, ABI_OPENAT2 }, { 428, ABI_OPEN_TREE }, { 429, ABI_MOVE_MOUNT },
+    { 442, ABI_MOUNT_SETATTR },
+    { 354, ABI_SECCOMP },                  /* §M90 — seccomp(2) */
+    { 383, ABI_STATX }, { 436, ABI_CLOSE_RANGE },
+    { 386, ABI_ENOSYS_KNOWN /* rseq */ }, { 288, ABI_ENOSYS_KNOWN /* keyctl */ },
+    { 377, ABI_ENOSYS_KNOWN /* copy_file_range */ },
+    { 430, ABI_ENOSYS_KNOWN }, { 431, ABI_ENOSYS_KNOWN }, { 432, ABI_ENOSYS_KNOWN }, { 433, ABI_ENOSYS_KNOWN },   /* fsopen fsconfig fsmount fspick */
 };
 
 /* ---- Linux / amd64 -------------------------------------------------------- */
@@ -245,6 +255,13 @@ static const struct abi_nument linux_amd64_ents[] = {
     {  52, ABI_GETPEERNAME },
     {  54, ABI_SETSOCKOPT  },
     {  55, ABI_GETSOCKOPT  },
+    /* §M90 (2026-10-15) — sendmsg 46, recvmsg 47 through the shared handlers
+     * (arm64's since rung 5).  x86_64 kept its own pair, which knew AF_INET
+     * and AF_UNIX only: a NETLINK reply came back as -1 = EPERM, so `nft`
+     * failed "cache initialization failed: Operation not permitted" and
+     * dockerd could not build its firewall. */
+    {  46, ABI_SENDMSG     },
+    {  47, ABI_RECVMSG     },
     /* §M73 — x86_64: mkdir 83, link 86, chmod 90, unlink 87, mkdirat 258,
      * linkat 265, fchmodat 268, unlinkat 263. */
     {  83, ABI_MKDIR }, { 258, ABI_MKDIRAT }, {  86, ABI_LINK }, { 265, ABI_LINKAT },
@@ -318,6 +335,16 @@ static const struct abi_nument linux_amd64_ents[] = {
     /* §M65 — d-os display-bridge op; the SAME number on every guest,
      * because it is ours to choose (Linux has no such call). */
     { 0xD054, ABI_UI_BUILD },
+    /* §M90 — pidfds (pidfd.c): the generic numbers, the same on every arch */
+    { 424, ABI_PIDFD_SEND_SIGNAL }, { 434, ABI_PIDFD_OPEN },
+    /* §M90 — openat2 and the new mount API's bind half (generic numbers) */
+    { 437, ABI_OPENAT2 }, { 428, ABI_OPEN_TREE }, { 429, ABI_MOVE_MOUNT },
+    { 442, ABI_MOUNT_SETATTR },
+    { 317, ABI_SECCOMP },                  /* §M90 — seccomp(2) */
+    { 332, ABI_STATX }, { 436, ABI_CLOSE_RANGE },
+    { 334, ABI_ENOSYS_KNOWN /* rseq */ }, { 250, ABI_ENOSYS_KNOWN /* keyctl */ },
+    { 326, ABI_ENOSYS_KNOWN /* copy_file_range */ },
+    { 430, ABI_ENOSYS_KNOWN }, { 431, ABI_ENOSYS_KNOWN }, { 432, ABI_ENOSYS_KNOWN }, { 433, ABI_ENOSYS_KNOWN },
 };
 
 /* ---- Linux / arm64 (the asm-generic numbering) ---------------------------- */
@@ -447,6 +474,16 @@ static const struct abi_nument linux_arm64_ents[] = {
     /* §M65 — d-os display-bridge op; the SAME number on every guest,
      * because it is ours to choose (Linux has no such call). */
     { 0xD054, ABI_UI_BUILD },
+    /* §M90 — pidfds (pidfd.c): the generic numbers, the same on every arch */
+    { 424, ABI_PIDFD_SEND_SIGNAL }, { 434, ABI_PIDFD_OPEN },
+    /* §M90 — openat2 and the new mount API's bind half (generic numbers) */
+    { 437, ABI_OPENAT2 }, { 428, ABI_OPEN_TREE }, { 429, ABI_MOVE_MOUNT },
+    { 442, ABI_MOUNT_SETATTR },
+    { 277, ABI_SECCOMP },                  /* §M90 — seccomp(2) */
+    { 291, ABI_STATX }, { 436, ABI_CLOSE_RANGE },
+    { 293, ABI_ENOSYS_KNOWN /* rseq */ }, { 219, ABI_ENOSYS_KNOWN /* keyctl */ },
+    { 285, ABI_ENOSYS_KNOWN /* copy_file_range */ },
+    { 430, ABI_ENOSYS_KNOWN }, { 431, ABI_ENOSYS_KNOWN }, { 432, ABI_ENOSYS_KNOWN }, { 433, ABI_ENOSYS_KNOWN },
 };
 
 #define ARRAY_N(a) ((uint32_t)(sizeof(a) / sizeof((a)[0])))

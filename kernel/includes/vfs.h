@@ -270,6 +270,12 @@ struct dentry {
     int             ro;
     int             ro_ns;
     unsigned        ro_seq;
+    /* §M90 — APPENDED.  A NOEXEC mount at this dentry (MS_NOEXEC on a
+     * filesystem mount or a remount, MOUNT_ATTR_NOEXEC), visible by the same
+     * rule: nothing reached through it may be executed or mapped executable. */
+    int             noexec;
+    int             noexec_ns;
+    unsigned        noexec_seq;
 };
 
 /* Open file handle — per-call-to-open instance state. */
@@ -574,6 +580,15 @@ struct dentry* vfs_resolve_nofollow(const char* path); /* §M89 — a final link
 /* §M73 — `path` made canonical: relative → joined to the caller's working
  * directory, "." / ".." applied, ".." at the root stays there.  0 on success. */
 int vfs_canonical(const char* path, char* out, size_t cap);
+/* §M90 — MS_NOEXEC: mark the mount at `path` (0, -1 when it does not exist),
+ * and ask whether a path / an open file is reached through a noexec mount. */
+int vfs_set_noexec(const char* path, int on);
+int vfs_path_noexec(const char* path);
+int vfs_file_noexec(struct file* f);
+/* §M90 — openat2's RESOLVE_* walk from `base` (vfs.c says what each flag
+ * does); the resolved canonical path in `out`, 0 or a negative errno. */
+int vfs_resolve_scoped(const char* base, const char* rel, unsigned res, int follow_last,
+                       char* out, size_t cap);
 void           vfs_chown_tree(struct dentry* d, int uid, int gid);   /* §M73 */
 
 /* §M90 — inotify (fsnotify.h): the inode `path` names (following a final

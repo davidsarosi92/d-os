@@ -44,6 +44,7 @@
 #define EAGER_MAX      (256u << 20)    /* an EAGER mapping allocates up front: bound it */
 
 #define E_NOMEM  12
+#define E_PERM   1             /* §M90 — PROT_EXEC on a noexec mount */
 #define E_INVAL  22
 #define E_EXIST  17
 #define E_BADF    9
@@ -292,6 +293,8 @@ long vma_mmap(uintptr_t addr, size_t len, int prot, int flags, int fd, uint64_t 
         if (off & (PG - 1)) return -E_INVAL;
         if (o->kind == FD_SHM && o->shm) kind = VMA_EAGER;
         else if (o->kind == FD_VFS && o->file) {
+            /* §M90 — an executable mapping of a file on a noexec mount: EPERM */
+            if ((prot & VMA_PROT_EXEC) && vfs_file_noexec(o->file)) return -E_PERM;
             /* §M74 rung 2's rule, now LAZY: a private file mapping shares the
              * page cache's frames copy-on-write, filled on first touch.  A
              * 101 MB file mapped whole costs nothing until it is read. */

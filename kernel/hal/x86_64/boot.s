@@ -23,6 +23,22 @@
 ; Phase 2's DoD is exactly the serial print.  Phase 3+ will replace
 ; the print+halt tail with a call to a C entry point.
 ;
+; §M90 (2026-10-15) — THE KERNEL IS LINKED IN THE UPPER HALF.
+;   Only this file's 32-bit part (.boot.*) runs at its physical address; the
+;   rest of the image is linked at KERNEL_VMA + physical.  The early tables map
+;   physical 0..1 GiB THREE times, all through one page directory of 2 MiB
+;   pages:
+;     PML4[0]   -> pdpt_low   [0]   identity — needed for the instructions
+;                                    between "paging on" and the jump up, and
+;                                    for the AP trampoline at 0x8000; dropped
+;                                    once the APs are up (vmm_drop_low_identity)
+;     PML4[256] -> pdpt_dm    [0]   the direct map (KERNEL_DIRECT_MAP_BASE), so
+;                                    phys_to_virt works from the first line of C
+;                                    for the low GiB; pmm_init widens it
+;     PML4[511] -> pdpt_high  [510] the kernel image at 0xFFFFFFFF80000000
+;   Symbols the 32-bit code touches before paging are written `sym - KERNEL_VMA`
+;   (their physical address).
+;
 ; Multiboot2 hand-off state we preserve through the transition:
 ;   eax = 0x36d76289                       (loader magic)
 ;   ebx = phys addr of mb2 info structure  (sized & aligned per spec)
@@ -45,6 +61,7 @@ bits 32
 
 MB2_MAGIC equ 0xe85250d6
 MB2_ARCH  equ 0                                ; 0 = i386 protected-mode entry
+KERNEL_VMA equ 0xFFFFFFFF80000000              ; keep in step with linker-x86_64.ld
 
 section .multiboot
 align 8
@@ -75,6 +92,16 @@ header_start:
     dd 1200         ; height
     dd 32           ; depth
 
+    ; Entry-address tag (type=3): the PHYSICAL address to start at.  The ELF
+    ; entry is _start, already a low address (.boot.text), but saying it in
+    ; the header means no loader has to guess how to translate an entry
+    ; point in a 64-bit ELF.
+    align 8
+    dw 3            ; type: entry address
+    dw 0            ; flags
+    dd 12           ; size
+    dd _start       ; entry (physical; .boot.text is linked at its LMA)
+
     ; End tag — required terminator.  type=0, flags=0, size=8.
     align 8
     dw 0
@@ -103,9 +130,13 @@ align 4096
 global pml4
 pml4:    resb 4096
 global pdpt
-pdpt:    resb 4096
+pdpt:    resb 4096              ; PML4[0]: the low identity (boot + AP start only)
 global pd_low
-pd_low:  resb 4096
+pd_low:  resb 4096              ; 512 x 2 MiB = physical 0..1 GiB, shared by all three
+global pdpt_dm
+pdpt_dm: resb 4096              ; PML4[256]: the direct map (vmm.c widens it)
+global pdpt_high
+pdpt_high: resb 4096            ; PML4[511]: the kernel image
 
 ; -----------------------------------------------------------------------------
 ; 64-bit GDT.  Two real entries:
@@ -133,7 +164,7 @@ pd_low:  resb 4096
 ;   56..63  base_high      (ignored in long mode; 0)
 ; -----------------------------------------------------------------------------
 
-section .rodata
+section .boot.data
 align 16
 gdt64:
     dq 0                                      ; index 0: null
@@ -165,7 +196,7 @@ no_lm_msg:
 ; _start — 32-bit entry from GRUB.
 ; -----------------------------------------------------------------------------
 
-section .text
+section .boot.text
 global _start
 extern x86_64_main_entry
 
@@ -176,7 +207,7 @@ _start:
     ; isn't accessible until we're in 64-bit mode; so we just keep
     ; them in fixed memory in .bss.  Phase 3+ will reload them.
     ; -------------------------------------------------------------------------
-    mov esp, stack_top                        ; private stack
+    mov esp, stack_top - KERNEL_VMA           ; private stack (physical)
     mov [mb2_magic], eax                      ; save loader magic
     mov [mb2_info],  ebx                      ; save info ptr
 
@@ -205,20 +236,36 @@ _start:
     ;   PD[i]   = i*2MiB     (present, writable, PS=1)  for i in 0..511
     ; -------------------------------------------------------------------------
 
-    ; PML4[0] = pdpt | 0x3 (P | RW)
-    mov eax, pdpt
+    ; PML4[0] = pdpt | 0x3 (P | RW)  — the low identity
+    mov eax, pdpt - KERNEL_VMA
     or  eax, 0x3
-    mov [pml4], eax                           ; low half
-    mov dword [pml4 + 4], 0                   ; high half: 0 since phys < 4 GiB
+    mov [pml4 - KERNEL_VMA], eax
+    mov dword [pml4 - KERNEL_VMA + 4], 0
 
-    ; PDPT[0] = pd_low | 0x3
-    mov eax, pd_low
+    ; PML4[256] = pdpt_dm | 0x3      — the direct map
+    mov eax, pdpt_dm - KERNEL_VMA
     or  eax, 0x3
-    mov [pdpt], eax
-    mov dword [pdpt + 4], 0
+    mov [pml4 - KERNEL_VMA + 256*8], eax
+    mov dword [pml4 - KERNEL_VMA + 256*8 + 4], 0
+
+    ; PML4[511] = pdpt_high | 0x3    — the kernel image
+    mov eax, pdpt_high - KERNEL_VMA
+    or  eax, 0x3
+    mov [pml4 - KERNEL_VMA + 511*8], eax
+    mov dword [pml4 - KERNEL_VMA + 511*8 + 4], 0
+
+    ; pdpt[0] = pdpt_dm[0] = pdpt_high[510] = pd_low | 0x3
+    mov eax, pd_low - KERNEL_VMA
+    or  eax, 0x3
+    mov [pdpt - KERNEL_VMA], eax
+    mov dword [pdpt - KERNEL_VMA + 4], 0
+    mov [pdpt_dm - KERNEL_VMA], eax
+    mov dword [pdpt_dm - KERNEL_VMA + 4], 0
+    mov [pdpt_high - KERNEL_VMA + 510*8], eax
+    mov dword [pdpt_high - KERNEL_VMA + 510*8 + 4], 0
 
     ; PD entries: i = 0..511, PD[i] = (i * 2MiB) | 0x83 (P | RW | PS)
-    mov edi, pd_low
+    mov edi, pd_low - KERNEL_VMA
     mov eax, 0x83                             ; flags + addr_low for i=0
     mov ecx, 512
 .fill_pd:
@@ -251,8 +298,8 @@ _start:
     or  eax, 1 << 5                           ; CR4.PAE
     mov cr4, eax
 
-    ; (3) CR3 = pml4
-    mov eax, pml4
+    ; (3) CR3 = pml4 (physical)
+    mov eax, pml4 - KERNEL_VMA
     mov cr3, eax
 
     ; (4) EFER.LME = 1
@@ -272,7 +319,7 @@ _start:
 
     ; Far-jmp encoded as 0xEA + 32-bit offset + 16-bit selector.
     ; nasm renders `jmp 0x08:long_mode_entry` as exactly that.
-    jmp 0x08:long_mode_entry
+    jmp 0x08:long_mode_low
 
 .no_lm:
     ; CPU can't long-mode.  Print error and halt.  We have no GDT/IDT
@@ -336,7 +383,16 @@ print_byte_32:
 
 bits 64
 
+; Still in .boot.text, running at the physical address through the identity
+; map: an absolute jump moves us into the upper half.
+long_mode_low:
+    mov rax, long_mode_entry
+    jmp rax
+
+section .text
+
 long_mode_entry:
+    mov rsp, stack_top                        ; the same stack, by its upper-half name
     ; Reload data segs.  Null is fine for ds/es/fs/gs in long mode
     ; (CPU just zero-extends and ignores base/limit), but use 0x10 for
     ; ss because some CPUs reject a null ss for certain ops.
@@ -351,7 +407,7 @@ long_mode_entry:
     ; This is harmless to leave in — gives us a sentinel line in the
     ; serial log that long-mode bring-up succeeded before we hand
     ; off to the C-level boot path.
-    lea rsi, [rel hello_msg]
+    mov rsi, hello_msg                        ; .boot.data is low: an absolute address
 .hello_loop:
     mov al, [rsi]
     test al, al
@@ -368,9 +424,9 @@ long_mode_entry:
     ; The kernel was loaded by GRUB into low memory, so mb2_info fits
     ; in 32 bits — we just zero-extend.
     xor edi, edi
-    mov edi, [mb2_magic]
+    mov edi, [abs mb2_magic]                  ; low addresses, still identity-mapped
     xor esi, esi
-    mov esi, [mb2_info]
+    mov esi, [abs mb2_info]
 
     ; Stack must be 16-byte aligned just before `call` per System V
     ; ABI.  stack_top is .bss-aligned to 16, and we haven't pushed
@@ -411,7 +467,7 @@ print_byte_64:
 ; 32-bit mode, reloaded by long_mode_entry into r12/r13.  Lives at a
 ; fixed addr in low memory so both modes can reference it directly.
 ; -----------------------------------------------------------------------------
-section .bss
+section .boot.data
 align 4
-mb2_magic: resd 1
-mb2_info:  resd 1
+mb2_magic: dd 0
+mb2_info:  dd 0

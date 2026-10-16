@@ -87,6 +87,10 @@ extern const unsigned char _binary_user_cpuidmusl_muslelf_start[] __attribute__(
 extern const unsigned char _binary_user_cpuidmusl_muslelf_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_sock6musl_muslelf_start[] __attribute__((weak));
 extern const unsigned char _binary_user_sock6musl_muslelf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_isigmusl_muslelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_isigmusl_muslelf_end[]   __attribute__((weak));
+extern const unsigned char _binary_user_newapimusl_muslelf_start[] __attribute__((weak));
+extern const unsigned char _binary_user_newapimusl_muslelf_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_killmusl_muslelf_start[] __attribute__((weak));
 extern const unsigned char _binary_user_killmusl_muslelf_end[]   __attribute__((weak));
 extern const unsigned char _binary_user_ptymusl_muslelf_start[] __attribute__((weak));
@@ -165,8 +169,8 @@ static void cmd_blktest(const char* args) {
         if (rf) pmm_free_frame(rf);
         return;
     }
-    uint8_t* wbuf = (uint8_t*)(uintptr_t)wf;
-    uint8_t* rbuf = (uint8_t*)(uintptr_t)rf;
+    uint8_t* wbuf = (uint8_t*)phys_to_virt(wf);       /* §M90 — a frame number is not a pointer */
+    uint8_t* rbuf = (uint8_t*)phys_to_virt(rf);
 
     /* Fill write buffer with a recognizable pattern: 0xA5 0x5A 0xA5 ... */
     for (int i = 0; i < 512; i++) wbuf[i] = (i & 1) ? 0x5A : 0xA5;
@@ -981,6 +985,42 @@ static void cmd_killtest(const char* args) {
     kprintf("killtest: returned rc=%d\n", rc);
 }
 
+/* §M90 — `isigtest`: ^C on the console reaches the foreground group
+ * (user/isigmusl.c; press Ctrl+C while it waits). */
+static void cmd_isigtest(const char* args) {
+    (void)args;
+    const unsigned char* a = _binary_user_isigmusl_muslelf_start;
+    const unsigned char* b = _binary_user_isigmusl_muslelf_end;
+    if (!a || !b) { console_write("isigtest: not embedded for this arch\n"); return; }
+    /* Run it the way a person runs a program: a real process started from a
+     * path, made the console's foreground group by the shell (cmd_pkg.c).
+     * The first version ran it as an EXCURSION on the shell task, which is
+     * not a user process, so the group lookup (rightly) skipped it and the
+     * test failed while the feature worked. */
+    struct file* f = vfs_open("/tmp/isigmusl", VFS_WRONLY | VFS_CREATE | VFS_TRUNC);
+    if (!f) { console_write("isigtest: cannot write /tmp/isigmusl\n"); return; }
+    ssize_t w = vfs_write(f, a, (size_t)(b - a));
+    vfs_close(f);
+    if (w != (ssize_t)(b - a)) { console_write("isigtest: short write\n"); return; }
+    int rc = shell_run_from_path("/tmp/isigmusl");
+    kprintf("isigtest: returned rc=%d\n", rc);
+}
+
+/* §M90 — `newapitest`: pidfd, clone3, openat2, open_tree/move_mount
+ * (user/newapimusl.c). */
+static void cmd_newapitest(const char* args) {
+    (void)args;
+    const unsigned char* a = _binary_user_newapimusl_muslelf_start;
+    const unsigned char* b = _binary_user_newapimusl_muslelf_end;
+    if (!a || !b) { console_write("newapitest: not embedded for this arch\n"); return; }
+    struct task* me = task_current();
+    int prev = me ? me->linux_abi : 0;
+    if (me) me->linux_abi = 1;
+    int rc = proc_exec_elf(a, (unsigned long)(b - a));
+    if (me) me->linux_abi = prev;
+    kprintf("newapitest: returned rc=%d\n", rc);
+}
+
 /* §M90 3b — `nfttest`: nf_tables over raw NETLINK_NETFILTER from a musl
  * program (user/nftmusl.c): filter, DNAT with un-DNAT, ct state, rollback. */
 static void cmd_nfttest(const char* args) {
@@ -1259,6 +1299,8 @@ TEST(pthreadtest,   t_pthreadtest,   "", "REAL musl pthreads");
 TEST(epollmusltest, t_epollmusltest, "", "epoll through unmodified musl");
 static void t_nxtest(const char* a) { cmd_nxtest(a); }
 TEST(nxtest, t_nxtest, "[excursion]", "no-execute: data and stack pages must not run");
+TEST(isigtest, cmd_isigtest, "", "^C on a console signals its foreground process group (§M90)");
+TEST(newapitest, cmd_newapitest, "", "pidfd, clone3, openat2, open_tree/move_mount: Linux's answers (§M90)");
 TEST(killtest, cmd_killtest, "", "kill permission: same uid or CAP_KILL, not the process tree (§M90)");
 TEST(ptytest, cmd_ptytest, "", "terminals: ptys, line discipline, controlling tty, job-control signals (§M90 rung 6)");
 TEST(nfttest, cmd_nfttest, "", "nf_tables: filter, DNAT + un-DNAT, ct state, batch rollback (§M90 3b)");

@@ -114,3 +114,5 @@ third_party/nftables-src/
 third_party/nft-*/
 user/nft.*
 third_party/buildx/
+# §M93 — the glibc package, fetched by scripts/fetch-glibc.sh
+third_party/glibc-*/

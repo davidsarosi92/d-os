@@ -39,6 +39,7 @@
  * (no `pane kill` yet — tracked as an M14 follow-up in PLAN.md).
  * ============================================================================= */
 
+#include "tty.h"
 #include "klog.h"
 #include "vc.h"
 #include "lnx_signal.h"   /* §M90 rung 6 — a signal ends a wait for input */
@@ -220,9 +221,20 @@ static void pv_erase(void* x, int row, int c0, int c1) {
     for (int c = c0; c < c1 && c < n->w; c++) fb_draw_glyph_at(n->x + c, n->y + row, ' ', v->fg, v->bg);
 }
 static void pv_reply(void* x, const char* s) { for (; *s; s++) vc_kbd_push_to((struct vc*)x, *s); }
+/* §M90 — SGR on a pane: it draws straight into the framebuffer, so the
+ * rendition is simply the colour pair the next glyphs (and erases) use.
+ * Bold shows a basic colour (0-7) as its bright form, as terminals do. */
+static void pv_attr(void* x, int fg, int bg, int bold, int rev) {
+    struct vc* v = x;
+    if (bold && fg >= 0 && fg < 8) fg += 8;
+    uint32_t f = fg == VT_DEFAULT ? VC_FG : 0xFF000000u | vt_rgb(fg);
+    uint32_t b = bg == VT_DEFAULT ? VC_BG : 0xFF000000u | vt_rgb(bg);
+    if (rev) { uint32_t t = f; f = b; b = t; }
+    v->fg = f; v->bg = b;
+}
 static const struct vt_ops pane_vt_ops = {
     .put = pv_put, .get_cursor = pv_get, .set_cursor = pv_set, .dims = pv_dims,
-    .erase = pv_erase, .shift = NULL, .reply = pv_reply,
+    .erase = pv_erase, .shift = NULL, .reply = pv_reply, .attr = pv_attr,
 };
 
 void vc_putchar(struct vc* v, char c) {
@@ -444,6 +456,8 @@ int vc_raw_kbd_dispatch(uint8_t keycode, uint8_t mods) {
  * duplicating it would be two chances to get the lost-wakeup rule wrong. */
 void vc_kbd_push_to(struct vc* v, char c) {
     if (!v) return;
+    /* §M90 — ^C / ^\ / ^Z for the console's foreground group (tty.c) */
+    if ((c == 3 || c == 28 || c == 26) && tty_console_isig(v, c)) return;
     uint32_t next = (v->in_head + 1) & VC_INBUF_MASK;
     if (next == v->in_tail) return;     /* ring full — drop */
     v->in_buf[v->in_head] = c;

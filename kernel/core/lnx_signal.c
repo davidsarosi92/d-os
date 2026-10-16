@@ -596,6 +596,11 @@ static long send_to(int tid, int sig, int code) {
 }
 
 long lnx_h_kill(struct abi_ctx* c)   { return send_to((int)c->a[0], (int)c->a[1], LNX_SI_USER); }
+/* §M90 — pidfd_send_signal's delivery: kill(2) aimed at a task already found. */
+long lnx_send_to_task(struct task* t, int sig) {
+    if (sig < 0 || sig >= LNX_NSIG) return -E_INVAL;
+    return send_one(task_current(), t, sig, LNX_SI_USER);
+}
 long lnx_h_tkill(struct abi_ctx* c)  { return send_to((int)c->a[0], (int)c->a[1], LNX_SI_TKILL); }
 /* tgkill(tgid, tid, sig): the thread must belong to that thread group (both
  * numbers in the sender's pid namespace) — ESRCH otherwise, as on Linux, so a

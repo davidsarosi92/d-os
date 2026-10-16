@@ -586,9 +586,9 @@ static int hda_init(void* ctx) {
     cmd |= PCI_CMD_MEM_SPACE | PCI_CMD_BUS_MASTER;
     pci_write16(pd.bus, pd.slot, pd.func, PCI_COMMAND, cmd);
 
-    for (uintptr_t off = 0; off < 0x4000; off += 0x1000)
-        vmm_map(phys + off, phys + off, VMM_WRITABLE);
-    g_hda.mmio = phys;
+    /* §M90 — through hal_mmio_map (the upper half on x86_64). */
+    g_hda.mmio = (uintptr_t)hal_mmio_map(phys, 0x4000);
+    if (!g_hda.mmio) { kprintf("hda: cannot map BAR0\n"); return -2; }
 
     /* Out of reset, then wait for the link to come up.  Reading STATESTS
      * before the codecs have had time to answer finds none of them. */

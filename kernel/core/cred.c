@@ -7,6 +7,7 @@
  * running machine rather than by reading it.
  * ============================================================================= */
 
+#include "seccomp.h"
 #include "cred.h"
 #include "task.h"
 #include "audit.h"
@@ -78,6 +79,9 @@ void cred_inherit(struct cred* child, const struct cred* parent) {
     if (!parent) { cred_init_kernel(child); return; }
 
     *child = *parent;
+    /* §M90 — the copied seccomp chain is now ALSO the child's: one more
+     * reference (seccomp.c), dropped when the child ends. */
+    seccomp_get(child->seccomp);
 
     /* A KERNEL parent does not pass its tag on.  pid 0 spawns init, and init is
      * not the scheduler's scaffolding — the kernel's own tasks are not an
@@ -133,7 +137,18 @@ int cred_become_user(int pid, int uid, int gid,
         return -1;
     }
 
+    /* §M90 (2026-10-15) — ZEROED FIRST.  cred_init_kernel sets the identity
+     * fields only, and this used to copy the rest of a STACK struct into the
+     * task: capability drops, umask, keepcaps, no_new_privs, the exe path and
+     * groups_explicit were whatever the stack held — a signed-in user's
+     * capabilities were random — and once the seccomp chain lived here too, a
+     * garbage pointer was reference-counted and its "refcount" was a saved
+     * frame pointer on some kernel stack (the gui-session died with a
+     * 16-bit-rotated return address).  Every field not set below is the
+     * default (zero), and the ones that belong to the PROCESS rather than to
+     * the identity are carried over explicitly. */
     struct cred nc;
+    for (unsigned i = 0; i < sizeof nc; i++) ((uint8_t*)&nc)[i] = 0;
     cred_init_kernel(&nc);
     nc.owner   = TASK_OWNER_USER;
     nc.uid     = uid;
@@ -157,6 +172,13 @@ int cred_become_user(int pid, int uid, int gid,
     nc.root = t->cred.root;
     nc.container = t->cred.container;
     for (unsigned i = 0; i < sizeof nc.cwd; i++) nc.cwd[i] = t->cred.cwd[i];
+    /* What belongs to the running PROCESS, not to who it is: the program it
+     * runs, its umask, the one-way no_new_privs, and its seccomp chain (the
+     * reference moves with it: no count changes). */
+    for (unsigned i = 0; i < sizeof nc.exe; i++) nc.exe[i] = t->cred.exe[i];
+    nc.umask_plus1  = t->cred.umask_plus1;
+    nc.no_new_privs = t->cred.no_new_privs;
+    nc.seccomp      = t->cred.seccomp;
     t->cred = nc;
     t->cred_seq++;
     return 0;
@@ -254,7 +276,8 @@ const struct cred* cred_current(void) {
         CRED_SESSION_NONE,
         NULL, 0, "", "", 0,              /* §M73 — the machine's root, no container, cwd "/"; §M89 no exe; §M90 umask 022 */
         0, 0, 0, 0, 0, 0, 0,             /* §M90 — every capability (none dropped), no keepcaps, no no_new_privs */
-        0                                /* §M90 — groups as the user database gave them */
+        0,                               /* §M90 — groups as the user database gave them */
+        NULL                             /* §M90 — no seccomp filter */
     };
     struct task* t = task_current();
     /* Before task_init, or on a CPU that has not taken a task yet.  "There is

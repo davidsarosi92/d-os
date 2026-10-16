@@ -118,6 +118,11 @@ static void memcpy_(void* dst, const void* src, size_t n) {
     char* d = (char*)dst; const char* s = (const char*)src;
     while (n--) *d++ = *s++;
 }
+static void memmove_(void* dst, const void* src, size_t n) {   /* §M90 — overlap-safe */
+    char* d = (char*)dst; const char* s = (const char*)src;
+    if (d < s) { while (n--) *d++ = *s++; }
+    else       { d += n; s += n; while (n--) *--d = *--s; }
+}
 
 /* ------------------------------------------------------------------- */
 /* Init + fs registry.                                                  */
@@ -296,6 +301,8 @@ static int bind_visible(const struct dentry* d) {
 static int g_bind_crossed;
 /* §M90 — set (under ns_lock) whenever a walk passes a read-only mount. */
 static int g_walk_ro;
+static int g_walk_noexec;                     /* §M90 — the walk passed a noexec mount */
+static int noexec_visible(const struct dentry* d);
 static int ro_visible(const struct dentry* d) {
     if (!d || !d->ro) return 0;
     int me = task_mntns_current();
@@ -306,9 +313,11 @@ static int ro_visible(const struct dentry* d) {
 }
 static struct dentry* follow_bind(struct dentry* d) {
     if (ro_visible(d)) g_walk_ro = 1;
+    if (noexec_visible(d)) g_walk_noexec = 1;
     for (int i = 0; d && d->bound && i < 8 && bind_visible(d); i++) {
         d = d->bound; g_bind_crossed = 1;
         if (ro_visible(d)) g_walk_ro = 1;
+        if (noexec_visible(d)) g_walk_noexec = 1;
     }
     return d;
 }
@@ -791,6 +800,178 @@ static struct dentry* resolve_path_ex(const char* path,
     }
 }
 
+/* ===========================================================================
+ * §M90 — openat2's SCOPED resolution (RESOLVE_* flags), Linux's semantics.
+ *
+ * `base` is the canonical absolute path of the starting directory (dirfd's,
+ * or the working directory); `rel` the guest's path.  The walk is done here,
+ * component by component, instead of handing the whole string to the normal
+ * resolver, because every rule is about WHERE a step lands:
+ *
+ *   RESOLVE_IN_ROOT     `base` is "/" for this lookup: an absolute path or
+ *                       an absolute symlink starts again at `base`, and ".."
+ *                       at `base` stays there (chroot, for one call)
+ *   RESOLVE_BENEATH     the same walk, but any step that would leave `base`
+ *                       (absolute path, absolute link, ".." past it) is EXDEV
+ *   RESOLVE_NO_SYMLINKS any symlink on the way is ELOOP (the last one too,
+ *                       unless it is not followed: O_NOFOLLOW / O_PATH)
+ *   RESOLVE_NO_MAGICLINKS  a /proc magic link (fd/N, exe, cwd, root) is ELOOP;
+ *                       IN_ROOT and BENEATH refuse them as well, as Linux does
+ *   RESOLVE_NO_XDEV     crossing a mount or bind (down or up) is EXDEV
+ *
+ * runc's path-safety library (pathrs-lite) uses exactly these to open files
+ * inside a container's root without being redirected out of it by a link the
+ * image planted; with openat2 absent it emulated them in userspace.
+ *
+ * The result is a canonical absolute path with every link on it resolved
+ * (the last component kept as is when `follow_last` is 0), which the caller
+ * opens normally.  A missing LAST component is fine (O_CREAT); a missing
+ * middle one is ENOENT.  Returns 0 or a negative errno.
+ * ========================================================================= */
+static int mount_table_has(const struct dentry* d);   /* below, beside the table */
+#define RES_NO_XDEV      0x01
+#define RES_NO_MAGIC     0x02
+#define RES_NO_SYMLINKS  0x04
+#define RES_BENEATH      0x08
+#define RES_IN_ROOT      0x10
+
+static int dentry_is_mount(struct dentry* d) {
+    if (!d) return 0;
+    if (d->bound && bind_visible(d)) return 1;
+    return mount_table_has(d);
+}
+/* "/proc/<self|thread-self|N>[/task/N]/{fd/N,exe,cwd,root}" — a magic link. */
+static int path_is_magic(const char* p) {
+    if (!streq_n(p, "/proc/", 6)) return 0;
+    p += 6;
+    const char* q = p;
+    while (*q && *q != '/') q++;
+    if (*q != '/') return 0;
+    q++;
+    if (streq_n(q, "task/", 5)) {
+        q += 5;
+        while (*q >= '0' && *q <= '9') q++;
+        if (*q != '/') return 0;
+        q++;
+    }
+    if (streq_n(q, "fd/", 3)) {
+        q += 3;
+        if (!(*q >= '0' && *q <= '9')) return 0;
+        while (*q >= '0' && *q <= '9') q++;
+        return *q == 0;
+    }
+    return (streq_n(q, "exe", 4) || streq_n(q, "cwd", 4) || streq_n(q, "root", 5));
+}
+
+static int scoped_unlocked(const char* base, const char* rel, unsigned res, int follow_last,
+                           char* out, size_t cap) {
+    char cur[256], todo[512], t[256];
+    size_t bl = strlen_(base);
+    if (bl + 1 > sizeof cur || base[0] != '/') return -36;           /* ENAMETOOLONG */
+    int scoped = (res & (RES_BENEATH | RES_IN_ROOT)) != 0;
+    const char* rootp = scoped ? base : "/";
+    size_t rl = strlen_(rootp);
+    /* Start: an absolute path is outside the scope (BENEATH), or restarts at
+     * the scope's root (IN_ROOT, or no scope = the task's "/"). */
+    if (rel[0] == '/') {
+        if (res & RES_BENEATH) return -18;                            /* EXDEV */
+        memcpy_(cur, rootp, rl + 1);
+    } else {
+        memcpy_(cur, base, bl + 1);
+    }
+    size_t tl = strlen_(rel);
+    if (tl + 1 > sizeof todo) return -36;
+    memcpy_(todo, rel, tl + 1);
+    int hops = 0;
+    for (;;) {
+        /* next component of `todo` */
+        char* p = todo;
+        while (*p == '/') p++;
+        if (!*p) break;
+        char* e = p;
+        while (*e && *e != '/') e++;
+        size_t cl = (size_t)(e - p);
+        char* rest = e;
+        while (*rest == '/') rest++;
+        int last = (*rest == 0);
+        char comp[VFS_NAME_MAX + 1];
+        if (cl > VFS_NAME_MAX) return -36;
+        memcpy_(comp, p, cl); comp[cl] = 0;
+        /* consume it */
+        size_t rlen = strlen_(rest);
+        memmove_(todo, rest, rlen + 1);
+        if (cl == 1 && comp[0] == '.') continue;
+        if (cl == 2 && comp[0] == '.' && comp[1] == '.') {
+            size_t cul = strlen_(cur);
+            int at_root = (cul == rl && streq_n(cur, rootp, rl));
+            if (at_root) {
+                if (res & RES_BENEATH) return -18;                    /* EXDEV */
+                continue;                                             /* IN_ROOT / "/" */
+            }
+            if (res & RES_NO_XDEV) {
+                struct dentry* here = resolve_path_ex(cur, NULL, NULL, 0);
+                if (dentry_is_mount(here)) return -18;
+            }
+            while (cul > 1 && cur[cul - 1] != '/') cul--;
+            if (cul > 1) cul--;                                       /* drop the slash */
+            cur[cul] = 0;
+            continue;
+        }
+        /* cand = cur + "/" + comp */
+        char cand[256];
+        size_t cul = strlen_(cur);
+        size_t o = cul;
+        if (o + 1 + cl + 1 > sizeof cand) return -36;
+        memcpy_(cand, cur, cul);
+        if (o == 0 || cand[o - 1] != '/') cand[o++] = '/';
+        memcpy_(cand + o, comp, cl); o += cl; cand[o] = 0;
+        int want_follow = !last || follow_last;
+        if (path_is_magic(cand)) {
+            if (want_follow && (res & (RES_NO_MAGIC | RES_BENEATH | RES_IN_ROOT))) return -40;   /* ELOOP */
+            /* unrestricted: the normal resolver follows it */
+            memcpy_(cur, cand, o + 1);
+            continue;
+        }
+        struct dentry* d = resolve_path_ex(cand, NULL, NULL, 0);
+        if (!d) {
+            if (last) { memcpy_(cur, cand, o + 1); break; }           /* O_CREAT's name */
+            return -2;                                                /* ENOENT */
+        }
+        if (d->inode && d->inode->type == INODE_SYMLINK && want_follow) {
+            if (res & RES_NO_SYMLINKS) return -40;                    /* ELOOP */
+            if (++hops > 40) return -40;
+            int n = link_target(d, t, sizeof t);
+            if (n < 0) return -2;
+            /* todo = target + "/" + rest */
+            size_t restl = strlen_(todo);
+            if ((size_t)n + 1 + restl + 1 > sizeof todo) return -36;
+            memmove_(todo + n + 1, todo, restl + 1);
+            memcpy_(todo, t, (size_t)n);
+            todo[n] = '/';
+            if (t[0] == '/') {
+                if (res & RES_BENEATH) return -18;                    /* EXDEV */
+                memcpy_(cur, rootp, rl + 1);
+            }
+            continue;
+        }
+        if (!last && (!d->inode || d->inode->type != INODE_DIR)) {
+            struct dentry* fb = follow_bind(d);
+            if (!fb || !fb->inode || fb->inode->type != INODE_DIR) return -20;   /* ENOTDIR */
+        }
+        if ((res & RES_NO_XDEV) && dentry_is_mount(d)) return -18;   /* EXDEV */
+        memcpy_(cur, cand, o + 1);
+    }
+    size_t fl = strlen_(cur);
+    if (fl + 1 > cap) return -36;
+    memcpy_(out, cur, fl + 1);
+    return 0;
+}
+int vfs_resolve_scoped(const char* base, const char* rel, unsigned res, int follow_last,
+                       char* out, size_t cap) {
+    if (!base || !rel || !out) return -14;
+    return NS_LOCKED(int, scoped_unlocked(base, rel, res, follow_last, out, cap));
+}
+
 /* ------------------------------------------------------------------- */
 /* Tree manipulation — used by filesystems and create/mkdir helpers.    */
 /* ------------------------------------------------------------------- */
@@ -854,6 +1035,10 @@ struct inode* vfs_orphan_child(struct dentry* parent, const char* name) {
 #define VFS_MAX_MOUNTS 8
 static struct vfs_mount g_mounts[VFS_MAX_MOUNTS];
 static int g_nmounts;
+static int mount_table_has(const struct dentry* d) {     /* §M90 — openat2 NO_XDEV */
+    for (int k = 0; k < g_nmounts; k++) if (g_mounts[k].mp == d) return 1;
+    return 0;
+}
 
 /* §M87 — the mount a dentry lives under: the nearest ancestor (or itself)
  * that is a mountpoint.  Walked upward, so the innermost mount wins, which is
@@ -1441,6 +1626,52 @@ static int ro_path(const char* path) {
     (void)resolve_path_ex(path, &parent, &last, 0);
     if (parent && ro_visible(parent)) g_walk_ro = 1;
     return g_walk_ro;
+}
+
+/* §M90 — noexec, by the same visibility rule as ro (a mark made in one mount
+ * namespace, seen from it and from namespaces born after it). */
+static int noexec_visible(const struct dentry* d) {
+    if (!d || !d->noexec) return 0;
+    int me = task_mntns_current();
+    if (d->noexec_ns == me) return 1;
+    for (int n = me; n > 0 && n < g_ns_n; n = g_ns[n].parent)
+        if (g_ns[n].parent == d->noexec_ns) return d->noexec_seq <= g_ns[n].born;
+    return 0;
+}
+int vfs_set_noexec(const char* path, int on) {
+    kmutex_lock(&ns_lock);
+    int r = -1;
+    char buf[256];
+    const char* last;
+    struct dentry* T = NULL;
+    if (path && path[0] == '/' && path[1] == 0) T = cred_fs_root() ? cred_fs_root() : root;
+    else if (split_parent(path, buf, sizeof buf, &last) == 0 && *last) {
+        struct dentry* parent = resolve_path(buf, NULL, NULL);
+        if (parent && parent->inode && parent->inode->type == INODE_DIR)
+            T = lookup_child(parent, last, strlen_(last));
+    }
+    if (T) {
+        T->noexec = on ? 1 : 0;
+        T->noexec_ns = task_mntns_current();
+        T->noexec_seq = ++g_bind_seq;
+        r = 0;
+    }
+    kmutex_unlock(&ns_lock);
+    return r;
+}
+int vfs_path_noexec(const char* path) {
+    if (!path || !path[0]) return 0;
+    kmutex_lock(&ns_lock);
+    g_walk_noexec = 0;
+    struct dentry* d = resolve_path(path, NULL, NULL);
+    int r = d ? (g_walk_noexec || noexec_visible(d)) : 0;
+    kmutex_unlock(&ns_lock);
+    return r;
+}
+int vfs_file_noexec(struct file* f) {
+    char p[256];
+    if (!f || !f->dentry || vfs_file_path(f, p, sizeof p) != 0) return 0;
+    return vfs_path_noexec(p);
 }
 
 int vfs_set_readonly(const char* path, int ro) {

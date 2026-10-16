@@ -81,4 +81,9 @@ long tty_console_ioctl(unsigned cmd, void* kbuf, unsigned long val);
  * Returns the number of processes signalled. */
 int  lnx_sig_pgrp(int pgid, int sig, int check);
 
+/* §M90 — the console's foreground process group and its ISIG (tty.c). */
+struct vc;
+int  tty_console_fg(struct vc* v);
+void tty_console_set_fg(struct vc* v, int pgid);
+int  tty_console_isig(struct vc* v, char c);      /* 1 = consumed (a signal) */
 #endif

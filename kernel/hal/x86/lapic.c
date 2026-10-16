@@ -25,6 +25,7 @@
  * Interrupt Controller (APIC)").
  * ============================================================================= */
 
+#include "hal_api.h"
 #include "lapic.h"
 #include "vmm.h"
 #include "hal.h"
@@ -156,14 +157,10 @@ int lapic_init_bsp(uintptr_t phys) {
      * above 4 GiB compiles without truncation; vmm_map's i386 impl
      * still rejects > 4 GiB (CR3 layout), which is the right failure
      * for that case. */
-    uintptr_t aligned = phys & ~((uintptr_t)0xFFFu);
-    if (vmm_map(aligned, aligned, VMM_WRITABLE | VMM_CACHE_DIS) != 0) {
-        /* Possibly already mapped by the kernel's identity map — that's
-         * fine; the cache-disable bit will lose, but on QEMU
-         * 0xFEE00000 is above the identity range so vmm_map should
-         * win.  On x86_64 the 1 GiB boot identity already covers it. */
-    }
-    g_lapic_mmio = (volatile uint8_t*)phys;
+    /* §M90 — through hal_mmio_map: identity on i386, the upper-half device
+     * window on x86_64 (the low half belongs to programs there). */
+    g_lapic_mmio = (volatile uint8_t*)hal_mmio_map(phys, 0x1000);
+    if (!g_lapic_mmio) return -1;
 
     /* Force IA32_APIC_BASE.APIC_EN = 1 — firmware usually leaves it on
      * but spec says we should re-set it after a reset. */

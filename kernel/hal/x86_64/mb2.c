@@ -29,6 +29,7 @@
  * Reference: GNU Multiboot2 spec, §3.5 (Boot Information Format).
  * ============================================================================= */
 
+#include "hal_api.h"
 #include "multiboot.h"
 #include "printf.h"
 #include <stdint.h>
@@ -105,7 +106,9 @@ uintptr_t mb2_translate_to_mb1(uintptr_t mb2_info) {
 
     /* mb2 info starts with: uint32_t total_size, uint32_t reserved,
      * then tags.  Each tag is 8-byte aligned. */
-    const uint8_t* base = (const uint8_t*)mb2_info;
+    /* §M90 — GRUB's structure is reached through the direct map (boot.s maps
+     * the low GiB there from the start), never at its physical address. */
+    const uint8_t* base = (const uint8_t*)phys_to_virt(mb2_info);
     uint32_t total_size = *(const uint32_t*)base;
     if (total_size < 8 || total_size > (1u << 20)) return 0;     /* sanity */
 
@@ -146,7 +149,10 @@ uintptr_t mb2_translate_to_mb1(uintptr_t mb2_info) {
                 synth_mmap[synth_mmap_n].type   = e->type;
                 synth_mmap_n++;
             }
-            synth_info.mmap_addr   = (uint32_t)(uintptr_t)&synth_mmap[0];
+            /* The PHYSICAL address (a 32-bit field); the kernel reaches the
+             * table through mboot_mmap_ptr below — the image is linked in the
+             * upper half since §M90 and a pointer does not fit here. */
+            synth_info.mmap_addr   = (uint32_t)kptr_phys(&synth_mmap[0]);
             synth_info.mmap_length =
                 (uint32_t)(synth_mmap_n * sizeof(struct mboot_mmap_entry));
             synth_info.flags      |= MBI_FLAG_MMAP;
@@ -180,4 +186,12 @@ uintptr_t mb2_translate_to_mb1(uintptr_t mb2_info) {
  * existing mboot_init() / kernel_main() unchanged. */
 uint32_t mb2_loader_magic(void) {
     return MB2_LOADER_MAGIC;
+}
+
+/* §M90 (2026-10-15) — the synthesised memory map as a POINTER.  The mb1
+ * field holds 32 bits and the kernel image (where the table lives) is linked
+ * at 0xFFFFFFFF80000000; aarch64 overrides the same weak hook. */
+uintptr_t mboot_mmap_ptr(const struct mboot_info* mbi) {
+    (void)mbi;
+    return (uintptr_t)synth_mmap;
 }

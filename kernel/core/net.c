@@ -1470,7 +1470,12 @@ static const char* const TCP_STATE_NAMES[] = {
  * 7/8 with one RST sent, and it was the stack telling the truth about a limit
  * rather than a bug. */
 #define TCP_MAX_CONNS   32
-#define TCP_RXBUF       8192
+/* §M90 (2026-10-16) — 64 KiB: the most a window can advertise without window
+ * scaling.  8 KiB made every round trip carry 8 KiB, so a download through the
+ * emulator's NAT ran so slowly that the far end gave up on a zero window and
+ * reset the connection (a 78 MB release, ~65 KB short, on the aarch64 guest);
+ * it also capped every transfer's speed at one small buffer per RTT. */
+#define TCP_RXBUF       65536
 #define TCP_TXBUF       8192
 /* The accept queue is a RING, so one slot is always the empty marker and the
  * largest honourable backlog is one less.  Sized to the connection table

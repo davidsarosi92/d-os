@@ -115,7 +115,27 @@ char keymap_translate(uint8_t keycode, uint8_t mods) {
          * the base character. */
         map = active->maps[KBD_COL_BASE];
     }
-    return map ? map[keycode] : 0;
+    char c = map ? map[keycode] : 0;
+    /* §M90 (2026-10-15) — CTRL makes a CONTROL CHARACTER, as on every
+     * terminal: Ctrl+A..Z = 0x01..0x1A, Ctrl+[ \ ] ^ _ = ESC and 0x1C..0x1F.
+     * It was ignored, so Ctrl+C arrived as a plain 'c' — no console could be
+     * interrupted, and a raw-mode program (a container's shell under
+     * `docker run -it`) never saw ^C, ^D or ^Z typed on the machine itself.
+     * AltGr (Right Alt) is not Ctrl: AltGr characters are left alone. */
+    if ((mods & KBD_MOD_CTRL_MASK) && !(mods & KBD_MOD_RALT) && c) {
+        char b = c;
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (b >= 'a' && b <= 'z') return (char)(b - 'a' + 1);
+        switch (b) {
+        case '[': return 0x1b;
+        case '\\': return 0x1c;
+        case ']': return 0x1d;
+        case '^': case '6': return 0x1e;
+        case '_': case '-': return 0x1f;
+        default: break;
+        }
+    }
+    return c;
 }
 
 void keymap_for_each(keymap_iter_fn fn, void* ctx) {

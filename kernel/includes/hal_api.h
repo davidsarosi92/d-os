@@ -213,15 +213,29 @@ static inline uint64_t kptr_phys(const void* v) {
     return (uint64_t)a;
 }
 #else
-/* Kernel-virtual pointer for a physical address.  Valid once the direct map is
- * installed (hal_extend_identity_map, called from pmm_init). */
+/* Kernel-virtual pointer for a physical address.  On x86_64 the low GiB is
+ * reachable from the first line of C (boot.s maps it there); the rest once
+ * pmm_init has widened the direct map (hal_extend_identity_map). */
 static inline void* phys_to_virt(uint64_t phys) {
     return (void*)(uintptr_t)(phys + KERNEL_DIRECT_MAP_BASE);
 }
 
-/* Inverse — ONLY for pointers that came from phys_to_virt.  A kernel image or
- * stack address is not in the direct map and must not be passed here. */
+#if defined(__x86_64__)
+/* §M90 (2026-10-15) — the x86_64 kernel IMAGE runs in the top 2 GiB, linked at
+ * KIMAGE_VBASE + its physical address (linker-x86_64.ld).  It is NOT in the
+ * direct map's numbering, so every conversion must tell the two apart: a
+ * static DMA buffer converted as if it were a direct-map pointer gives the
+ * device an address 2^47 away from the buffer. */
+#define KIMAGE_VBASE 0xFFFFFFFF80000000UL
+#endif
+
+/* Inverse of phys_to_virt.  On x86_64 it also accepts an image address (a
+ * static buffer), because the two kinds look alike at a call site and a
+ * wrong guess is silent memory corruption by a device. */
 static inline uint64_t virt_to_phys(const void* v) {
+#if defined(__x86_64__)
+    if ((uintptr_t)v >= KIMAGE_VBASE) return (uint64_t)((uintptr_t)v - KIMAGE_VBASE);
+#endif
     return (uint64_t)(uintptr_t)v - KERNEL_DIRECT_MAP_BASE;
 }
 
@@ -237,6 +251,10 @@ static inline uint64_t kptr_phys(const void* v) {
      * is a hundred copies of one warning.  A real warning cannot be seen in
      * that, and §M57 had already paid for the lesson that a noisy build is a
      * build nobody reads. */
+#if defined(__x86_64__)
+    if (a >= (uintptr_t)KIMAGE_VBASE)
+        return (uint64_t)(a - (uintptr_t)KIMAGE_VBASE);
+#endif
 #if KERNEL_DIRECT_MAP_BASE
     if (a >= (uintptr_t)KERNEL_DIRECT_MAP_BASE)
         return (uint64_t)(a - (uintptr_t)KERNEL_DIRECT_MAP_BASE);

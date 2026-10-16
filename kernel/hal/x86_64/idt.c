@@ -579,6 +579,14 @@ void isr_handler(struct int_frame* f) {
         /* M34/§3.1 — copy-on-write page fault (parity with i386): a write to a
          * fork-shared page is resolved into a private copy and retried; only if
          * the resolver declines is it a real fault. */
+        /* §M90 (2026-10-15) — an INSTRUCTION FETCH from a PRESENT page
+         * (error code P=1, I/D=0x10) is a no-execute violation and nothing
+         * else: no resolver below can make that page executable.  They used
+         * to be asked anyway, and vma_fault answers "this page is mapped,
+         * retry" — so the program re-executed the same fetch forever (nxtest
+         * hung after its control case; it had passed in §M86, before §M89's
+         * vma_fault existed). */
+        if (f->int_no == 14 && (f->err_code & 0x11) == 0x11) goto nx_violation;
         if (f->int_no == 14) {
             uint64_t cr2;
             __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
@@ -592,6 +600,7 @@ void isr_handler(struct int_frame* f) {
                 if (vma_fault((uintptr_t)cr2, (f->err_code & 2) != 0, can_sleep)) return;
             }
         }
+    nx_violation:
         /* §1.1 — user-access exception table (see the i386 twin): a kernel-mode
          * fault inside a uaccess primitive resumes at its fixup, so a user
          * pointer that goes bad mid-copy returns -EFAULT instead of halting. */
@@ -687,6 +696,18 @@ void isr_handler(struct int_frame* f) {
                     (unsigned long)f->cs, (void*)(uintptr_t)f->rip,
                     (unsigned long)f->err_code, (void*)fault_addr,
                     ft ? ft->name : "?", ft ? ft->pid : -1, this_cpu_id());
+            /* §M90 (2026-10-15) — the STACK, too: a fault whose rip is garbage
+             * (a corrupted return address) says nothing by itself; the words
+             * around rsp name the frames it came from.  Only when rsp is a
+             * kernel address (a ring-0 fault on a kernel stack). */
+            uintptr_t sp = (uintptr_t)f->rsp;
+            kprintf("   rsp=%p rbp=%p\n", (void*)sp, (void*)(uintptr_t)f->rbp);
+            if (sp >= 0xFFFF800000000000ull && !(sp & 7)) {
+                for (int w = 0; w < 16; w++) {
+                    uint64_t v = ((const uint64_t*)sp)[w];
+                    kprintf("   [rsp+%d] %p\n", w * 8, (void*)(uintptr_t)v);
+                }
+            }
         }
         /* §M47 — capture BEFORE the policy: halt and reboot both never return. */
         {

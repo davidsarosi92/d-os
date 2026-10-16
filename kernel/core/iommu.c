@@ -114,10 +114,9 @@ struct dmar_drhd {
 static volatile uint8_t* reach_regs(uint64_t phys) {
     uintptr_t p = (uintptr_t)phys;
     if (p != phys) return NULL;              /* above this arch's reach */
-    uintptr_t aligned = p & ~(uintptr_t)0xFFF;
-    if (vmm_map(aligned, aligned, VMM_WRITABLE | VMM_CACHE_DIS) != 0)
-        return NULL;
-    return (volatile uint8_t*)p;
+    /* §M90 — the one way to a device register (identity on i386, the
+     * upper-half window on x86_64). */
+    return (volatile uint8_t*)hal_mmio_map(phys, 0x1000);
 }
 
 static uint64_t reg64(volatile uint8_t* base, int off) {

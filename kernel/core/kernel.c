@@ -272,11 +272,25 @@ void kernel_main(uint32_t mb_magic, uintptr_t mb_info) {
     if (smp_ncpus() > 1) {
         smp_boot_aps();
     }
+#if defined(__x86_64__)
+    /* §M90 (2026-10-15) — every AP has passed through its trampoline, which
+     * was the last user of the low identity map; the lower half is user space
+     * only from here on (vmm.c says why it goes rather than staying). */
+    {
+        extern void vmm_drop_low_identity(void);
+        vmm_drop_low_identity();
+    }
+#endif
 
     /* Two-level paging path round-trip. */
     {
         pmm_phys_t phys = pmm_alloc_frame();
-        uint32_t virt = 0xE0000000u;
+#if defined(__x86_64__)
+        /* A kernel address: the low half is user space on x86_64 (§M90). */
+        uintptr_t virt = 0xFFFFFFFF40000000ul;
+#else
+        uintptr_t virt = 0xE0000000u;
+#endif
         if (phys && vmm_map(virt, phys, VMM_WRITABLE) == 0) {
             volatile uint32_t* p = (volatile uint32_t*)(uintptr_t)virt;
             *p = 0xDEADBEEFu;

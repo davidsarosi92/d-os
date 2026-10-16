@@ -673,6 +673,10 @@ void isr_handler(struct int_frame* f) {
         /* M34 — copy-on-write page fault: a write to a fork-shared page.  Try
          * to resolve it (private copy) and retry; only if that declines is it a
          * real fault. */
+        /* §M90 — a fetch from a present page is a no-execute violation; no
+         * resolver can fix it (see the x86_64 twin: vma_fault said "retry"
+         * and the program faulted on the same fetch forever). */
+        if (f->int_no == 14 && (f->err_code & 0x11) == 0x11) goto nx_violation;
         if (f->int_no == 14) {
             uint32_t cr2;
             __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
@@ -691,6 +695,7 @@ void isr_handler(struct int_frame* f) {
             }
         }
 
+    nx_violation:;
         uint32_t _cr2 = 0;
         if (f->int_no == 14) __asm__ volatile ("mov %%cr2, %0" : "=r"(_cr2));
 

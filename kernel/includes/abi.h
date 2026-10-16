@@ -262,6 +262,11 @@ enum abi_op {
     /* §M90 3b — select / pselect6 (nft waits for netlink replies with it) */
     ABI_SELECT, ABI_PSELECT6,
     ABI_WAITID,             /* §M90 — waitid(2), incl. WNOWAIT */
+    ABI_PIDFD_OPEN, ABI_PIDFD_SEND_SIGNAL,   /* §M90 — pidfd.c */
+    ABI_OPENAT2, ABI_OPEN_TREE, ABI_MOVE_MOUNT, ABI_MOUNT_SETATTR,   /* §M90 */
+    ABI_SECCOMP,                                                     /* §M90 — seccomp.c */
+    ABI_STATX, ABI_CLOSE_RANGE,                                      /* §M90 */
+    ABI_ENOSYS_KNOWN,      /* §M90 — not offered; every caller falls back; no log line */
 
     ABI_OP_MAX
 };

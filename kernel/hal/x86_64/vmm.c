@@ -65,6 +65,11 @@
 extern uint8_t pml4[];
 extern uint8_t pdpt[];
 extern uint8_t pd_low[];
+extern uint8_t pdpt_dm[];       /* §M90 — PML4[256], built by boot.s */
+
+/* §M90 (2026-10-15) — the kernel runs in the upper half, so `pml4` is an
+ * upper-half IMAGE address; the value CR3 needs is its physical address. */
+#define KPML4_PHYS  ((uint64_t)kptr_phys(pml4))
 
 static inline uint64_t* table_at(uintptr_t phys) {
     /* Page tables are reached through the kernel direct map (§M48) — NOT as
@@ -72,6 +77,10 @@ static inline uint64_t* table_at(uintptr_t phys) {
      * space, so a physical-as-virtual dereference would read whatever the
      * running process has mapped there.  Strip the low 12 bits (PTE flags). */
     return (uint64_t*)phys_to_virt(phys & PAGE_MASK_4K);
+}
+
+static inline void write_cr3_early(uint64_t v) {
+    __asm__ volatile ("mov %0, %%cr3" : : "r"(v) : "memory");
 }
 
 static inline void invlpg(uintptr_t virt) {
@@ -85,10 +94,12 @@ static inline void invlpg(uintptr_t virt) {
  * just announce ourselves and verify the inheritance.
  * ----------------------------------------------------------------------------- */
 
+static void iomap_install(void);
+
 void vmm_init(void) {
-    kprintf("vmm: 4-level paging active, PML4 @ %p, "
-            "identity 1 GiB via 2 MiB pages (inherited from boot)\n",
-            (void*)pml4);
+    iomap_install();
+    kprintf("vmm: 4-level paging active, PML4 @ %p, kernel in the upper half, "
+            "user space from 64 KiB\n", (void*)pml4);
     {
         extern int x86_cpu_has_nx(void);
         kprintf("vmm: no-execute %s\n", x86_cpu_has_nx()
@@ -99,9 +110,8 @@ void vmm_init(void) {
 
 uintptr_t vmm_kernel_pd_phys(void) {
     /* Top-level page table — PML4 on x86_64.  AP trampoline writes
-     * this into CR3 before enabling paging.  Identity-mapped, so the
-     * pointer is also the physical address. */
-    return (uintptr_t)pml4;
+     * this into CR3 before enabling paging. */
+    return (uintptr_t)KPML4_PHYS;
 }
 
 /* §M48 — install the KERNEL DIRECT MAP; stop growing the LOW identity map.
@@ -126,10 +136,11 @@ uintptr_t vmm_kernel_pd_phys(void) {
  *
  * Adding mappings needs no TLB flush: nothing changed, only filled in. */
 
-/* The direct map's PDPT.  In .bss, so it lives inside the kernel image below
- * 1 GiB and its link address IS its physical address — which is what the PML4
- * entry has to contain. */
-static uint64_t dm_pdpt[512] __attribute__((aligned(4096)));
+/* The direct map's PDPT is boot.s's `pdpt_dm` (§M90): it is already hooked
+ * under PML4[256], with its first slot pointing at the boot page directory so
+ * the low GiB is reachable from the first line of C.  This function replaces
+ * that slot by a 1 GiB page onto the same memory and adds the rest. */
+#define dm_pdpt ((uint64_t*)pdpt_dm)
 
 uintptr_t hal_extend_identity_map(uintptr_t end_phys) {
     const uintptr_t GIB = (uintptr_t)1 << 30;
@@ -141,10 +152,11 @@ uintptr_t hal_extend_identity_map(uintptr_t end_phys) {
         dm_pdpt[(addr >> 30) & 0x1FF] =
             ((uint64_t)addr & PAGE_MASK_4K) | PTE_P | PTE_RW | PTE_PS;
 
-    /* Hook it under PML4[256].  Kernel-only — no PTE_US anywhere on this
-     * path, so ring 3 can never walk into the direct map. */
-    ((uint64_t*)pml4)[256] =
-        ((uint64_t)(uintptr_t)dm_pdpt & PAGE_MASK_4K) | PTE_P | PTE_RW;
+    /* Hooked under PML4[256] by boot.s.  Kernel-only — no PTE_US anywhere on
+     * this path, so ring 3 can never walk into the direct map.  Slot 0 changed
+     * from a table to a 1 GiB page onto the same memory: reload CR3 so no CPU
+     * keeps the old walk cached (only the BSP runs this, before the APs). */
+    write_cr3_early(KPML4_PHYS);
 
     return end;
 }
@@ -168,7 +180,7 @@ uintptr_t hal_extend_identity_map(uintptr_t end_phys) {
  * Every page table lives in the identity-mapped physical region. */
 static int access_walk(uintptr_t va, uintptr_t len, int want_write) {
     if (len == 0) return 1;
-    if (va < vmm_user_base()) return 0;
+    if (va < vmm_user_min()) return 0;
     if (va + len < va)        return 0;                 /* overflow */
     const uint64_t AMASK = 0x000FFFFFFFFFF000ULL;       /* phys addr bits 51:12 */
     uint64_t cr3;
@@ -195,7 +207,7 @@ static int access_walk(uintptr_t va, uintptr_t len, int want_write) {
  * a bad pointer.  PROT_NONE and truly unmapped ranges still fail. */
 int vmm_user_access_ok(uintptr_t va, uintptr_t len, int want_write) {
     if (access_walk(va, len, want_write)) return 1;
-    if (va < vmm_user_base() || va + len < va) return 0;
+    if (va < vmm_user_min() || va + len < va) return 0;
     return vma_prefault(va, len, want_write) && access_walk(va, len, want_write);
 }
 
@@ -427,25 +439,15 @@ struct vmm_space* vmm_space_create(void) {
     s->pml4      = (uint64_t*)phys_to_virt(pml4_phys);
     s->pml4_phys = pml4_phys;
 
-    /* Snapshot the kernel PML4 (mostly just [0]). */
+    /* §M90 (2026-10-15) — the LOWER HALF (PML4 0..255) is the process's and
+     * starts empty; the UPPER half (256..511: direct map, device windows, the
+     * kernel image) is the kernel's and is shared BY POINTER, so a kernel
+     * mapping made later under one of those slots reaches every process.  No
+     * slot of the upper half may be created after the first process exists —
+     * vmm_init pre-creates them all. */
     uint64_t* kpml4 = (uint64_t*)pml4;
-    for (int i = 0; i < 512; i++) s->pml4[i] = kpml4[i];
-
-    /* Give PML4[0] a PRIVATE PDPT so the user region under it doesn't write
-     * into the shared kernel PDPT.  Copy the kernel PDPT entries (sharing
-     * the kernel PD subtrees by pointer); the empty user slot stays empty
-     * and becomes private on first map. */
-    uint64_t k0 = kpml4[0];
-    if (k0 & PTE_P) {
-        pmm_phys_t pdpt_phys = pmm_alloc_frame();
-        if (!pdpt_phys) { pmm_free_frame(pml4_phys); kfree(s); return NULL; }
-        uint64_t* kpdpt = table_at((uintptr_t)k0);
-        uint64_t* npdpt = (uint64_t*)phys_to_virt(pdpt_phys);
-        for (int i = 0; i < 512; i++) npdpt[i] = kpdpt[i];
-        /* Point PML4[0] at the private PDPT; keep P+RW, USER widened lazily
-         * by walk_to_pt_root when the first user page is mapped. */
-        s->pml4[0] = ((uint64_t)pdpt_phys & PAGE_MASK_4K) | PTE_P | PTE_RW;
-    }
+    for (int i = 0;   i < 256; i++) s->pml4[i] = 0;
+    for (int i = 256; i < 512; i++) s->pml4[i] = kpml4[i];
     return s;
 }
 
@@ -605,19 +607,20 @@ struct vmm_space* vmm_space_clone(struct vmm_space* parent) {
     s->pml4_phys = pml4_phys;
 
     uint64_t* kpml4 = (uint64_t*)pml4;
-    for (int i = 0; i < 512; i++) s->pml4[i] = kpml4[i];   /* kernel snapshot */
+    for (int i = 0; i < 512; i++) s->pml4[i] = 0;
+    for (int i = 256; i < 512; i++) s->pml4[i] = kpml4[i];  /* kernel half, shared */
 
-    uint64_t p0 = parent->pml4[0];
-    if (p0 & PTE_P) {
-        uint64_t* pdpt_parent = table_at((uintptr_t)p0);
-        uint64_t* pdpt_kernel = (kpml4[0] & PTE_P) ? table_at((uintptr_t)kpml4[0]) : NULL;
-        uintptr_t cphys = clone_subtree(pdpt_parent, pdpt_kernel, /*depth PDPT*/1, 0);
+    /* §M90 — every slot of the lower half is the process's own (it was only
+     * PML4[0] while the kernel lived there too). */
+    for (int i = 0; i < 256; i++) {
+        uint64_t p0 = parent->pml4[i];
+        if (!(p0 & PTE_P)) continue;
+        uintptr_t cphys = clone_subtree(table_at((uintptr_t)p0), NULL, /*depth PDPT*/1,
+                                        (uintptr_t)i << 39);
         if (!cphys) { vmm_space_destroy(s); return NULL; }
-        /* Preserve the parent's PML4[0] flags — crucially the US bit, which
-         * walk_to_pt_root widened in when user pages were first mapped.  A
-         * hardcoded PTE_P|PTE_RW (no US) would make every user access in the
-         * child fault (#PF err=5: present, user, protection). */
-        s->pml4[0] = ((uint64_t)cphys & PAGE_MASK_4K) | (p0 & ~PAGE_MASK_4K);
+        /* Preserve the parent's flags — crucially the US bit, which
+         * walk_to_pt_root widened in when user pages were first mapped. */
+        s->pml4[i] = ((uint64_t)cphys & PAGE_MASK_4K) | (p0 & ~PAGE_MASK_4K);
     }
     /* §M51 — clone_subtree took write access AWAY from the parent, entry by
      * entry, and the parent may be runnable on another core RIGHT NOW: that is
@@ -962,11 +965,11 @@ uint32_t vmm_frame_share_count(uintptr_t phys) {
 }
 
 uintptr_t vmm_space_pd_phys(struct vmm_space* s) {
-    return s ? s->pml4_phys : (uintptr_t)pml4;
+    return s ? s->pml4_phys : (uintptr_t)KPML4_PHYS;
 }
 
 void vmm_space_switch(struct vmm_space* s) {
-    uint64_t target = s ? (uint64_t)s->pml4_phys : (uint64_t)(uintptr_t)pml4;
+    uint64_t target = s ? (uint64_t)s->pml4_phys : KPML4_PHYS;
     if (read_cr3() != target) write_cr3(target);
 }
 
@@ -986,8 +989,8 @@ uintptr_t vmm_space_root_phys(struct vmm_space* s) { return s ? (uintptr_t)s->pm
 void* vmm_space_vma(struct vmm_space* s) { return s ? s->vma : NULL; }
 void  vmm_space_set_vma(struct vmm_space* s, void* v) { if (s) s->vma = v; }
 
-/* Everything under PML4[0]: the private PDPT every space gets at creation. */
-uintptr_t vmm_user_limit(void) { return (uintptr_t)1 << 39; }
+/* §M90 — the whole lower canonical half (PML4 0..255, 128 TiB), as on Linux. */
+uintptr_t vmm_user_limit(void) { return (uintptr_t)0x800000000000ULL; }
 
 int vmm_space_probe(struct vmm_space* s, uintptr_t va) {
     if (!s) return 0;
@@ -1032,6 +1035,130 @@ int vmm_space_range_state(struct vmm_space* s, uintptr_t a, uintptr_t b) {
     return st;
 }
 
-/* §M90 — see vmm.h.  On x86 the kernel still owns everything below the user
- * base (the x86_64 kernel itself is linked low), so the two coincide. */
-uintptr_t vmm_user_min(void) { return vmm_user_base(); }
+/* §M90 (2026-10-15) — see vmm.h.  The kernel left the lower half, so a
+ * program owns everything from 64 KiB up (the lowest pages stay unmapped so a
+ * NULL dereference faults — Linux's mmap_min_addr).  vmm_user_base() stays at
+ * 1 GiB: where this system's own programs and PIE images are placed. */
+uintptr_t vmm_user_min(void) { return 0x10000u; }
+
+
+/* ===========================================================================
+ * §M90 (2026-10-15) — DEVICE MEMORY IN THE UPPER HALF.
+ *
+ * Device registers and the framebuffer used to be reached at their physical
+ * address through identity mappings in the kernel's low half — which every
+ * process shared.  Now the low half is the program's, so device memory gets
+ * its own window: physical address P is reached at IOMAP_BASE + P, mapped
+ * page by page (2 MiB where the range allows) the first time somebody asks.
+ *
+ * An OFFSET map rather than a bump allocator, on purpose: the pointer for a
+ * physical address is the same whoever asks and whenever, so a framebuffer
+ * that grows (the page flip's second buffer, a bigger mode) stays linear and
+ * two drivers reaching one register page agree without a table of windows.
+ *
+ * The window's PDPTs are created before the first process (vmm_init), so
+ * every mapping made later below them reaches every process — the upper half
+ * of a process's PML4 is the kernel's, shared by pointer.
+ * =========================================================================== */
+#define IOMAP_BASE      0xFFFFC00000000000ULL      /* PML4[384] */
+#define IOMAP_SLOT0     384
+#define IOMAP_SLOTS     8                          /* 8 x 512 GiB = physical < 4 TiB */
+#define PTE_PWT         0x008
+#define PTE_PCD         0x010
+static uint64_t iomap_pdpt[IOMAP_SLOTS][512] __attribute__((aligned(4096)));
+static spinlock_t g_iomap_lock = SPINLOCK_INIT;
+
+static void iomap_install(void) {
+    uint64_t* k = (uint64_t*)pml4;
+    for (int i = 0; i < IOMAP_SLOTS; i++)
+        if (!(k[IOMAP_SLOT0 + i] & PTE_P))
+            k[IOMAP_SLOT0 + i] = (kptr_phys(iomap_pdpt[i]) & PAGE_MASK_4K) | PTE_P | PTE_RW;
+}
+
+/* Map [phys, phys+len) at IOMAP_BASE + phys with the given cache bits.  A page
+ * already mapped there keeps its mapping (the window never changes meaning). */
+static int iomap_range(uint64_t phys, uint64_t len, uint64_t cache) {
+    if (phys + len < phys || phys + len > ((uint64_t)IOMAP_SLOTS << 39)) return -1;
+    uint64_t p   = phys & ~(uint64_t)0xFFF;
+    uint64_t end = (phys + (len ? len : 1) + 0xFFF) & ~(uint64_t)0xFFF;
+    uint32_t fl = spin_lock_irqsave(&g_iomap_lock);
+    iomap_install();
+    while (p < end) {
+        uintptr_t va = (uintptr_t)(IOMAP_BASE + p);
+        /* PML4 -> PDPT -> PD */
+        uint64_t* tbl = (uint64_t*)pml4;
+        int fail = 0;
+        for (int level = 0; level < 2 && !fail; level++) {
+            unsigned idx = (unsigned)(va >> (level ? 30 : 39)) & 0x1FFu;
+            uint64_t e = tbl[idx];
+            if (!(e & PTE_P)) {
+                pmm_phys_t nt = pmm_alloc_frame();
+                if (!nt) { fail = 1; break; }
+                uint64_t* t = (uint64_t*)phys_to_virt(nt);
+                for (int j = 0; j < 512; j++) t[j] = 0;
+                tbl[idx] = ((uint64_t)nt & PAGE_MASK_4K) | PTE_P | PTE_RW;
+                e = tbl[idx];
+            }
+            tbl = table_at((uintptr_t)e);
+        }
+        if (fail) { spin_unlock_irqrestore(&g_iomap_lock, fl); return -1; }
+        unsigned pdi = (unsigned)IDX_PD(va);
+        uint64_t pde = tbl[pdi];
+        if (pde & PTE_P) {
+            if (pde & PTE_PS) { p = (p | 0x1FFFFF) + 1; continue; }     /* a 2 MiB page */
+        } else if (!(p & 0x1FFFFF) && end - p >= 0x200000) {
+            tbl[pdi] = (p & PAGE_MASK_2M) | PTE_P | PTE_RW | PTE_PS | cache;
+            invlpg(va);
+            p += 0x200000;
+            continue;
+        }
+        if (!(pde & PTE_P)) {
+            pmm_phys_t nt = pmm_alloc_frame();
+            if (!nt) { spin_unlock_irqrestore(&g_iomap_lock, fl); return -1; }
+            uint64_t* t = (uint64_t*)phys_to_virt(nt);
+            for (int j = 0; j < 512; j++) t[j] = 0;
+            tbl[pdi] = ((uint64_t)nt & PAGE_MASK_4K) | PTE_P | PTE_RW;
+            pde = tbl[pdi];
+        }
+        uint64_t* pt = table_at((uintptr_t)pde);
+        unsigned pti = (unsigned)IDX_PT(va);
+        if (!(pt[pti] & PTE_P)) {
+            pt[pti] = (p & PAGE_MASK_4K) | PTE_P | PTE_RW | cache;
+            invlpg(va);
+        }
+        p += 0x1000;
+    }
+    spin_unlock_irqrestore(&g_iomap_lock, fl);
+    return 0;
+}
+
+/* Registers: uncached (PCD|PWT = UC with the default PAT). */
+volatile void* hal_mmio_map(uint64_t phys, size_t len) {
+    if (!phys) return NULL;
+    if (iomap_range(phys, len, PTE_PCD | PTE_PWT) != 0) return NULL;
+    return (volatile void*)(uintptr_t)(IOMAP_BASE + phys);
+}
+
+/* A framebuffer: ordinary cached mapping, as the identity map gave it before
+ * (the compositor's fill rate is the reason; the device is QEMU's VRAM). */
+volatile void* x86_64_fb_map(uint64_t phys, uint64_t len) {
+    if (!phys) return NULL;
+    if (iomap_range(phys, len, 0) != 0) return NULL;
+    return (volatile void*)(uintptr_t)(IOMAP_BASE + phys);
+}
+uintptr_t x86_64_iomap_va(uint64_t phys) { return (uintptr_t)(IOMAP_BASE + phys); }
+
+/* §M90 — the low identity map exists for two things only: the instructions
+ * between "paging on" and the jump into the upper half, and the AP trampoline
+ * at 0x8000, which turns paging on with the kernel's CR3 while running at its
+ * physical address.  Once every AP is up it goes: from then on the low half
+ * of the kernel's own tables is as empty as a new process's, so a stray
+ * physical-address dereference faults in EVERY context instead of quietly
+ * working in a kernel thread and reading a program's page in a system call. */
+void vmm_drop_low_identity(void) {
+    uint64_t* k = (uint64_t*)pml4;
+    k[0] = 0;
+    hal_tlb_shootdown(0, 0);
+    write_cr3(KPML4_PHYS);
+    kprintf("vmm: low identity map dropped - the lower half is user space only\n");
+}

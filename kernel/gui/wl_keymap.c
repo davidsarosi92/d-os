@@ -31,6 +31,7 @@
  * directory to point it at.
  * ============================================================================= */
 
+#include "hal_api.h"
 #include "wayland.h"
 #include "keymap.h"
 #include "fd.h"
@@ -208,7 +209,8 @@ struct ofile* wl_keymap_make(uint32_t* size_out) {
     for (uint32_t off = 0; off < total; off++) {
         uint32_t fi = off / 4096, fo = off % 4096;
         if ((int)fi >= s->nframes) break;
-        *(volatile uint8_t*)(uintptr_t)(s->frames[fi] + fo) = (uint8_t)text[off];
+        /* §M90 — through the direct map: a frame number is not a pointer. */
+        ((volatile uint8_t*)phys_to_virt(s->frames[fi]))[fo] = (uint8_t)text[off];
     }
 
     struct ofile* o = ofile_from_shm(s);

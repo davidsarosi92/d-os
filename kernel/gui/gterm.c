@@ -97,6 +97,23 @@ static int gterm_cell_selected(const struct gui_window* win, int row, int col) {
  * now (the user has scrolled back) is not drawn at all — without this check the
  * live shell would keep painting its output over the history being read, which
  * is the one thing scrollback exists to prevent. */
+/* §M90 — a cell's rendition (SGR), packed: foreground 0 = default or palette
+ * index + 1 (9 bits), background likewise, bold, reverse.  Kept for the LIVE
+ * grid only: a line that scrolls into the history keeps its text and is shown
+ * in the default colours (said in vt.h's spirit — not pretended). */
+#define GA_FG(a)    ((int)((a) & 0x1FF) - 1)
+#define GA_BG(a)    ((int)(((a) >> 9) & 0x1FF) - 1)
+#define GA_BOLD     (1u << 18)
+#define GA_REV      (1u << 19)
+#define GA_BGMASK   (0x1FFu << 9)
+static uint32_t ga_pack(int fg, int bg, int bold, int rev) {
+    return (uint32_t)(fg + 1) | ((uint32_t)(bg + 1) << 9) | (bold ? GA_BOLD : 0) | (rev ? GA_REV : 0);
+}
+static uint32_t gterm_cell_attr(const struct gui_window* win, int col, int abs) {
+    int rel = abs - win->scrolled;
+    if (!win->cattr || rel < 0 || rel >= win->rows || col < 0 || col >= gmax_cols) return 0;
+    return win->cattr[(size_t)rel * gmax_cols + col];
+}
 static void gterm_draw_cell(struct gui_window* win, int col, int row, char c) {
     int v = gterm_screen_row(win, row);
     if (v < 0) return;
@@ -104,10 +121,26 @@ static void gterm_draw_cell(struct gui_window* win, int col, int row, char c) {
     int py = PAD + v * cp_cell_h();
     char s[2] = { c, 0 };
     int sel = gterm_cell_selected(win, row, col);
-    gfx_fill(&win->surf, px, py, cp_cell_w(), cp_cell_h(),
-             sel ? COL_SEL_BG : COL_WIN_BG);
+    uint32_t fg = COL_WIN_FG, bg = COL_WIN_BG;
+    uint32_t a = gterm_cell_attr(win, col, row);
+    if (a) {
+        int f = GA_FG(a), b = GA_BG(a);
+        if ((a & GA_BOLD) && f >= 0 && f < 8) f += 8;      /* bold = bright */
+        if (f >= 0) fg = 0xFF000000u | vt_rgb(f);
+        if (b >= 0) bg = 0xFF000000u | vt_rgb(b);
+        if (a & GA_REV) { uint32_t t = fg; fg = bg; bg = t; }
+    }
+    gfx_fill(&win->surf, px, py, cp_cell_w(), cp_cell_h(), sel ? COL_SEL_BG : bg);
     /* §M69 — the MONO face at the runtime size, not the 8x8 bitmap. */
-    if (c > 0x20) cp_mono_text(&win->surf, px, py, s, sel ? COL_SEL_FG : COL_WIN_FG);
+    if (c > 0x20) cp_mono_text(&win->surf, px, py, s, sel ? COL_SEL_FG : fg);
+}
+/* Move the attribute rows with the character rows (scroll / line edits). */
+static void ga_row_copy(struct gui_window* w, int dst, int src) {
+    if (!w->cattr) return;
+    uint32_t* d = w->cattr + (size_t)dst * gmax_cols;
+    if (src < 0) { for (int c = 0; c < gmax_cols; c++) d[c] = 0; return; }
+    const uint32_t* s = w->cattr + (size_t)src * gmax_cols;
+    for (int c = 0; c < gmax_cols; c++) d[c] = s[c];
 }
 static void gterm_scroll(struct gui_window* win) {
     /* §M58 — the line about to be discarded goes into the history first. */
@@ -126,9 +159,11 @@ static void gterm_scroll(struct gui_window* win) {
         for (int r = 0; r < win->rows - 1; r++) {
             char* d = win->cells + (size_t)r * gmax_cols;
             for (int c = 0; c < gmax_cols; c++) d[c] = d[c + gmax_cols];
+            ga_row_copy(win, r, r + 1);
         }
         char* last = win->cells + (size_t)(win->rows - 1) * gmax_cols;
         for (int c = 0; c < gmax_cols; c++) last[c] = 0;
+        ga_row_copy(win, win->rows - 1, -1);
         return;
     }
 
@@ -145,9 +180,11 @@ static void gterm_scroll(struct gui_window* win) {
     for (int r = 0; r < win->rows - 1; r++) {
         char* d = win->cells + (size_t)r * gmax_cols;
         for (int c = 0; c < gmax_cols; c++) d[c] = d[c + gmax_cols];
+        ga_row_copy(win, r, r + 1);
     }
     char* lastrow = win->cells + (size_t)(win->rows - 1) * gmax_cols;
     for (int c = 0; c < gmax_cols; c++) lastrow[c] = 0;
+    ga_row_copy(win, win->rows - 1, -1);
 }
 void gterm_emit(void* ctx, char c) {
     struct gui_window* win = (struct gui_window*)ctx;
@@ -156,6 +193,7 @@ void gterm_emit(void* ctx, char c) {
     if (c == '\f') {
         gfx_fill(&win->surf, 0, 0, win->surf.w, win->surf.h, COL_WIN_BG);
         for (int i = 0; i < gmax_cols * gmax_rows; i++) win->cells[i] = 0;
+        if (win->cattr) for (int i = 0; i < gmax_cols * gmax_rows; i++) win->cattr[i] = 0;
         win->ccol = win->crow = 0;
     } else if (c == '\n') {
         win->ccol = 0;
@@ -166,10 +204,12 @@ void gterm_emit(void* ctx, char c) {
         if (win->ccol > 0) {
             win->ccol--;
             win->cells[(size_t)win->crow * gmax_cols + win->ccol] = 0;
+            if (win->cattr) win->cattr[(size_t)win->crow * gmax_cols + win->ccol] = win->cur_attr & GA_BGMASK;
             gterm_draw_cell(win, win->ccol, win->scrolled + win->crow, ' ');
         }
     } else {
         win->cells[(size_t)win->crow * gmax_cols + win->ccol] = c;
+        if (win->cattr) win->cattr[(size_t)win->crow * gmax_cols + win->ccol] = win->cur_attr;
         gterm_draw_cell(win, win->ccol, win->scrolled + win->crow, c);
         if (++win->ccol >= win->cols) {
             win->ccol = 0;
@@ -212,7 +252,11 @@ static void gv_erase(void* x, int row, int c0, int c1) {
     spin_lock(&w->lock);
     if (row >= 0 && row < w->rows) {
         if (c1 > w->cols) c1 = w->cols;
-        for (int c = c0 < 0 ? 0 : c0; c < c1; c++) w->cells[(size_t)row * gmax_cols + c] = 0;
+        for (int c = c0 < 0 ? 0 : c0; c < c1; c++) {
+            w->cells[(size_t)row * gmax_cols + c] = 0;
+            /* the erased cells take the CURRENT background (xterm's BCE) */
+            if (w->cattr) w->cattr[(size_t)row * gmax_cols + c] = w->cur_attr & GA_BGMASK;
+        }
         gv_redraw_row(w, row, c0 < 0 ? 0 : c0, c1);
     }
     spin_unlock(&w->lock);
@@ -223,11 +267,18 @@ static void gv_shift(void* x, int row, int col, int n) {
     spin_lock(&w->lock);
     if (row >= 0 && row < w->rows && col >= 0 && col < w->cols && n) {
         char* r = w->cells + (size_t)row * gmax_cols;
+        uint32_t* ra = w->cattr ? w->cattr + (size_t)row * gmax_cols : NULL;
         if (n > 0) {                                   /* insert n blanks at col */
-            for (int c = w->cols - 1; c >= col; c--) r[c] = (c - n >= col) ? r[c - n] : 0;
+            for (int c = w->cols - 1; c >= col; c--) {
+                r[c] = (c - n >= col) ? r[c - n] : 0;
+                if (ra) ra[c] = (c - n >= col) ? ra[c - n] : 0;
+            }
         } else {                                       /* delete -n characters */
             int k = -n;
-            for (int c = col; c < w->cols; c++) r[c] = (c + k < w->cols) ? r[c + k] : 0;
+            for (int c = col; c < w->cols; c++) {
+                r[c] = (c + k < w->cols) ? r[c + k] : 0;
+                if (ra) ra[c] = (c + k < w->cols) ? ra[c + k] : 0;
+            }
         }
         gv_redraw_row(w, row, col, w->cols);
     }
@@ -238,9 +289,55 @@ static void gv_reply(void* x, const char* s) {
     struct gui_window* w = x;
     for (; *s; s++) vc_kbd_push_to(w->vc, *s);
 }
+/* §M90 — SGR: the rendition the next output gets. */
+static void gv_attr(void* x, int fg, int bg, int bold, int rev) {
+    struct gui_window* w = x;
+    spin_lock(&w->lock);
+    w->cur_attr = (fg == VT_DEFAULT && bg == VT_DEFAULT && !bold && !rev) ? 0 : ga_pack(fg, bg, bold, rev);
+    spin_unlock(&w->lock);
+}
+/* §M90 — insert (n > 0) / delete (n < 0) whole lines at `row` (CSI L / M):
+ * the rows below move, the bottom fills blank, all of it redrawn. */
+static void gv_lines(void* x, int row, int n) {
+    struct gui_window* w = x;
+    spin_lock(&w->lock);
+    if (row >= 0 && row < w->rows && n) {
+        int k = n > 0 ? n : -n;
+        if (k > w->rows - row) k = w->rows - row;
+        if (n > 0) {
+            for (int r = w->rows - 1; r >= row; r--) {
+                char* d = w->cells + (size_t)r * gmax_cols;
+                if (r - k >= row) {
+                    const char* s2 = w->cells + (size_t)(r - k) * gmax_cols;
+                    for (int c = 0; c < gmax_cols; c++) d[c] = s2[c];
+                    ga_row_copy(w, r, r - k);
+                } else {
+                    for (int c = 0; c < gmax_cols; c++) d[c] = 0;
+                    ga_row_copy(w, r, -1);
+                }
+            }
+        } else {
+            for (int r = row; r < w->rows; r++) {
+                char* d = w->cells + (size_t)r * gmax_cols;
+                if (r + k < w->rows) {
+                    const char* s2 = w->cells + (size_t)(r + k) * gmax_cols;
+                    for (int c = 0; c < gmax_cols; c++) d[c] = s2[c];
+                    ga_row_copy(w, r, r + k);
+                } else {
+                    for (int c = 0; c < gmax_cols; c++) d[c] = 0;
+                    ga_row_copy(w, r, -1);
+                }
+            }
+        }
+        for (int r = row; r < w->rows; r++) gv_redraw_row(w, r, 0, w->cols);
+    }
+    spin_unlock(&w->lock);
+    gui_damage_win(w);
+}
 const struct vt_ops gterm_vt_ops = {
     .put = gv_put, .get_cursor = gv_get, .set_cursor = gv_set, .dims = gv_dims,
-    .erase = gv_erase, .shift = gv_shift, .reply = gv_reply,
+    .erase = gv_erase, .shift = gv_shift, .reply = gv_reply, .attr = gv_attr,
+    .lines = gv_lines,
 };
 
 /* §M58 — copy the selected cells out of the backing store into `dst`.
@@ -376,8 +473,8 @@ void gterm_rerender_locked(struct gui_window* win) {
     for (int v = 0; v < win->rows; v++) {
         const char* src = gterm_row(win, base + v);
         if (!src) continue;
-        for (int c = 0; c < win->cols; c++)
-            if (src[c]) gterm_draw_cell(win, c, base + v, src[c]);
+        for (int c = 0; c < win->cols; c++)      /* §M90 — a coloured blank is drawn too */
+            if (src[c] || gterm_cell_attr(win, c, base + v)) gterm_draw_cell(win, c, base + v, src[c] ? src[c] : ' ');
     }
 
     /* A scrolled-back view says so, in the corner it cannot be confused with

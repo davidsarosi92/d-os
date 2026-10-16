@@ -25,6 +25,7 @@
  * Reference: arch/x86/entry/syscalls/syscall_64.tbl.
  * ============================================================================= */
 
+#include "seccomp.h"
 #include "lnx_signal.h"   /* §M89 */
 #include "syscall.h"
 #include "idt.h"
@@ -182,7 +183,6 @@ struct lnx_iovec { void* iov_base; uint64_t iov_len; };
 #define LNX_SCM_RIGHTS  1
 
 /* Defined further down with the other ring-3 pointer checks. */
-static int lnx_r_ok(uintptr_t uptr, uintptr_t len);
 static int lnx_w_ok(uintptr_t uptr, uintptr_t len);
 
 struct lnx_cmsghdr {
@@ -192,36 +192,6 @@ struct lnx_cmsghdr {
 };
 
 #define LNX_CMSG_ALIGN(n) (((n) + sizeof(long) - 1) & ~(unsigned long)(sizeof(long) - 1))
-
-/* Pull the FIRST descriptor out of a client's control buffer, or -1.  The
- * control buffer is client memory, so it is validated before being read. */
-static int lnx_cmsg_take_fd(const void* ctl, unsigned long ctllen) {
-    if (!ctl || ctllen < sizeof(struct lnx_cmsghdr)) return -1;
-    if (!lnx_r_ok((uintptr_t)ctl, ctllen)) return -1;
-    const struct lnx_cmsghdr* c = (const struct lnx_cmsghdr*)ctl;
-    if (c->cmsg_level != LNX_SOL_SOCKET || c->cmsg_type != LNX_SCM_RIGHTS)
-        return -1;
-    if (c->cmsg_len < LNX_CMSG_ALIGN(sizeof *c) + sizeof(int)) return -1;
-    if (c->cmsg_len > ctllen) return -1;
-    const int* fds = (const int*)((const uint8_t*)ctl + LNX_CMSG_ALIGN(sizeof *c));
-    return fds[0];
-}
-
-/* Write a one-descriptor SCM_RIGHTS block into the client's control buffer and
- * report how many bytes it occupies (0 if it does not fit / none passed). */
-static unsigned long lnx_cmsg_put_fd(void* ctl, unsigned long ctllen, int fd) {
-    unsigned long need = LNX_CMSG_ALIGN(sizeof(struct lnx_cmsghdr)) + sizeof(int);
-    if (fd < 0 || !ctl || ctllen < need) return 0;
-    if (!lnx_w_ok((uintptr_t)ctl, need)) return 0;
-    struct lnx_cmsghdr* c = (struct lnx_cmsghdr*)ctl;
-    c->cmsg_len   = need;
-    c->cmsg_level = LNX_SOL_SOCKET;
-    c->cmsg_type  = LNX_SCM_RIGHTS;
-    int* fds = (int*)((uint8_t*)ctl + LNX_CMSG_ALIGN(sizeof(struct lnx_cmsghdr)));
-    fds[0] = fd;
-    return need;
-}
-
 
 /* ---- BSD sockets (Linux x86_64 gives each call its own syscall number, unlike
  * i386's single multiplexed socketcall) --------------------------------------
@@ -271,140 +241,10 @@ struct lnx_msghdr {          /* amd64: 56 bytes */
 static int lnx_w_ok(uintptr_t uptr, uintptr_t len) {   /* ring-3 write target */
     return uptr && vmm_user_access_ok(uptr, len, 1);
 }
-static int lnx_r_ok(uintptr_t uptr, uintptr_t len) {   /* ring-3 read source  */
-    return uptr && vmm_user_access_ok(uptr, len, 0);
-}
-/* ---- sockaddr marshalling (twin of the i386 helpers) -----------------------
- * Byte-order conversion lives ONLY here: it is a Linux-ABI concern, not
- * something the M24 stack should know about. */
-static int sockaddr_to_hostorder(const struct lnx_sockaddr_in* sa,
-                                 uint32_t* ip_out, int* port_out) {
-    if (!lnx_r_ok((uintptr_t)sa, sizeof *sa)) return -1;
-    if (sa->sin_family != AF_INET_LNX) return -1;
-    const uint8_t* a = (const uint8_t*)&sa->sin_addr;   /* network order bytes */
-    const uint8_t* p = (const uint8_t*)&sa->sin_port;
-    *ip_out   = ((uint32_t)a[0] << 24) | ((uint32_t)a[1] << 16) |
-                ((uint32_t)a[2] << 8)  |  (uint32_t)a[3];
-    *port_out = ((int)p[0] << 8) | (int)p[1];
-    return 0;
-}
-
-/* Fill a Linux sockaddr_in (network order) from a host-order (ip, port).
- * Honours the caller's addrlen: requiring the full struct would wrongly reject
- * a caller that legitimately passed a shorter buffer. */
-/* `addrlen` is an in/out KERNEL word: in = how much room the client gave us,
- * out = the length we would have written.  It is deliberately NOT a client
- * pointer, because this helper has callers with both origins — recvfrom hands
- * us the client's socklen_t, recvmsg hands us msg_namelen lifted out of an
- * already-validated msghdr.  Validating it here as a ring-3 pointer therefore
- * made the recvmsg path bail out silently, leaving msg_name untouched: musl's
- * resolver then compared the (still zeroed) source address against its
- * nameserver list, decided the reply came from a stranger and dropped every
- * single DNS answer.  Same lesson as the sys_*_k cores — check where the
- * pointer's ORIGIN is known.  `sa` itself IS a client pointer and is still
- * validated below. */
-static void hostorder_to_sockaddr(struct lnx_sockaddr_in* sa, uint32_t* addrlen,
-                                  uint32_t ip, int port) {
-    struct lnx_sockaddr_in tmp;
-    tmp.sin_family = AF_INET_LNX;
-    ((uint8_t*)&tmp.sin_port)[0] = (uint8_t)(port >> 8);
-    ((uint8_t*)&tmp.sin_port)[1] = (uint8_t)port;
-    ((uint8_t*)&tmp.sin_addr)[0] = (uint8_t)(ip >> 24);
-    ((uint8_t*)&tmp.sin_addr)[1] = (uint8_t)(ip >> 16);
-    ((uint8_t*)&tmp.sin_addr)[2] = (uint8_t)(ip >> 8);
-    ((uint8_t*)&tmp.sin_addr)[3] = (uint8_t)ip;
-    for (int i = 0; i < 8; i++) tmp.sin_zero[i] = 0;
-    uint32_t room = addrlen ? *addrlen : (uint32_t)sizeof tmp;
-    uint32_t cnt  = room < sizeof tmp ? room : (uint32_t)sizeof tmp;
-    if (cnt && !lnx_w_ok((uintptr_t)sa, cnt)) return;
-    for (uint32_t i = 0; i < cnt; i++) ((uint8_t*)sa)[i] = ((uint8_t*)&tmp)[i];
-    if (addrlen) *addrlen = (uint32_t)sizeof tmp;
-}
-
-/* recvmsg(fd, msg, flags) — the resolver's receive path.  musl's __res_msend
- * receives every DNS answer here and DROPS any reply whose source address does
- * not match a nameserver it queried, so filling msg_name is not optional:
- * leaving it alone makes getaddrinfo fail silently. */
-static long linux_recvmsg(int fd, struct lnx_msghdr* mh, int flags) {
-    (void)flags;
-    if (!lnx_w_ok((uintptr_t)mh, sizeof *mh)) return -LNX_EFAULT;
-    if (!mh->msg_iov || mh->msg_iovlen == 0) return -LNX_EOPNOTSUPP;
-    if (!lnx_r_ok((uintptr_t)mh->msg_iov, sizeof(struct lnx_iovec))) return -LNX_EFAULT;
-    struct lnx_iovec* iov = &mh->msg_iov[0];
-
-    /* Route by fd KIND.  A UNIX socket (the Wayland display connection) has no
-     * datagram source address and is served by the ordinary read path; only an
-     * AF_INET socket goes through recvfrom.  Handling only the latter is what
-     * made upstream libwayland's very first read fail. */
-    if (sys_fd_kind(fd) != FDK_NETSOCK) {
-        /* sys_recv is the read that can also carry a DESCRIPTOR; anything it
-         * hands back is marshalled into the client's SCM_RIGHTS block. */
-        int passfd = -1;
-        long r = sys_recv_u(fd, (uintptr_t)iov->iov_base, (size_t)iov->iov_len,
-                            &passfd);
-        if (r < 0) return r;
-        mh->msg_namelen    = 0;      /* connection-mode: no source address */
-        mh->msg_flags      = 0;
-        unsigned long ctl = lnx_cmsg_put_fd(mh->msg_control,
-                                            (unsigned long)mh->msg_controllen,
-                                            passfd);
-        mh->msg_controllen = ctl;
-        return r;
-    }
-
-    uint32_t ip = 0; int port = 0;
-    /* Payload lands in the CLIENT's iovec, source address in kernel locals —
-     * sys_recvfrom_u is exactly that split and bounce-buffers the payload. */
-    long n = sys_recvfrom_u(fd, (uintptr_t)iov->iov_base, (size_t)iov->iov_len,
-                            &ip, &port);
-    if (n < 0) return n;
-    if (mh->msg_name) {
-        uint32_t namelen = mh->msg_namelen;
-        hostorder_to_sockaddr((struct lnx_sockaddr_in*)mh->msg_name, &namelen, ip, port);
-        mh->msg_namelen = namelen;
-    }
-    mh->msg_flags = 0;
-    return n;
-}
-
-/* sendmsg(fd, msg, flags) — gather the iovecs and send as one message.  Used by
- * musl's TCP-fallback DNS path.  `buf` is a KERNEL gather buffer, so this calls
- * the *_k cores: the gated sys_write/sys_sendto would (correctly) reject a
- * kernel address while task->in_user_syscall is set. */
-static long linux_sendmsg(int fd, const struct lnx_msghdr* mh, int flags) {
-    (void)flags;
-    if (!lnx_r_ok((uintptr_t)mh, sizeof *mh)) return -LNX_EFAULT;
-    if (!mh->msg_iov || mh->msg_iovlen > 1024) return -LNX_EOPNOTSUPP;
-    if (!lnx_r_ok((uintptr_t)mh->msg_iov,
-                  (uintptr_t)mh->msg_iovlen * sizeof(struct lnx_iovec)))
-        return -LNX_EFAULT;
-    uint8_t buf[1024];
-    size_t total = 0;
-    for (uint64_t i = 0; i < mh->msg_iovlen; i++) {
-        const struct lnx_iovec* v = &mh->msg_iov[i];
-        const uint8_t* p = (const uint8_t*)v->iov_base;
-        if (v->iov_len && !lnx_r_ok((uintptr_t)p, v->iov_len)) return -LNX_EFAULT;
-        for (uint64_t k = 0; k < v->iov_len && total < sizeof buf; k++)
-            buf[total++] = p[k];
-    }
-    /* Same routing on the way out — but a UNIX socket may also be carrying a
-     * DESCRIPTOR in its ancillary data (a Wayland client's shm pool). */
-    if (sys_fd_kind(fd) != FDK_NETSOCK) {
-        int passfd = lnx_cmsg_take_fd(mh->msg_control,
-                                      (unsigned long)mh->msg_controllen);
-        if (passfd >= 0) return sys_send_k(fd, buf, total, passfd);
-        return sys_write_k(fd, buf, total);
-    }
-
-    if (mh->msg_name) {                              /* datagram to a peer */
-        uint32_t ip; int port;
-        if (sockaddr_to_hostorder((const struct lnx_sockaddr_in*)mh->msg_name,
-                                  &ip, &port) != 0)
-            return -LNX_EAFNOSUPPORT;
-        return sys_sendto_k(fd, buf, total, ip, port);
-    }
-    return sys_write_k(fd, buf, total);              /* connected stream */
-}
+/* recvmsg / sendmsg — §M90 (2026-10-15): served by the shared handlers in
+ * abi_engine.c (h_recvmsg / h_sendmsg), as on arm64.  The copies that lived
+ * here knew AF_INET and AF_UNIX only, and a netlink socket's reply came back
+ * as a bare -1 (EPERM). */
 
 /* fcntl(fd, cmd, arg) — only the status-flag commands do real work. */
 #define LNX_F_DUPFD          0
@@ -449,6 +289,20 @@ static void linux_syscall_body(struct int_frame* f) {
     uint64_t a0 = f->rdi, a1 = f->rsi, a2 = f->rdx;
     uint64_t a3 = f->r10, a4 = f->r8,  a5 = f->r9;
     (void)a4; (void)a5;
+
+    /* §M90 — the caller's seccomp filters, before anything else (seccomp.c). */
+    {
+        struct task* st = task_current();
+        if (st && st->cred.seccomp) {
+            unsigned long aa[6] = { a0, a1, a2, a3, a4, a5 };
+            long r;
+            if (seccomp_enter(st, (unsigned long)f->rax, aa, (uintptr_t)f->rip,
+                              SECCOMP_ARCH_X86_64, &r)) {
+                f->rax = (uint64_t)r;
+                return;
+            }
+        }
+    }
 
     /* §M50 — THE ARCH SHIM.  Everything above this point is the only
      * architecture-specific part of a syscall translation: which registers
@@ -645,13 +499,6 @@ static void linux_syscall_body(struct int_frame* f) {
          * `struct msghdr` is a row of guest-width words — a different
          * marshalling problem from a fixed 16-byte sockaddr, and one that has
          * not been solved once yet. */
-        case LNX_sendmsg:
-            f->rax = (uint64_t)linux_sendmsg((int)a0, (const struct lnx_msghdr*)a1,
-                                             (int)a2);
-            return;
-        case LNX_recvmsg:
-            f->rax = (uint64_t)linux_recvmsg((int)a0, (struct lnx_msghdr*)a1, (int)a2);
-            return;
 
         /* §M40 — clone().  amd64: clone(flags, stack, ptid, ctid, tls).
          *
@@ -662,6 +509,12 @@ static void linux_syscall_body(struct int_frame* f) {
          * expects the child to resume at the same instruction with rax = 0. */
         case LNX_clone: {
             unsigned long flags = (unsigned long)a0;
+            /* §M90 (2026-10-15) — Go's fork/exec (and musl's vfork) is
+             * clone(CLONE_VM|CLONE_VFORK|SIGCHLD) with NO new stack.  A fork
+             * is a correct vfork (the aarch64 shim has done this since §M73):
+             * without it every Go exec on x86_64 failed EINVAL — dockerd could
+             * start neither runc nor nft. */
+            if ((flags & 0x4000 /* CLONE_VFORK */) && a1 == 0) flags &= ~LNX_CLONE_VM;
             if (!(flags & LNX_CLONE_VM)) {          /* a fork in disguise */
                 struct user_regs r;
                 r.rax = 0;
@@ -700,6 +553,20 @@ static void linux_syscall_body(struct int_frame* f) {
             }
             if ((flags & LNX_CLONE_CHILD_SETTID) && ctid) *ctid = tid;
             f->rax = (uint64_t)tid;
+            return;
+        }
+
+        /* §M90 — clone3(args, size): the same register snapshot as clone(),
+         * the rest is portable (proc_clone3). */
+        case 435: {
+            struct user_regs r;
+            r.rax = 0;
+            r.rbx = f->rbx; r.rcx = f->rcx; r.rdx = f->rdx;
+            r.rsi = f->rsi; r.rdi = f->rdi; r.rbp = f->rbp;
+            r.r8  = f->r8;  r.r9  = f->r9;  r.r10 = f->r10; r.r11 = f->r11;
+            r.r12 = f->r12; r.r13 = f->r13; r.r14 = f->r14; r.r15 = f->r15;
+            r.rip = f->rip; r.rflags = f->rflags; r.user_sp = f->rsp;
+            f->rax = (uint64_t)proc_clone3(&r, (uintptr_t)a0, (unsigned long)a1, 0);
             return;
         }
 

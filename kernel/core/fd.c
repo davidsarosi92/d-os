@@ -54,6 +54,8 @@ void fd_readiness_changed(struct ofile* o) {
 /* §M90 — an eBPF program behind a descriptor (bpf.c); takes a reference. */
 struct bpf_prog_ref;
 void bpf_prog_ref_get(struct bpf_prog* p);
+/* §M90 — an ofile of a kind whose object lives in the ofile itself (pidfd). */
+struct ofile* ofile_alloc_kind(int kind) { return ofile_alloc((enum fd_kind)kind); }
 struct ofile* ofile_from_bpf(struct bpf_prog* p) {
     if (!p) return NULL;
     struct ofile* o = ofile_alloc(FD_BPF);
@@ -175,6 +177,7 @@ void ofile_unref(struct ofile* o) {
         case FD_INOTIFY: inotify_close(o->ino); break;
         case FD_PACKET:  packet_close(o->pkt); break;
         case FD_PTY:     tty_release(o); if (o->file) vfs_close(o->file); break;   /* §M90 rung 6 */
+        case FD_PIDFD:   break;                   /* §M90 — the pid lives in the ofile */
     }
     o->kind = (enum fd_kind)0x0DEAD;     /* the poison, see above */
     kfree(o);

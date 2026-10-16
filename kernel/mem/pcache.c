@@ -434,6 +434,12 @@ SHELL_CMD(sharetest) = { "sharetest", "", 0, SHELL_G_TEST, cmd_sharetest, SHELL_
 static void cmd_pcachetest(const char* args) {
     (void)args;
     int bad = 0;
+    /* §M90 — start from a cache with NOTHING reclaimable: the counts below
+     * are about this test's page, and on a machine that has been working other
+     * files' unmapped pages are in the cache too — the first reclaim took one
+     * of those and read as "reclaimed a MAPPED page" (seen in a long test
+     * batch; only clean unmapped pages go, so draining them is harmless). */
+    for (int guard = 0; guard < 100000 && pcache_reclaim(64) > 0; guard++) { }
     struct file* f = vfs_open("/tmp-pcachetest", VFS_RDWR | VFS_CREATE | VFS_TRUNC);
     if (!f) { kprintf("pcachetest: cannot create a file\n"); return; }
     uint8_t buf[64];
@@ -453,22 +459,26 @@ static void cmd_pcachetest(const char* args) {
     if (!same) { kprintf("pcachetest: the cached page does not hold the file\n"); bad++; }
     /* two "mappings" hold it: not reclaimable */
     if (pcache_reclaim(1) != 0) { kprintf("pcachetest: reclaimed a MAPPED page\n"); bad++; }
-    /* the file changes: the page leaves the cache (detached, the mappings keep it) */
+    /* §M90 — the file changes: the cached page is UPDATED IN PLACE (pcache_update,
+     * one page cache for read() and every mapping, as on Linux), so the next
+     * lookup finds the same frame and the EXISTING mapping sees the new byte.
+     * (This test still expected §M74's drop-on-write and failed on aarch64
+     * since the coherent cache shipped.) */
     f->pos = 0; buf[0] = 0x7A; vfs_write(f, buf, 1);
     pcache_map_page(f, 0, &f3);
     pcache_stats(&c);
-    if (f3 == f1) { kprintf("pcachetest: a write did not drop the stale page\n"); bad++; }
-    p = (uint8_t*)kmap_frame(f3);
-    if (p[0] != 0x7A) { kprintf("pcachetest: the re-read page is stale\n"); bad++; }
+    if (f3 != f1) { kprintf("pcachetest: a write replaced the cached page instead of updating it\n"); bad++; }
+    p = (uint8_t*)kmap_frame(f1);
+    if (p[0] != 0x7A) { kprintf("pcachetest: an existing mapping does not see the write\n"); bad++; }
     kunmap_frame(p);
-    /* drop our "mappings": f1 was detached, so its last holder frees it */
+    /* drop our "mappings"; the cache's own reference stays */
     if (vmm_frame_unshare(f1)) pmm_free_frame(f1);
     if (vmm_frame_unshare(f2)) pmm_free_frame(f2);
     if (vmm_frame_unshare(f3)) pmm_free_frame(f3);
     if (pcache_reclaim(1) != 1) { kprintf("pcachetest: an unmapped page was not reclaimable\n"); bad++; }
     vfs_close(f);
     vfs_unlink("/tmp-pcachetest");
-    kprintf("pcachetest: one frame and one read for two lookups, a write drops it, only "
-            "unmapped pages are reclaimed -> %s\n", bad ? "FAIL" : "PASS");
+    kprintf("pcachetest: one frame and one read for two lookups, a write updates it in "
+            "place, only unmapped pages are reclaimed -> %s\n", bad ? "FAIL" : "PASS");
 }
 SHELL_CMD(pcachetest) = { "pcachetest", "", 0, SHELL_G_TEST, cmd_pcachetest, SHELL_P_ADMIN };

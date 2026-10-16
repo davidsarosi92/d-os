@@ -24,6 +24,69 @@ void vt_init(struct vt* v) {
     v->np = 0; v->priv = 0;
     v->saved_row = v->saved_col = 0;
     for (int i = 0; i < 8; i++) v->params[i] = 0;
+    v->fg = v->bg = VT_DEFAULT;
+    v->bold = v->reverse = 0;
+}
+
+/* §M90 — xterm's palette: 0-7 the basic colours, 8-15 their bright forms,
+ * 16-231 a 6x6x6 cube, 232-255 a grey ramp. */
+unsigned vt_rgb(int idx) {
+    static const unsigned base[16] = {
+        0x000000, 0xCD0000, 0x00CD00, 0xCDCD00, 0x0000EE, 0xCD00CD, 0x00CDCD, 0xE5E5E5,
+        0x7F7F7F, 0xFF0000, 0x00FF00, 0xFFFF00, 0x5C5CFF, 0xFF00FF, 0x00FFFF, 0xFFFFFF };
+    if (idx < 0) return 0;
+    if (idx < 16) return base[idx];
+    if (idx < 232) {
+        int i = idx - 16, r = i / 36, g = (i / 6) % 6, b = i % 6;
+        int lv[6] = { 0, 95, 135, 175, 215, 255 };
+        return ((unsigned)lv[r] << 16) | ((unsigned)lv[g] << 8) | (unsigned)lv[b];
+    }
+    if (idx < 256) { unsigned g = 8 + (unsigned)(idx - 232) * 10; return (g << 16) | (g << 8) | g; }
+    return 0;
+}
+/* The palette index nearest to an RGB colour (the 6x6x6 cube, or a grey). */
+static int rgb_to_idx(int r, int g, int b) {
+    int cr = r < 48 ? 0 : r < 115 ? 1 : (r - 35) / 40;
+    int cg = g < 48 ? 0 : g < 115 ? 1 : (g - 35) / 40;
+    int cb = b < 48 ? 0 : b < 115 ? 1 : (b - 35) / 40;
+    if (cr > 5) cr = 5;
+    if (cg > 5) cg = 5;
+    if (cb > 5) cb = 5;
+    if (cr == cg && cg == cb && r == g && g == b) {
+        if (r < 8) return 16;
+        if (r > 238) return 231;
+        return 232 + (r - 8) / 10;
+    }
+    return 16 + 36 * cr + 6 * cg + cb;
+}
+static void sgr(struct vt* v, const struct vt_ops* o, void* x) {
+    int n = v->np ? v->np : 1;
+    for (int i = 0; i < n; i++) {
+        int p = v->np ? v->params[i] : 0;
+        if (p < 0) p = 0;
+        if (p == 0)       { v->fg = v->bg = VT_DEFAULT; v->bold = v->reverse = 0; }
+        else if (p == 1)  v->bold = 1;
+        else if (p == 22) v->bold = 0;
+        else if (p == 7)  v->reverse = 1;
+        else if (p == 27) v->reverse = 0;
+        else if (p >= 30 && p <= 37) v->fg = p - 30;
+        else if (p >= 40 && p <= 47) v->bg = p - 40;
+        else if (p >= 90 && p <= 97) v->fg = p - 90 + 8;
+        else if (p >= 100 && p <= 107) v->bg = p - 100 + 8;
+        else if (p == 39) v->fg = VT_DEFAULT;
+        else if (p == 49) v->bg = VT_DEFAULT;
+        else if (p == 38 || p == 48) {
+            int c = -2;
+            if (i + 2 < n && v->params[i + 1] == 5) { c = v->params[i + 2] & 255; i += 2; }
+            else if (i + 4 < n && v->params[i + 1] == 2) {
+                c = rgb_to_idx(v->params[i + 2] & 255, v->params[i + 3] & 255, v->params[i + 4] & 255);
+                i += 4;
+            }
+            if (c >= 0) { if (p == 38) v->fg = c; else v->bg = c; }
+        }
+        /* 2-9 other renditions (dim, italic, underline, blink...): accepted, not drawn */
+    }
+    if (o->attr) o->attr(x, v->fg, v->bg, v->bold, v->reverse);
 }
 
 static int arg(const struct vt* v, int i, int def) {
@@ -95,6 +158,11 @@ static void csi(struct vt* v, char f, const struct vt_ops* o, void* x) {
     case 'c':                                        /* who are you: a VT102 */
         if (o->reply && !v->priv) o->reply(x, "\x1b[?6c");
         return;
+    case 'm':                                        /* §M90 — select graphic rendition */
+        if (!v->priv) sgr(v, o, x);
+        return;
+    case 'L': if (o->lines && !v->priv) o->lines(x, r, n);  return;   /* §M90 — insert lines */
+    case 'M': if (o->lines && !v->priv) o->lines(x, r, -n); return;   /* §M90 — delete lines */
     default:
         return;                                      /* m h l r t ... consumed */
     }
@@ -133,7 +201,10 @@ void vt_feed(struct vt* v, char ch, const struct vt_ops* o, void* x) {
             else if (c == 'D') o->put(x, '\n');      /* index: down, scrolling */
             else if (c == 'E') { o->put(x, '\r'); o->put(x, '\n'); }
             else if (c == 'M') { if (o->set_cursor && r > 0) o->set_cursor(x, r - 1, col); }
-            else if (c == 'c') { o->put(x, '\f'); vt_init(v); }   /* reset: clear */
+            else if (c == 'c') {                                   /* reset: clear */
+                o->put(x, '\f'); vt_init(v);
+                if (o->attr) o->attr(x, VT_DEFAULT, VT_DEFAULT, 0, 0);
+            }
         }
         return;
     case ST_CSI:
@@ -169,7 +240,7 @@ void vt_feed(struct vt* v, char ch, const struct vt_ops* o, void* x) {
 
 #define VR 5
 #define VC 10
-struct vscr { char cell[VR][VC]; int r, c; char reply[32]; int nreply; };
+struct vscr { char cell[VR][VC]; int r, c; char reply[32]; int nreply; int fg, bg, bold, rev, nattr; };
 static void vs_put(void* x, char ch) {
     struct vscr* s = x;
     if (ch == '\n') { s->c = 0; if (s->r < VR - 1) s->r++; return; }
@@ -197,7 +268,19 @@ static void vs_reply(void* x, const char* str) {
     while (*str && s->nreply < 31) s->reply[s->nreply++] = *str++;
     s->reply[s->nreply] = 0;
 }
-static const struct vt_ops vs_ops = { vs_put, vs_get, vs_set, vs_dims, vs_erase, vs_shift, vs_reply };
+static void vs_attr(void* x, int fg, int bg, int bold, int rev) {
+    struct vscr* s = x;
+    s->fg = fg; s->bg = bg; s->bold = bold; s->rev = rev; s->nattr++;
+}
+static void vs_lines(void* x, int row, int n) {
+    struct vscr* s = x;
+    if (n > 0) { for (int r = VR - 1; r >= row; r--) for (int c = 0; c < VC; c++)
+                     s->cell[r][c] = (r - n >= row) ? s->cell[r - n][c] : '.'; }
+    else       { int k = -n; for (int r = row; r < VR; r++) for (int c = 0; c < VC; c++)
+                     s->cell[r][c] = (r + k < VR) ? s->cell[r + k][c] : '.'; }
+}
+static const struct vt_ops vs_ops = { vs_put, vs_get, vs_set, vs_dims, vs_erase, vs_shift, vs_reply,
+                                      vs_attr, vs_lines };
 
 static int row_is(struct vscr* s, int r, const char* want) {
     for (int c = 0; c < VC; c++) if (s->cell[r][c] != want[c]) return 0;
@@ -210,7 +293,7 @@ static void cmd_vttest(const char* args) {
     struct vt v; struct vscr s;
     int ok = 1;
     #define VT(cond, what) do { int _c = (cond); kprintf("vt: %s %s\n", what, _c ? "ok" : "FAIL"); if (!_c) ok = 0; } while (0)
-    vt_init(&v); s.nreply = 0; vs_put(&s, '\f');
+    vt_init(&v); s.nreply = 0; s.nattr = 0; s.fg = s.bg = VT_DEFAULT; s.bold = s.rev = 0; vs_put(&s, '\f');
     feed(&v, &s, "hello\x1b[2Dxy");
     VT(row_is(&s, 0, "helxy....."), "cursor back (CSI D) then overwrite");
     feed(&v, &s, "\x1b[1;3H\x1b[K");
@@ -222,8 +305,17 @@ static void cmd_vttest(const char* args) {
     VT(row_is(&s, 0, "abef......"), "delete two characters (CSI P)");
     feed(&v, &s, "\x1b[1;2H\x1b[2@");
     VT(row_is(&s, 0, "a..bef...."), "insert two blanks (CSI @)");
-    feed(&v, &s, "\x1b[31;1mR\x1b[0m\x1b]0;title\x07\x1b(BS");
-    VT(row_is(&s, 0, "aRSbef...."), "colours, a window title and a charset are consumed, never printed");
+    feed(&v, &s, "\x1b[31;1mR");
+    VT(s.fg == 1 && s.bg == VT_DEFAULT && s.bold, "SGR 31;1: red, bold, default background");
+    feed(&v, &s, "\x1b[0m\x1b]0;title\x07\x1b(BS");
+    VT(row_is(&s, 0, "aRSbef....") && s.fg == VT_DEFAULT && !s.bold,
+       "SGR 0 resets; a window title and a charset are consumed, never printed");
+    feed(&v, &s, "\x1b[38;5;200;48;2;0;0;255m");
+    VT(s.fg == 200 && s.bg == 21, "256-colour foreground, direct-colour background (nearest: 21)");
+    feed(&v, &s, "\x1b[97;7m");
+    VT(s.fg == 15 && s.rev, "bright white (97) and reverse (7)");
+    feed(&v, &s, "\x1b[39;49;27m");
+    VT(s.fg == VT_DEFAULT && s.bg == VT_DEFAULT && !s.rev, "default colours (39, 49), reverse off (27)");
     feed(&v, &s, "\x1b[2J");
     VT(row_is(&s, 0, "..........") && row_is(&s, 2, ".........."), "erase the screen (CSI 2J)");
     feed(&v, &s, "\x1b[99;99H");
@@ -233,6 +325,11 @@ static void cmd_vttest(const char* args) {
     /* ("\x1b" "7", not "\x1b7": a hex escape takes every hex digit after it) */
     feed(&v, &s, "\x1b" "7" "\x1b[5;5H" "\x1b" "8" "x");
     VT(s.cell[3][2] == 'x', "save and restore the cursor (ESC 7 / 8)");
+    feed(&v, &s, "\x1b[2J\x1b[1;1H1\x1b[2;1H2\x1b[3;1H3\x1b[2;1H\x1b[L");
+    VT(s.cell[0][0] == '1' && s.cell[1][0] == '.' && s.cell[2][0] == '2' && s.cell[3][0] == '3',
+       "insert a line (CSI L): the rest moves down");
+    feed(&v, &s, "\x1b[1;1H\x1b[2M");
+    VT(s.cell[0][0] == '2' && s.cell[1][0] == '3' && s.cell[4][0] == '.', "delete two lines (CSI 2M): the rest moves up");
     kprintf("vt: %s\n", ok ? "ALL ok" : "FAIL");
     #undef VT
 }
@@ -244,7 +341,9 @@ SHELL_CMD(vttest) = { "vttest", "", "the VT100 subset against a test screen", SH
 static void cmd_vtdemo(const char* args) {
     (void)args;
     console_write("1 want 'vtdemo: BB'    > vtdemo: AAAA\x1b[4DBB\x1b[K\n");
-    console_write("2 want 'red, no codes' > \x1b[31;1mred\x1b[0m, no codes\n");
+    console_write("2 want 'red' in red    > \x1b[31;1mred\x1b[0m, no codes\n");
+    console_write("6 want colours         > \x1b[32mgreen \x1b[44myellow-on-blue\x1b[0m "
+                  "\x1b[38;5;208morange(256)\x1b[0m \x1b[7mreverse\x1b[0m\n");
     console_write("3 want 'abcf'          > abcdef\x1b[3D\x1b[2P\n");
     console_write("4 want 'a  bc'         > abc\x1b[2D\x1b[2@\n");
     console_write("5 want 'title gone'    > \x1b]0;a window title\x07title gone\n");

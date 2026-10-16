@@ -12,12 +12,15 @@
  * terminal.c decides which driver gets called.
  * ============================================================================= */
 
+#include "hal_api.h"
 #include "console.h"
 #include "module.h"
 #include <stdint.h>
 #include <stddef.h>
 
-#define VGA_MEMORY ((volatile uint16_t*)0xB8000)
+/* §M90 — through the direct map: on x86_64 the low half is no longer the
+ * kernel's (phys_to_virt is the identity on i386). */
+#define VGA_MEMORY ((volatile uint16_t*)phys_to_virt(0xB8000))
 #define VGA_COLS   80
 #define VGA_ROWS   25
 #define VGA_ATTR   0x07                         /* light grey on black */
