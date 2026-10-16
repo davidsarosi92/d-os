@@ -163,7 +163,7 @@ static void clone_thread_bootstrap(void) {
 }
 
 int proc_clone_thread(struct user_regs* parent_regs, uintptr_t child_stack,
-                      uintptr_t tls, int* ctid_kaddr) {
+                      uintptr_t tls, int* ctid_kaddr, int* ptid_set, int* ctid_set) {
     struct task* parent = task_current();
     if (!parent || !parent->mm || !child_stack) return -1;
     if (!ns_pid_thread_ok(parent)) return -1;   /* §M90 — after unshare(NEWPID) */
@@ -198,6 +198,10 @@ int proc_clone_thread(struct user_regs* parent_regs, uintptr_t child_stack,
      * in-tree-libc thread is joined with waitpid and stays owned. */
     task_set_reap_owned(child, parent->linux_abi ? 0 : 1);
     int vtid = ns_vnr(parent, child);
+    /* NEXT #14 — PARENT_/CHILD_SETTID while the child CANNOT run yet: it reads
+     * its tid from that very word (see proc.h). */
+    if (ptid_set) *ptid_set = vtid;
+    if (ctid_set) *ctid_set = vtid;
     task_release(child);                /* §4.96: built completely, now it may run */
     /* §M90 — the tid AS THE CALLER SEES IT (its pid namespace): what clone
      * returns and what PARENT_/CHILD_SETTID store — a C library keeps that

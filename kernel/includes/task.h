@@ -467,6 +467,14 @@ struct task {
      * in the kernel it names the call it is asleep IN — `ps` shows it.  Found
      * necessary when a busybox shell hung only while NOT being traced. */
     int       guest_nr;
+    /* NEXT #14 (2026-10-16) — the futex word this task is parked on and the
+     * value it expected there; 0 while not in a FUTEX_WAIT.  `ps` prints it
+     * beside the word's CURRENT value, because a joiner asleep on a word that
+     * already reads 0 is a lost wake-up, while one asleep on a word still
+     * holding its value means the thread never cleared it — two different
+     * bugs that look identical from the prompt. */
+    uintptr_t futex_addr;
+    uint32_t  futex_val;
     uintptr_t sig_handler[32];          /* NSIG (syscall.h) */
     uintptr_t sig_restorer;
     /* §M89 — Linux-ABI signal state (dispositions shared by threads, the

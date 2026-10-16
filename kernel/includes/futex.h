@@ -30,4 +30,10 @@
 long futex_wait(uintptr_t uaddr, uint32_t val, uint64_t deadline_ns);
 long futex_wake(uintptr_t uaddr, int count);
 
+/* NEXT #14 — a record of the last few CLONE_CHILD_CLEARTID clears made at
+ * thread exit (pid, word, whether the store happened, whether anybody was
+ * parked in the bucket).  Lock-free and allocation-free so the exit path can
+ * call it; `futex` prints it.  Read beside `ps`'s "futex <addr> want <v>". */
+void futex_note_clear(int pid, uintptr_t addr, int stored, int woke);
+
 #endif

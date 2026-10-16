@@ -41,4 +41,17 @@ void gdt_load_cpu_tss(void);
  * (RPL 3).  `hal_set_tls_base` (hal_api.h) rewrites that descriptor's base. */
 uint16_t gdt_tls_selector(void);
 
+/* NEXT #14 (2026-10-16) — BIND THE CALLING TASK'S TLS TO THE CPU IT IS ON, AS
+ * ONE STEP.  The slot is per CPU (GDT_TLS_BASE + cpu), so "pin to this CPU",
+ * "write this CPU's slot" and "the selector for this CPU" must all name the
+ * SAME cpu.  They were three preemptible calls, each reading this_cpu_id()
+ * afresh: a thread migrated between them wrote ANOTHER CPU's slot and entered
+ * ring 3 with that CPU's selector while pinned somewhere else — and from then
+ * on its %gs base was whatever thread owned that slot, i.e. it ran as another
+ * thread (musl's __pthread_self()).  Interrupts are off across the three, so
+ * the CPU cannot change under them.  `t` must be the CALLING task with
+ * `t->tls_base` already set.  Returns the ring-3 selector (RPL 3). */
+struct task;
+uint16_t x86_tls_bind(struct task* t);
+
 #endif

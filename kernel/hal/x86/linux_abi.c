@@ -843,12 +843,12 @@ static void linux_syscall_body(struct int_frame* f) {
                 const struct lnx_user_desc* ud = (const struct lnx_user_desc*)f->esi;
                 if (lnx_r_ok((uintptr_t)ud, sizeof *ud)) tls = (uintptr_t)ud->base_addr;
             }
-            int tid = proc_clone_thread(&r, (uintptr_t)f->ecx, tls, ctid);
+            int* pset = ((flags & LNX_CLONE_PARENT_SETTID) && f->edx &&
+                         lnx_w_ok(f->edx, sizeof(int))) ? (int*)f->edx : NULL;
+            int* cset = ((flags & LNX_CLONE_CHILD_SETTID) && f->edi &&
+                         lnx_w_ok(f->edi, sizeof(int))) ? (int*)f->edi : NULL;
+            int tid = proc_clone_thread(&r, (uintptr_t)f->ecx, tls, ctid, pset, cset);
             if (tid < 0) { f->eax = (uint32_t)-LNX_EINVAL; return; }
-            if ((flags & LNX_CLONE_PARENT_SETTID) && f->edx) {
-                if (lnx_w_ok(f->edx, sizeof(int))) *(int*)f->edx = tid;
-            }
-            if ((flags & LNX_CLONE_CHILD_SETTID) && ctid) *ctid = tid;
             f->eax = (uint32_t)tid;
             return;
         }
@@ -875,9 +875,8 @@ static void linux_syscall_body(struct int_frame* f) {
             if (!t || !lnx_w_ok(f->ebx, sizeof *u)) { f->eax = (uint32_t)-LNX_EFAULT; return; }
             t->tls_base = (uintptr_t)u->base_addr;
             t->has_tls  = 1;
-            task_set_affinity(t, 1u << this_cpu_id());  /* per-CPU selector */
-            hal_set_tls_base(t->tls_base);
-            u->entry_number = (uint32_t)(gdt_tls_selector() >> 3);
+            /* NEXT #14 — pin, slot and selector for ONE cpu (gdt.h). */
+            u->entry_number = (uint32_t)(x86_tls_bind(t) >> 3);
             f->eax = 0;
             return;
         }

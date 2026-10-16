@@ -270,9 +270,7 @@ static void syscall_dispatch_body(struct int_frame* f) {
             if (!t) { f->eax = 0; return; }
             t->tls_base = (uintptr_t)f->ebx;
             t->has_tls  = 1;
-            task_set_affinity(t, 1u << this_cpu_id());
-            hal_set_tls_base(t->tls_base);
-            f->eax = gdt_tls_selector();
+            f->eax = x86_tls_bind(t);       /* NEXT #14 — one CPU for all three */
             return;
         }
 

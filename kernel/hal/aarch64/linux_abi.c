@@ -127,15 +127,13 @@ void linux_syscall_dispatch(struct trapframe* tf) {
                 return;
             }
             uintptr_t tls = (flags & 0x00080000u /* SETTLS */) ? (uintptr_t)tf->x[3] : 0;
-            int tid = proc_clone_thread(&r, (uintptr_t)tf->x[1], tls, ctid);
-            if (tid >= 0) {
-                if ((flags & 0x00100000u /* PARENT_SETTID */) && tf->x[2] &&
-                    vmm_user_access_ok((uintptr_t)tf->x[2], sizeof(int), 1))
-                    *(int*)(uintptr_t)tf->x[2] = tid;
-                if ((flags & 0x01000000u /* CHILD_SETTID */) && tf->x[4] &&
-                    vmm_user_access_ok((uintptr_t)tf->x[4], sizeof(int), 1))
-                    *(int*)(uintptr_t)tf->x[4] = tid;
-            }
+            int* pset = ((flags & 0x00100000u /* PARENT_SETTID */) && tf->x[2] &&
+                         vmm_user_access_ok((uintptr_t)tf->x[2], sizeof(int), 1))
+                        ? (int*)(uintptr_t)tf->x[2] : NULL;
+            int* cset = ((flags & 0x01000000u /* CHILD_SETTID */) && tf->x[4] &&
+                         vmm_user_access_ok((uintptr_t)tf->x[4], sizeof(int), 1))
+                        ? (int*)(uintptr_t)tf->x[4] : NULL;
+            int tid = proc_clone_thread(&r, (uintptr_t)tf->x[1], tls, ctid, pset, cset);
             tf->x[0] = (uint64_t)(tid < 0 ? -11 /* EAGAIN */ : tid);
         }
         if (me) me->in_user_syscall = prev;

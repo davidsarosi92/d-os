@@ -491,6 +491,10 @@ static int proc_exec_common(const void* image, size_t len,
      * mode.  Control returns here when the program issues SYS_EXIT. */
     struct task* me = task_current();
     struct vmm_space* prev = me ? me->mm : NULL;
+    /* NEXT #14 — a musl program pins its thread to the CPU it set its TLS on
+     * (i386's per-CPU GDT slot); that pin is the PROGRAM's, and the hosting
+     * shell kept it after the program was gone.  Restored below. */
+    uint32_t prev_aff = me ? task_get_affinity(me) : 0;
     if (me) task_swap_mm(me, s);     /* a fresh space carries a fresh cursor */
     vmm_space_switch(s);
 
@@ -507,6 +511,7 @@ static int proc_exec_common(const void* image, size_t len,
     fd_close_all();                    /* reclaim any fds the program opened */
     vmm_space_switch(prev);
     if (me) task_swap_mm(me, prev);
+    if (me && prev_aff && task_get_affinity(me) != prev_aff) task_set_affinity(me, prev_aff);
     /* §M90 — the program's THREADS share `s` and may still be on their way out
      * in the kernel (a joined thread has finished in user space, not yet left
      * its CPU).  Destroying the space under them freed page tables a running
@@ -911,6 +916,13 @@ void user_excursion_end(void) {
         me->sig_blocked = 0;
         me->sig_pending = 0;
         for (int i = 0; i < NSIG; i++) me->sig_handler[i] = SIG_DFL;
+        /* NEXT #14 (2026-10-16) — so did its tid word (musl's startup
+         * set_tid_address(&__thread_list_lock)) and its thread pointer: `ps`
+         * showed the shell still carrying `ctid` into an image that was about
+         * to be destroyed, to be zeroed there if the shell ever exited. */
+        me->clear_tid = NULL;
+        me->has_tls = 0;
+        me->tls_base = 0;
     }
 }
 
@@ -1144,12 +1156,12 @@ long proc_clone3(struct user_regs* r, uintptr_t uargs, unsigned long size, int t
     }
     int* ctid = (fl & CL_CHILD_CLEARTID) ? (int*)(uintptr_t)a[2] : NULL;
     if (ctid && !vmm_user_access_ok((uintptr_t)ctid, sizeof(int), 1)) return -14;
-    int tid = proc_clone_thread(r, stack_top, tls, ctid);
+    int* pset = ((fl & CL_PARENT_SETTID) && a[3] && vmm_user_access_ok((uintptr_t)a[3], sizeof(int), 1))
+                ? (int*)(uintptr_t)a[3] : NULL;
+    int* cset = ((fl & CL_CHILD_SETTID) && a[2] && vmm_user_access_ok((uintptr_t)a[2], sizeof(int), 1))
+                ? (int*)(uintptr_t)a[2] : NULL;
+    int tid = proc_clone_thread(r, stack_top, tls, ctid, pset, cset);
     if (tid < 0) return -11;
-    if ((fl & CL_PARENT_SETTID) && a[3] && vmm_user_access_ok((uintptr_t)a[3], sizeof(int), 1))
-        copy_to_user((uintptr_t)a[3], &tid, sizeof tid);
-    if ((fl & CL_CHILD_SETTID) && a[2] && vmm_user_access_ok((uintptr_t)a[2], sizeof(int), 1))
-        copy_to_user((uintptr_t)a[2], &tid, sizeof tid);
     return tid;
 }
 

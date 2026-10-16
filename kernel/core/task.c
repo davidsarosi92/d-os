@@ -87,6 +87,7 @@
 #include "watchdog.h"   /* §M31 L3 — hw_watchdog_pet from the tick */
 #include "kmutex.h"
 #include "syscall.h"   /* sys_futex — CLONE_CHILD_CLEARTID wake */
+#include "futex.h"     /* futex_wake + the NEXT #14 clear ring */
 #include "kmalloc.h"
 #include "printf.h"
 #include "lock.h"
@@ -1907,6 +1908,16 @@ static void wake_waitq_sleeper(struct task* t) {
     if (!wq) return;
 
     uint32_t fl = spin_lock_irqsave(&wq->lock);
+    /* NEXT #14 (2026-10-16) — `t->wq` was read WITHOUT this lock.  In the
+     * window the task can be woken from that queue, run, and park on ANOTHER
+     * one.  Acting anyway set it RUNNABLE and cleared `t->wq` while it was
+     * still linked into the new queue's list; its next park then linked it a
+     * second time, and the list, now with one task in it twice, could lose
+     * the waiters behind it.  So: only if it is still parked HERE. */
+    if (t->wq != wq) {
+        spin_unlock_irqrestore(&wq->lock, fl);
+        return;
+    }
     /* Unlink from the singly-linked parked list.  It may already be gone
      * — a real waker could have raced us between the read of t->wq and
      * this lock — in which case there is nothing left to do. */
@@ -2962,7 +2973,14 @@ void task_exit_code(int code) {
          * a kernel data abort). */
         if (vmm_user_access_ok((uintptr_t)p, sizeof(int), 1)) {
             *p = 0;
-            sys_futex(p, 1 /* FUTEX_WAKE */, 0x7fffffff);
+            long woke = futex_wake((uintptr_t)p, 0x7fffffff);
+            futex_note_clear(self->pid, (uintptr_t)p, 1, (int)woke);
+        } else {
+            futex_note_clear(self->pid, (uintptr_t)p, 0, 0);
+            /* NEXT #14 — said out loud: a joiner waits on this word forever,
+             * so skipping it silently turns into a hang nobody can trace. */
+            kprintf("task: '%s' (pid %d) exits and cannot clear its tid word %p\n",
+                    self->name, self->pid, (void*)p);
         }
     }
 
@@ -3316,6 +3334,19 @@ void waitq_block(struct waitq* wq) {
     /* Woken.  Re-acquire the condition lock for the caller's recheck
      * loop.  IRQs are still off (schedule restored them to entry state).*/
     spin_lock(&wq->lock);
+    /* NEXT #14 (2026-10-16) — a waker that went through THIS queue unlinked
+     * us before making us runnable; any other route back to RUNNABLE (a timed
+     * sweep, a resume, a wake that read a stale `t->wq`) did not, and leaving
+     * the link in place means the next park pushes us onto a list we are
+     * already in.  Under the lock, so it is the one authoritative check. */
+    if (self->wq == wq) {
+        struct task** pp = &wq->head;
+        while (*pp) {
+            if (*pp == self) { *pp = self->wq_next; break; }
+            pp = &(*pp)->wq_next;
+        }
+    }
+    self->wq_next = NULL;
     self->wq = NULL;                            /* §M49 — no longer parked */
 }
 
@@ -3467,6 +3498,11 @@ void task_list(void) {
          * the machine's must not look like any other. */
         if (t->cred.container) kprintf("  [container %d]", t->cred.container);
         if (t->guest_nr && t->state == TASK_SLEEPING) kprintf("  in sys #%d", t->guest_nr - 1);
+        /* NEXT #14 — a parked futex waiter: the word, what it expected, and
+         * `futex` (futex.c) prints the recent tid-word clears to compare. */
+        if (t->futex_addr && t->state == TASK_SLEEPING)
+            kprintf("  futex %p want %u", (void*)t->futex_addr, t->futex_val);
+        if (t->clear_tid) kprintf("  ctid %p", (void*)t->clear_tid);
         kprintf("\n");
         t = t->next;
     } while (t != master_head);

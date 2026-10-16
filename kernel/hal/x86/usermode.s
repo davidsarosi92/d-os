@@ -37,12 +37,8 @@ extern resume_kernel_after_syscall_exit
 ; #11 — the resume point is stored where the CALLER says (the task's
 ; exc_resume), not in globals: two excursions at once used to overwrite each
 ; other's saved ESP/EIP here.
-section .data
-align 4
-global g_entry_gs
-g_entry_gs: dw 0x23                              ; ring-3 %gs for enter_user_mode_regs
-
 section .text
+global enter_user_mode_regs_gs
 
 ; void arch_enter_user_wrap(uint32_t eip, uint32_t esp, uint32_t* resume);
 ;   Stack on entry:  [esp+0]=ret_addr, [esp+4]=eip, [esp+8]=esp, [esp+12]=resume
@@ -137,15 +133,21 @@ enter_user_mode:
 ; eip 28, eflags 32, user_sp 36.  Never returns.
 ; -----------------------------------------------------------------------------
 enter_user_mode_regs:
+    mov edx, 0x23                               ; no thread pointer: plain data
+    jmp eumr_common
+; void enter_user_mode_regs_gs(struct user_regs* r, uint32_t gs);
+;   NEXT #14 — the child's %gs is an ARGUMENT.  It was a global (g_entry_gs),
+;   and two children starting at once on two CPUs overwrote each other's.
+enter_user_mode_regs_gs:
+    mov edx, [esp + 8]                          ; the TLS selector fork.c chose
+eumr_common:
     mov eax, [esp + 4]                          ; r (struct pointer)
 
     mov cx, 0x23                                ; user data segments
     mov ds, cx
     mov es, cx
     mov fs, cx
-    mov gs, [g_entry_gs]                         ; %gs = TLS selector for a musl
-                                                ; fork child (set by fork.c),
-                                                ; else 0x23
+    mov gs, dx                                  ; %gs = TLS selector, else 0x23
 
     push 0x23                                   ; SS3
     push dword [eax + 36]                       ; ESP3 = r->user_sp

@@ -1002,8 +1002,11 @@ static void cmd_isigtest(const char* args) {
     ssize_t w = vfs_write(f, a, (size_t)(b - a));
     vfs_close(f);
     if (w != (ssize_t)(b - a)) { console_write("isigtest: short write\n"); return; }
-    int rc = shell_run_from_path("/tmp/isigmusl");
-    kprintf("isigtest: returned rc=%d\n", rc);
+    /* shell_run_from_path answers "was it found and run" (1/0), not the
+     * program's exit code — printed as `rc=` it read as a failure beside
+     * "isig: PASS".  The verdict is the program's own line. */
+    int ran = shell_run_from_path("/tmp/isigmusl");
+    kprintf("isigtest: %s\n", ran ? "done (the verdict is the isig: line above)" : "program not found");
 }
 
 /* §M90 — `newapitest`: pidfd, clone3, openat2, open_tree/move_mount

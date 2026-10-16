@@ -33,12 +33,13 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* The ring-3 %gs selector enter_user_mode_regs loads (usermode.s).  Default is
- * the plain user-data selector (0x23); fork_child_bootstrap raises it to the
- * per-CPU TLS selector when the child has TLS, so musl's post-fork thread-local
- * accesses resolve.  (Global → UP-correct; SMP concurrent forks want this
- * per-CPU / passed-in — a follow-up.) */
-extern uint16_t g_entry_gs;
+/* The ring-3 %gs a child enters with — the plain user-data selector (0x23), or
+ * the per-CPU TLS selector when it has a thread pointer — is PASSED to
+ * enter_user_mode_regs_gs (usermode.s).  It was a global, `g_entry_gs`, noted
+ * here as "UP-correct; SMP concurrent forks want this per-CPU / passed-in — a
+ * follow-up": two children starting at once on two CPUs overwrote each other's
+ * selector (NEXT #14, 2026-10-16, found with the TLS-bind race beside it). */
+void enter_user_mode_regs_gs(struct user_regs* r, uint32_t gs) __attribute__((noreturn));
 
 /* Handed to the child task's bootstrap (heap-allocated, freed by the child). */
 struct fork_boot {
@@ -71,16 +72,10 @@ static void fork_child_bootstrap(void) {
     /* Re-establish TLS for the child: pin to this CPU (its %gs selector is
      * per-CPU), load this CPU's TLS descriptor base, and tell the resume path
      * to enter ring 3 with the TLS selector rather than plain user data. */
-    if (me->has_tls) {
-        task_set_affinity(me, 1u << this_cpu_id());
-        hal_set_tls_base(me->tls_base);
-        g_entry_gs = gdt_tls_selector();
-    } else {
-        g_entry_gs = 0x23;
-    }
+    uint32_t gs = me->has_tls ? x86_tls_bind(me) : 0x23;   /* NEXT #14 — one step */
 
     proc_fork_child_entry();                /* §M90 — CLONE_CHILD_SETTID, in OUR space */
-    enter_user_mode_regs(&regs);            /* → ring 3 at the fork point; no return */
+    enter_user_mode_regs_gs(&regs, gs);     /* → ring 3 at the fork point; no return */
 }
 
 int proc_fork(struct user_regs* parent_regs) {
@@ -186,21 +181,18 @@ static void clone_thread_bootstrap(void) {
      * enter ring 3 with the TLS SELECTOR in %gs — %gs is not part of the
      * register snapshot.  Without this the thread runs with a plain data
      * selector and musl's very first thread-pointer read faults at %gs:0x10. */
+    uint32_t gs = 0x23;
     if (tls) {
         me->tls_base = tls;
         me->has_tls  = 1;
-        task_set_affinity(me, 1u << this_cpu_id());
-        hal_set_tls_base(tls);
-        g_entry_gs = gdt_tls_selector();
-    } else {
-        g_entry_gs = 0x23;
+        gs = x86_tls_bind(me);              /* NEXT #14 — pin + slot + selector, one CPU */
     }
 
-    enter_user_mode_regs(&regs);            /* → ring 3, eax = 0 */
+    enter_user_mode_regs_gs(&regs, gs);     /* → ring 3, eax = 0 */
 }
 
 int proc_clone_thread(struct user_regs* parent_regs, uintptr_t child_stack,
-                      uintptr_t tls, int* ctid_kaddr) {
+                      uintptr_t tls, int* ctid_kaddr, int* ptid_set, int* ctid_set) {
     struct task* parent = task_current();
     if (!parent || !parent->mm || !child_stack) return -1;
     if (!ns_pid_thread_ok(parent)) return -1;   /* §M90 — after unshare(NEWPID) */
@@ -235,6 +227,10 @@ int proc_clone_thread(struct user_regs* parent_regs, uintptr_t child_stack,
      * in-tree-libc thread is joined with waitpid and stays owned. */
     task_set_reap_owned(child, parent->linux_abi ? 0 : 1);
     int vtid = ns_vnr(parent, child);
+    /* NEXT #14 — PARENT_/CHILD_SETTID while the child CANNOT run yet: it reads
+     * its tid from that very word (see proc.h). */
+    if (ptid_set) *ptid_set = vtid;
+    if (ctid_set) *ctid_set = vtid;
     task_release(child);                /* §4.96: built completely, now it may run */
     /* §M90 — the tid AS THE CALLER SEES IT (its pid namespace): what clone
      * returns and what PARENT_/CHILD_SETTID store — a C library keeps that

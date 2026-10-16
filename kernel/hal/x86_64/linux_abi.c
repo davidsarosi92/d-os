@@ -546,12 +546,12 @@ static void linux_syscall_body(struct int_frame* f) {
             if (ctid && !lnx_w_ok((uintptr_t)ctid, sizeof(int))) {
                 f->rax = (uint64_t)-LNX_EFAULT; return;
             }
-            int tid = proc_clone_thread(&r, (uintptr_t)a1, (uintptr_t)a4, ctid);
+            int* pset = ((flags & LNX_CLONE_PARENT_SETTID) && a2 &&
+                         lnx_w_ok(a2, sizeof(int))) ? (int*)a2 : NULL;
+            int* cset = ((flags & LNX_CLONE_CHILD_SETTID) && a3 &&
+                         lnx_w_ok(a3, sizeof(int))) ? (int*)a3 : NULL;
+            int tid = proc_clone_thread(&r, (uintptr_t)a1, (uintptr_t)a4, ctid, pset, cset);
             if (tid < 0) { f->rax = (uint64_t)-LNX_EINVAL; return; }
-            if ((flags & LNX_CLONE_PARENT_SETTID) && a2) {
-                if (lnx_w_ok(a2, sizeof(int))) *(int*)a2 = tid;
-            }
-            if ((flags & LNX_CLONE_CHILD_SETTID) && ctid) *ctid = tid;
             f->rax = (uint64_t)tid;
             return;
         }

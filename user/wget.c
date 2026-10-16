@@ -149,7 +149,16 @@ static int fetch(const char *url, int ofd, char *loc, size_t loccap) {
     while (*p && *p != '/' && *p != ':' && *p != '?' && hi < 255) host[hi++] = *p++;
     host[hi] = 0;
     int port = https ? 443 : 80;
-    if (*p == ':') { p++; port = 0; while (*p >= '0' && *p <= '9') port = port*10 + (*p++ - '0'); }
+    /* A port is 1..65535.  The parse used to accumulate any run of digits,
+     * so ":99999999999" overflowed into whatever number came out and was
+     * then dialled; it is refused now, with the URL named. */
+    if (*p == ':') {
+        p++; port = 0;
+        while (*p >= '0' && *p <= '9' && port <= 65535) port = port*10 + (*p++ - '0');
+        if (port < 1 || port > 65535 || (*p >= '0' && *p <= '9')) {
+            printf("wget: bad port in URL '%s'\n", url); return -1;
+        }
+    }
     const char *path = (*p == '/' || *p == '?') ? p : "/";
     if (hi == 0) { printf("wget: bad URL '%s'\n", url); return -1; }
 

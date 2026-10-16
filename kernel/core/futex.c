@@ -28,6 +28,8 @@
 #include "futex.h"
 #include "lnx_signal.h"
 #include "uaccess.h"
+#include "shellcmd.h"
+#include "printf.h"
 #include <stdint.h>
 
 /* §M89 — KEYED BY (address space, virtual address), not by physical address.
@@ -83,7 +85,10 @@ long futex_wait(uintptr_t uaddr, uint32_t val, uint64_t deadline_ns) {
         if (deadline_ns) ktimer_cancel(&tm);
         return -FUTEX_EAGAIN;
     }
+    struct task* self = task_current();
+    if (self) { self->futex_val = val; self->futex_addr = uaddr; }
     waitq_block(wq);                  /* drops + re-acquires the lock */
+    if (self) self->futex_addr = 0;
     waitq_unlock(wq, f);
     if (deadline_ns) ktimer_cancel(&tm);
     /* Any wake returns 0 (futex semantics allow spurious ones — the caller
@@ -115,3 +120,59 @@ long sys_futex(int* uaddr, int op, int val) {
     default: return -1;
     }
 }
+
+/* ---------------------------------------------------------------------------
+ * NEXT #14 (2026-10-16) — WHAT THE EXITING THREADS DID WITH THEIR TID WORDS.
+ *
+ * An occasional pthread_join hang (i386 -smp 4, ~1 run in 30) leaves the main
+ * thread parked on a thread's tid word long after that thread printed "done".
+ * Two different defects produce that one picture: the word was never cleared
+ * (the exit skipped it, or wrote somewhere else), or it was cleared and the
+ * wake missed the waiter.  `ps` shows what the waiter is parked on; this ring
+ * shows what the exits did — together they say which.  A ring and not a
+ * kprintf, because the hang vanished when timing was disturbed before.
+ * ------------------------------------------------------------------------- */
+#define FUTEX_NOTE_N 32
+static struct { int pid; uintptr_t addr; int stored; int woke; } g_note[FUTEX_NOTE_N];
+static volatile uint32_t g_note_seq;
+
+void futex_note_clear(int pid, uintptr_t addr, int stored, int woke) {
+    uint32_t i = __atomic_fetch_add(&g_note_seq, 1, __ATOMIC_RELAXED) % FUTEX_NOTE_N;
+    g_note[i].pid = pid; g_note[i].addr = addr;
+    g_note[i].stored = stored; g_note[i].woke = woke;
+}
+
+static void cmd_futex(const char* args) {
+    /* Which tasks are LINKED into a bucket right now.  Beside `ps`'s
+     * "futex <addr> want <v>" this separates a waiter the wake missed (it is
+     * linked) from one that fell out of the list (it is not). */
+    for (int b = 0; b < FUTEX_NBUCKETS; b++) {
+        uint32_t f = waitq_lock(&g_futex[b]);
+        int k = 0;
+        for (struct task* t = g_futex[b].head; t && k < 16; t = t->wq_next, k++)
+            kprintf("futex: bucket %d holds pid %d (state %d, wq %s)\n", b, t->pid,
+                    (int)t->state, t->wq == &g_futex[b] ? "this" : t->wq ? "OTHER" : "none");
+        waitq_unlock(&g_futex[b], f);
+    }
+    /* `futex kick` — wake every bucket.  If a stuck joiner then finishes, the
+     * word it waits on had already changed: the wake was lost, not missing. */
+    if (args && args[0] == 'k') {
+        for (int b = 0; b < FUTEX_NBUCKETS; b++) {
+            uint32_t f = waitq_lock(&g_futex[b]);
+            waitq_wake_all(&g_futex[b]);
+            waitq_unlock(&g_futex[b], f);
+        }
+        kprintf("futex: every bucket woken\n");
+    }
+    uint32_t n = g_note_seq;
+    uint32_t first = n > FUTEX_NOTE_N ? n - FUTEX_NOTE_N : 0;
+    kprintf("futex: %u tid-word clears at thread exit, newest last\n", (unsigned)n);
+    for (uint32_t k = first; k < n; k++) {
+        uint32_t i = k % FUTEX_NOTE_N;
+        kprintf("  pid %d  word %p  %s  %s\n", g_note[i].pid, (void*)g_note[i].addr,
+                g_note[i].stored ? "cleared" : "NOT CLEARED",
+                g_note[i].woke ? "woke a waiter" : "nobody parked");
+    }
+}
+SHELL_CMD(futex) = { "futex", "[kick]", "recent thread-exit tid-word clears (pthread_join diagnosis)",
+                     SHELL_G_TEST, cmd_futex, SHELL_P_ADMIN };

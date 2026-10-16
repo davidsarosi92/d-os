@@ -53,6 +53,8 @@
 #include "tss.h"
 #include "acpi.h"          /* ACPI_MAX_CPUS */
 #include "percpu.h"        /* this_cpu_id  */
+#include "task.h"          /* x86_tls_bind: task_set_affinity, tls_base */
+#include "hal_api.h"       /* hal_intr_save/restore */
 #include <stdint.h>
 
 /* One GDT entry, packed because the CPU reads it byte-for-byte. */
@@ -195,4 +197,17 @@ uint16_t gdt_tls_selector(void) {
  * by sys_set_tls. */
 void hal_set_tls_base(uintptr_t base) {
     set_entry(GDT_TLS_BASE + this_cpu_id(), (uint32_t)base, 0xFFFFF, 0xF2, 0xC);
+}
+
+/* NEXT #14 — see gdt.h.  task_set_affinity on the running task, for the CPU it
+ * is running on, only records the mask (nothing has to move), so it is safe
+ * with interrupts off; its own locks are irqsave. */
+uint16_t x86_tls_bind(struct task* t) {
+    uint32_t fl = hal_intr_save();
+    uint32_t cpu = this_cpu_id();
+    task_set_affinity(t, 1u << cpu);
+    set_entry(GDT_TLS_BASE + cpu, (uint32_t)t->tls_base, 0xFFFFF, 0xF2, 0xC);
+    uint16_t sel = (uint16_t)(((GDT_TLS_BASE + cpu) << 3) | 3);
+    hal_intr_restore(fl);
+    return sel;
 }

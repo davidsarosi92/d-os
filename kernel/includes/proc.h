@@ -112,7 +112,16 @@ void proc_set_exec_env(const char* kv);
  * valid for the child's lifetime) or NULL.  Returns the new tid, or -1. */
 struct user_regs;
 int proc_clone_thread(struct user_regs* parent_regs, uintptr_t child_stack,
-                      uintptr_t tls, int* ctid_kaddr);
+                      uintptr_t tls, int* ctid_kaddr, int* ptid_set, int* ctid_set);
+/* `ptid_set` / `ctid_set` — CLONE_PARENT_SETTID / CLONE_CHILD_SETTID targets
+ * (user VAs the caller has already checked writable), or NULL.  The tid is
+ * stored there BEFORE the child may run (NEXT #14, 2026-10-16): musl's
+ * pthread_create passes &new->tid as PARENT_SETTID and the new thread reads
+ * that field as its own tid for every lock it takes — stdio's FILE lock and
+ * the thread-list lock store the owner's tid.  Written after the release, a
+ * child that got a CPU first locked with tid 0, which those locks read as
+ * "free": two owners at once, a waiter bit nobody clears, and an occasional
+ * hang (i386 -smp 4, `pthreadtest`, roughly 1 run in 30). */
 
 /* §M71 — THE END OF A RING-3 EXCURSION.
  *
