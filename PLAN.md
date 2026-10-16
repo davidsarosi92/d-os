@@ -231,7 +231,7 @@ fixed first, whatever it touches.
 | §M73 | ✅ complete — rungs 1-3 (§4.115) | — (resource caps per container, network namespace, registry pull) |
 | queued UI | ✅ done (§4.116) — Memory page, System information, translations 73 → 0 | — |
 | §M88 | ✅ (§4.118) | open: a taskbar per monitor |
-| §M89 | ◐ → core ✅ | Java: `java Hello.java` from the unmodified JDK on x86_64 + aarch64 (DOCS §4.119); open: `app install` end to end, host-side delivery, rung 5 measurements |
+| §M89 | ✅ core; install via §M93 | Java: `java Hello.java` from the unmodified JDK on x86_64 + aarch64 (DOCS §4.119); `wget` + `app install` of the Temurin JDK end to end since §M93 (DOCS §4.120); open: rung 5 measurements |
 | §M90 | ✅ (2026-10-16) | Docker itself on d-os (dockerd + containerd + runc + the CLI), no Docker Desktop — rungs 1-2 ✅ (`docker run … echo hi` prints `hi`, aarch64); cgroup limits + inotify ✅ (OOMKilled true/137); overlayfs + overlay2 ✅ (run/diff/commit); networking ✅ (default bridge, NAT, `-p`); IPv6 + netfilter ✅; `-it`/build/volumes ✅; x86_64 ✅ (higher-half kernel) — DOCS §4.120 |
 | §M91 | — | the ABI as its own project: d-os, Linux and NT personalities over one common language (ReactOS's pattern) — designed, not started |
 | §M92 | — | a driver engine for d-os, Linux and Windows drivers — an OPEN QUESTION, recorded, not decided |
